@@ -1,0 +1,1 @@
+"""Generative retriever rollout example."""
