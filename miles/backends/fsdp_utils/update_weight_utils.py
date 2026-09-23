@@ -92,7 +92,10 @@ class UpdateWeight(abc.ABC):
         bucket_size = 0
         model_type = getattr(getattr(self.model, "config", None), "model_type", "")
         sync_dtypes = getattr(self.model, "_fsdp_sync_dtypes", None)
+        include_prefixes = tuple(self.args.weight_sync_include_prefixes or ())
         for raw_name, raw_param in self.model.state_dict().items():
+            if include_prefixes and not raw_name.startswith(include_prefixes):
+                continue
             for name, param in _iter_sync_named_params(raw_name, raw_param, model_type, self.model, sync_dtypes):
                 param_size = param.numel() * param.element_size()
                 if bucket and bucket_size + param_size >= self.args.update_weight_buffer_size:

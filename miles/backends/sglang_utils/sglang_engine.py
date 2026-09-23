@@ -1,3 +1,4 @@
+import dataclasses
 import ipaddress
 import logging
 import os
@@ -14,6 +15,15 @@ from miles.utils.lora import LORA_ADAPTER_NAME, lora_base_cpu_backup_enabled, lo
 from miles.utils.multi_lora import is_multi_lora_enabled
 
 logger = logging.getLogger(__name__)
+
+
+def _server_arg_names() -> list[str]:
+    try:
+        return [field.name for field in msgspec.structs.fields(ServerArgs)]
+    except TypeError:
+        if dataclasses.is_dataclass(ServerArgs):
+            return [field.name for field in dataclasses.fields(ServerArgs)]
+        raise
 
 
 def format_v6_uri(addr: str | None) -> str | None:
@@ -178,12 +188,12 @@ def _compute_server_args(
         kwargs.update(sglang_overrides)
 
     unused_keys = set(kwargs.keys())
-    for attr in msgspec.structs.fields(ServerArgs):
-        if worker_type == "decode" and attr.name == "enable_hierarchical_cache":
+    for attr_name in _server_arg_names():
+        if worker_type == "decode" and attr_name == "enable_hierarchical_cache":
             continue
-        if hasattr(args, f"sglang_{attr.name}") and attr.name not in kwargs:
-            kwargs[attr.name] = getattr(args, f"sglang_{attr.name}")
-        unused_keys.discard(attr.name)
+        if hasattr(args, f"sglang_{attr_name}") and attr_name not in kwargs:
+            kwargs[attr_name] = getattr(args, f"sglang_{attr_name}")
+        unused_keys.discard(attr_name)
 
     # for compatibility with old args
     if len(unused_keys) > 0:

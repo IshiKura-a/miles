@@ -321,6 +321,21 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="The qkv layout.",
             )
             parser.add_argument(
+                "--custom-fsdp-model-factory-path",
+                type=str,
+                default=None,
+                help=(
+                    "Optional import path for an FSDP model factory with signature "
+                    "factory(checkpoint_path, args, init_context) -> torch.nn.Module."
+                ),
+            )
+            parser.add_argument(
+                "--weight-sync-include-prefixes",
+                nargs="*",
+                default=None,
+                help="Only synchronize state_dict entries matching one of these prefixes to rollout engines.",
+            )
+            parser.add_argument(
                 "--linear-attention-backend",
                 type=str,
                 choices=["fla", "flashqla"],

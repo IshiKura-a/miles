@@ -27,6 +27,7 @@ from miles.utils.context_utils import with_defer
 from miles.utils.distributed_utils import get_gloo_group
 from miles.utils.flops_utils import flops_args_from_hf_config, fwd_tflops_per_gpu
 from miles.utils.ft_utils.indep_dp import IndepDPInfo
+from miles.utils.function_registry import load_function
 from miles.utils.hf_config import load_hf_config
 from miles.utils.memory_utils import clear_memory, print_memory
 from miles.utils.processing_utils import load_processor, load_tokenizer
@@ -174,9 +175,12 @@ class FSDPTrainRayActor(TrainRayActor):
         if args.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
 
+        trainable_parameters = [parameter for parameter in self.model.parameters() if parameter.requires_grad]
+        if not trainable_parameters:
+            raise ValueError("FSDP actor has no trainable parameters")
         if args.optimizer == "adam":
             self.optimizer = torch.optim.AdamW(
-                self.model.parameters(),
+                trainable_parameters,
                 lr=args.lr,
                 betas=(args.adam_beta1, args.adam_beta2),
                 eps=args.adam_eps,
@@ -235,6 +239,11 @@ class FSDPTrainRayActor(TrainRayActor):
 
     def _build_model_with_attn_bridge(self, checkpoint_path: str, init_context):
         """Build HF model and optionally apply Triton attention bridge patch."""
+        if self.args.custom_fsdp_model_factory_path is not None:
+            factory = load_function(self.args.custom_fsdp_model_factory_path)
+            model = factory(checkpoint_path, self.args, init_context)
+            return model, 0
+
         # ROCm-only: on other platforms "triton" falls through to from_pretrained, which rejects
         # it exactly as it did before this path existed.
         use_triton_bridge = self.args.attn_implementation == "triton" and torch.version.hip is not None
@@ -537,7 +546,9 @@ class FSDPTrainRayActor(TrainRayActor):
                     losses_reduced.append(log_dict)
 
                 grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.clip_grad)
-                grad_norm = grad_norm.full_tensor().item()
+                if hasattr(grad_norm, "full_tensor"):
+                    grad_norm = grad_norm.full_tensor()
+                grad_norm = grad_norm.item()
 
                 self.optimizer.step()
                 self.lr_scheduler.step()
@@ -693,6 +704,9 @@ class FSDPTrainRayActor(TrainRayActor):
 
         if batch.get("multimodal_train_inputs"):
             model_args.update(batch["multimodal_train_inputs"])
+        if getattr(self.model, "_miles_requires_response_lengths", False):
+            model_args["response_lengths"] = batch["response_lengths"]
+            model_args["total_lengths"] = batch["total_lengths"]
 
         return model_args
 
@@ -729,12 +743,17 @@ def apply_fsdp2(model, mesh=None, cpu_offload=False, args=None, param_dtype=None
     layer_cls_to_wrap = model._no_split_modules
     assert len(layer_cls_to_wrap) > 0 and next(iter(layer_cls_to_wrap)) is not None
 
-    modules = [
-        module
-        for name, module in model.named_modules()
-        if module.__class__.__name__ in layer_cls_to_wrap
-        or (isinstance(module, torch.nn.Embedding) and not model.config.tie_word_embeddings)
-    ]
+    ignore_frozen_parameters = getattr(model, "_miles_fsdp_ignore_frozen_parameters", False)
+    modules = []
+    for module in model.modules():
+        should_wrap = module.__class__.__name__ in layer_cls_to_wrap or (
+            isinstance(module, torch.nn.Embedding) and not model.config.tie_word_embeddings
+        )
+        if should_wrap and (
+            not ignore_frozen_parameters
+            or any(parameter.requires_grad for parameter in module.parameters())
+        ):
+            modules.append(module)
 
     if param_dtype is None:
         param_dtype = torch.float16 if args.fp16 else torch.bfloat16
@@ -751,10 +770,16 @@ def apply_fsdp2(model, mesh=None, cpu_offload=False, args=None, param_dtype=None
         "offload_policy": offload_policy,
         "mesh": mesh,
     }
+    if ignore_frozen_parameters:
+        fsdp_kwargs["ignored_params"] = {
+            parameter for parameter in model.parameters() if not parameter.requires_grad
+        }
 
-    # fully_shard each layer first, then the root model
-    for module in modules:
-        fully_shard(module, **fsdp_kwargs)
+    # Small custom heads can shard as one unit while their frozen backbone is
+    # ignored. This avoids creating nested DTensors for shared head parameters.
+    if not getattr(model, "_miles_fsdp_wrap_root_only", False):
+        for module in modules:
+            fully_shard(module, **fsdp_kwargs)
     fully_shard(model, **fsdp_kwargs)
 
     return model

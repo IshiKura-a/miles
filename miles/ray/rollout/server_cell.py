@@ -155,7 +155,13 @@ class ServerCell:
             )
 
         addr_info = await self._compute_addr_info()
-        await activate_launch_gate(gate_url=addr_info.gate_url)
+        await activate_launch_gate(
+            gate_url=addr_info.gate_url,
+            activated_check=lambda: probe_server_healthy(
+                server_url=addr_info.server_url,
+                api_key=self.meta.sglang_api_key,
+            ),
+        )
         self._change_state(
             "init", StateUninitialized, StateInitializing(addr_info=addr_info, start_time=time.monotonic())
         )
