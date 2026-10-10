@@ -9,7 +9,7 @@ Example:
         --checkpoint /path/to/checkpoint \
         --qwen-model /path/to/Qwen3-4B \
         --slm-root /path/to/SLMv3 \
-        --transformers-path /path/to/transformers-4.57.3 \
+        --transformers-path /path/to/transformers-source \
         --query "cheap accommodation oporto with global travelers"
 """
 
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +30,8 @@ from .model_loading import (
     load_checkpoint,
     require_directory,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -54,9 +57,10 @@ def _prepare_transformers(checkpoint: Path, transformers_path: str | Path | None
     with config_path.open(encoding="utf-8") as config_file:
         expected_version = json.load(config_file).get("transformers_version")
     if expected_version and transformers.__version__ != expected_version:
-        raise RuntimeError(
-            f"checkpoint requires transformers=={expected_version}, "
-            f"but loaded {transformers.__version__}; pass transformers_path with the matching source"
+        logger.warning(
+            "Checkpoint was saved with Transformers %s; running with %s",
+            expected_version,
+            transformers.__version__,
         )
 
 

@@ -10,6 +10,8 @@ from typing import Any
 import torch
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
+from transformers.models.t5.modeling_t5 import T5Attention
+from examples.experimental.generative_retriever.constrained_decode import PrefixConstraint, load_constraint
 
 from .model_loading import (
     build_run_arguments,
@@ -35,13 +37,16 @@ class GRStage5Policy(nn.Module):
     _miles_fsdp_wrap_root_only = True
     _no_split_modules = ["Qwen3DecoderLayer", "T5Block"]
 
-    def __init__(self, source_model: nn.Module, pad_token_id: int) -> None:
+    def __init__(
+        self, source_model: nn.Module, pad_token_id: int, constraint: PrefixConstraint,
+    ) -> None:
         super().__init__()
         self.config = source_model.encoder_list[0].model.encoder.config
         self.config.tie_word_embeddings = False
         self.pad_token_id = pad_token_id
         self.code_dim = source_model.docid_dim
         self.code_num = source_model.docid_size
+        self.constraint = constraint
 
         self.encoder_list = source_model.encoder_list
         self.docEnc2decoder = source_model.docEnc2decoder
@@ -52,6 +57,8 @@ class GRStage5Policy(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Dropout):
                 module.p = 0.0
+            if isinstance(module, T5Attention):
+                module.dropout = 0.0
         for module in (
             self.docEnc2decoder,
             self.decoder,
@@ -179,13 +186,11 @@ class GRStage5Policy(nn.Module):
             for position in range(self.code_num):
                 position_logits = logits[output_row, start + position]
                 position_logits.fill_(invalid_logit)
-                codebook_start = 2 + position * self.code_dim
-                codebook_end = codebook_start + self.code_dim
-                position_logits[codebook_start:codebook_end] = response_logits[
-                    index,
-                    position,
-                    codebook_start:codebook_end,
-                ]
+                prefix = torch.cat((responses.new_zeros(1), responses[index, :position]))
+                allowed = self.constraint(index, prefix)
+                if not allowed or responses[index, position].item() not in allowed:
+                    raise ValueError(f"GR response violates official prefix constraint at position {position}")
+                position_logits[allowed] = response_logits[index, position, allowed]
         return SimpleNamespace(logits=logits)
 
 
@@ -197,6 +202,10 @@ def build_gr_stage5_policy(checkpoint_path: str, args: Any, init_context) -> GRS
     checkpoint = _required_path("GR_CHECKPOINT")
     qwen_model = _required_path("GR_QWEN_MODEL")
     slm_root = _required_path("GR_SLM_ROOT")
+    mapping = os.environ.get("GR_ID_MAPPING")
+    if not mapping:
+        raise ValueError("GR_ID_MAPPING must be set for constrained GR training")
+    constraint = load_constraint(str(slm_root), mapping, 4, 256)
     slmv3 = import_slmv3(slm_root)
     run_args = build_run_arguments(slmv3["RunArguments"], checkpoint, qwen_model)
 
@@ -225,4 +234,5 @@ def build_gr_stage5_policy(checkpoint_path: str, args: Any, init_context) -> GRS
     return GRStage5Policy(
         source_model,
         pad_token_id=qwen_encoder.tokenizer.pad_token_id,
+        constraint=constraint,
     )

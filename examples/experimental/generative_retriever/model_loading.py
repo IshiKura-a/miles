@@ -17,25 +17,26 @@ def require_directory(path: str | Path, name: str) -> Path:
 
 
 def import_slmv3(slm_root: Path) -> dict[str, Any]:
-    import transformers
-
-    # Transformers 5 removed the MT5 aliases used by the original SLMv3 imports.
-    if not hasattr(transformers, "MT5Tokenizer"):
-        transformers.MT5Tokenizer = transformers.T5Tokenizer
-    if not hasattr(transformers, "MT5TokenizerFast"):
-        transformers.MT5TokenizerFast = transformers.T5TokenizerFast
-
     root_string = str(slm_root)
     if root_string not in sys.path:
         sys.path.insert(0, root_string)
 
     model_module = importlib.import_module("model")
+    import transformers
+
+    # Model imports can replace Transformers' lazy module; patch the active module before utils.
+    if not hasattr(transformers, "MT5Tokenizer"):
+        transformers.MT5Tokenizer = transformers.T5Tokenizer
+    if not hasattr(transformers, "MT5TokenizerFast"):
+        transformers.MT5TokenizerFast = transformers.T5TokenizerFast
+
     utils_module = importlib.import_module("utils")
     encoder_module = importlib.import_module("CustomizedEncoder")
     return {
         "RunArguments": utils_module.RunArguments,
         "T5MultiWithGivenQueryDocEncoderDSI": model_module.T5MultiWithGivenQueryDocEncoderDSI,
         "Encoder_QWen1216t": encoder_module.Encoder_QWen1216t,
+        "get_restrict_decode_vocab": utils_module.get_restrict_decode_vocab,
     }
 
 

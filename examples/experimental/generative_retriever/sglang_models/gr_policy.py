@@ -8,6 +8,11 @@ import torch
 from torch import nn
 from transformers import T5Config
 from transformers.models.t5.modeling_t5 import T5Stack
+from examples.experimental.generative_retriever.constrained_decode import (
+    build_generation_model,
+    generate_beams,
+    load_constraint,
+)
 
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -33,9 +38,13 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
         self.gr_config = T5Config.from_dict(raw_gr_config)
         self.docid_size = int(raw_gr_config["docid_size"])
         self.docid_dim = int(raw_gr_config["docid_dim"])
-        self.temperature = float(raw_gr_config.get("temperature", 1.0))
-        if self.temperature < 0:
-            raise ValueError("gr_config.temperature must be non-negative")
+        self.num_beams = int(raw_gr_config["num_beams"])
+        self.num_return_sequences = int(raw_gr_config["num_return_sequences"])
+        if not 1 <= self.num_return_sequences <= self.num_beams:
+            raise ValueError("Require 1 <= num_return_sequences <= num_beams")
+        self.constraint = load_constraint(
+            raw_gr_config["slm_root"], raw_gr_config["id_mapping"], self.docid_size, self.docid_dim,
+        )
 
         decoder_config = self.gr_config
         decoder_config.is_decoder = True
@@ -62,6 +71,11 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
             decoder_vocab_size,
             bias=False,
         )
+        generation_model = build_generation_model(
+            slm_root=raw_gr_config["slm_root"], config=decoder_config,
+            projection=self.docEnc2decoder, decoder=self.decoder, lm_head=self.lm_head,
+        )
+        object.__setattr__(self, "_generation_model", generation_model)
 
     @staticmethod
     def _split_hidden_states(
@@ -90,57 +104,17 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
             attention_mask[index, : sequence.shape[0]] = 1
         return padded, attention_mask
 
-    def _sample(self, log_probs: torch.Tensor) -> torch.Tensor:
-        if self.temperature == 0:
-            return log_probs.argmax(dim=-1)
-        return torch.multinomial(log_probs.exp(), num_samples=1).squeeze(-1)
-
     def _generate_docids(
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> EmbeddingPoolerOutput:
-        encoder_hidden_states = self.docEnc2decoder(hidden_states)
-        batch_size = hidden_states.shape[0]
-        decoder_input_ids = torch.zeros(
-            (batch_size, 1),
-            dtype=torch.long,
-            device=hidden_states.device,
+        token_ids, token_logprobs = generate_beams(
+            self._generation_model, hidden_states, attention_mask, self.constraint,
+            code_num=self.docid_size, num_beams=self.num_beams,
+            num_return_sequences=self.num_return_sequences,
         )
-        token_ids = []
-        token_logprobs = []
-
-        for position in range(self.docid_size):
-            output = self.decoder(
-                input_ids=decoder_input_ids,
-                encoder_hidden_states=encoder_hidden_states,
-                encoder_attention_mask=attention_mask,
-                use_cache=False,
-                return_dict=True,
-            )
-            logits = self.lm_head(output.last_hidden_state[:, -1])
-            start = 2 + position * self.docid_dim
-            position_logits = logits[:, start : start + self.docid_dim]
-            if self.temperature > 0:
-                position_logits = position_logits / self.temperature
-            log_probs = position_logits.float().log_softmax(dim=-1)
-            local_token_ids = self._sample(log_probs)
-            selected_logprobs = log_probs.gather(-1, local_token_ids[:, None]).squeeze(-1)
-            selected_token_ids = local_token_ids + start
-            decoder_input_ids = torch.cat(
-                (decoder_input_ids, selected_token_ids[:, None]),
-                dim=-1,
-            )
-            token_ids.append(selected_token_ids)
-            token_logprobs.append(selected_logprobs)
-
-        packed = torch.cat(
-            (
-                torch.stack(token_ids, dim=-1).float(),
-                torch.stack(token_logprobs, dim=-1),
-            ),
-            dim=-1,
-        )
+        packed = torch.cat((token_ids.float(), token_logprobs.float()), dim=-1).flatten(1)
         return EmbeddingPoolerOutput(embeddings=packed)
 
     @torch.no_grad()

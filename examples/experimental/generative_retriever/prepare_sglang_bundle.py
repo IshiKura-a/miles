@@ -36,15 +36,25 @@ def prepare_bundle(
     checkpoint: str | Path,
     qwen_model: str | Path,
     output: str | Path,
+    slm_root: str | Path,
+    id_mapping: str | Path,
+    num_beams: int = 500,
+    num_return_sequences: int = 8,
     temperature: float = 1.0,
 ) -> Path:
     checkpoint_path = require_directory(checkpoint, "checkpoint")
     qwen_path = require_directory(qwen_model, "Qwen model")
+    slm_path = require_directory(slm_root, "SLMv3 source")
+    mapping_path = Path(id_mapping).expanduser().resolve()
+    if not mapping_path.is_file():
+        raise FileNotFoundError(f"Official ID mapping is missing: {mapping_path}")
     output_path = Path(output).expanduser().resolve()
     output_path.mkdir(parents=True, exist_ok=True)
 
-    if temperature < 0:
-        raise ValueError("temperature must be non-negative")
+    if temperature != 1.0:
+        raise ValueError("Official constrained beam search requires temperature=1")
+    if not 1 <= num_return_sequences <= num_beams:
+        raise ValueError("Require 1 <= num_return_sequences <= num_beams")
 
     with (qwen_path / "config.json").open(encoding="utf-8") as config_file:
         config = json.load(config_file)
@@ -57,6 +67,10 @@ def prepare_bundle(
         "docid_size": 4,
         "docid_dim": 256,
         "temperature": temperature,
+        "slm_root": str(slm_path),
+        "id_mapping": str(mapping_path),
+        "num_beams": num_beams,
+        "num_return_sequences": num_return_sequences,
     }
     (output_path / "config.json").write_text(
         json.dumps(config, indent=2, sort_keys=True) + "\n",
@@ -68,6 +82,10 @@ def prepare_bundle(
         if not source.is_file():
             raise FileNotFoundError(f"Qwen tokenizer asset is missing: {source}")
         _replace_symlink(output_path / filename, source)
+    for filename in ("chat_template.jinja", "chat_template.json"):
+        source = qwen_path / filename
+        if source.is_file():
+            _replace_symlink(output_path / filename, source)
 
     index_source = checkpoint_path / "pytorch_model.bin.index.json"
     if not index_source.is_file():
@@ -92,6 +110,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--qwen-model", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--slm-root", required=True)
+    parser.add_argument("--id-mapping", required=True)
+    parser.add_argument("--num-beams", type=int, default=500)
+    parser.add_argument("--num-return-sequences", type=int, default=8)
     parser.add_argument("--temperature", type=float, default=1.0)
     return parser.parse_args()
 
@@ -102,6 +124,10 @@ def main() -> None:
         checkpoint=args.checkpoint,
         qwen_model=args.qwen_model,
         output=args.output,
+        slm_root=args.slm_root,
+        id_mapping=args.id_mapping,
+        num_beams=args.num_beams,
+        num_return_sequences=args.num_return_sequences,
         temperature=args.temperature,
     )
     print(os.fspath(output))

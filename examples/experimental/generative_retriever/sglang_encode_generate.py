@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import math
+import asyncio
 from typing import Any
 
 from miles.backends.sglang_utils.sglang_router_api_client import use_legacy_router_api
 from miles.rollout.base_types import GenerateFnInput, GenerateFnOutput
 from miles.utils.http_utils import GeneralHttpClientProvider, post
 from miles.utils.types import Sample
+from examples.experimental.generative_retriever.relevance_reward import REWARD_MODES
 
 
 def _add_arguments(parser) -> None:
+    parser.add_argument(
+        "--generative-retriever-reward-mode", choices=REWARD_MODES,
+        default="continuous_relevance_unique",
+    )
     parser.add_argument(
         "--generative-retriever-docid-size",
         type=int,
@@ -42,14 +48,22 @@ def _parse_embedding(
     output: dict[str, Any],
     docid_size: int,
     docid_dim: int,
+    num_return_sequences: int = 1,
+    beam_rank: int = 0,
 ) -> tuple[list[int], list[float]]:
     raw = output.get("embedding")
-    if not isinstance(raw, list) or len(raw) != docid_size * 2:
+    expected = num_return_sequences * docid_size * 2
+    if not isinstance(raw, list) or len(raw) != expected:
         raise ValueError(
-            f"GR SGLang /encode must return {docid_size * 2} values, got {raw!r}"
+            f"GR SGLang /encode must return {expected} beam values, got {raw!r}"
         )
+    if not 0 <= beam_rank < num_return_sequences:
+        raise ValueError("GR beam rank is outside the returned beam group")
+    start = beam_rank * docid_size * 2
+    raw = raw[start:start + docid_size * 2]
     token_ids = [int(value) for value in raw[:docid_size]]
-    if any(float(value) != token_id for value, token_id in zip(raw[:docid_size], token_ids, strict=True)):
+    if any(isinstance(value, bool) or float(value) != token_id
+           for value, token_id in zip(raw[:docid_size], token_ids, strict=True)):
         raise ValueError(f"GR SGLang returned non-integral token ids: {raw[:docid_size]!r}")
     for position, token_id in enumerate(token_ids):
         start = 2 + position * docid_dim
@@ -79,7 +93,8 @@ async def _resolve_engine_url(args: Any, sample: Sample) -> str:
         )
     if not worker_urls:
         raise RuntimeError(f"GR rollout router has no healthy regular workers: {router_url}")
-    routing_index = sample.index if sample.index is not None else 0
+    routing_index = sample.group_index if sample.group_index is not None else sample.index
+    routing_index = routing_index if routing_index is not None else 0
     return worker_urls[routing_index % len(worker_urls)]
 
 
@@ -107,13 +122,34 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
 
     prompt_ids = _training_prompt_ids(input.state, sample)
     engine_url = await _resolve_engine_url(args, sample)
-    output = await post(
-        f"{engine_url}/encode",
-        {"input_ids": prompt_ids},
-    )
+    group_size = args.n_samples_per_prompt
+    if sample.index is None:
+        raise ValueError("Constrained beam rollout requires sample.index")
+    if not input.evaluation and sample.group_index is None:
+        raise ValueError("Constrained training rollout requires sample.group_index")
+    beam_rank = 0 if input.evaluation else sample.index % group_size
+    if not hasattr(input.state, "_gr_beam_requests"):
+        input.state._gr_beam_requests = {}
+    requests = input.state._gr_beam_requests
+    group_key = sample.index if input.evaluation else sample.group_index
+    key = (input.evaluation, group_key, engine_url, tuple(prompt_ids))
+    if key not in requests:
+        requests[key] = (
+            asyncio.create_task(post(f"{engine_url}/encode", {"input_ids": prompt_ids})),
+            set(),
+        )
+    task, consumed = requests[key]
+    try:
+        output = await asyncio.shield(task)
+    finally:
+        if task.done() and (task.cancelled() or task.exception() is not None):
+            requests.pop(key, None)
+    consumed.add(beam_rank)
+    if input.evaluation or len(consumed) == group_size:
+        requests.pop(key, None)
     docid_size = args.generative_retriever_docid_size
     docid_dim = args.generative_retriever_docid_dim
-    token_ids, logprobs = _parse_embedding(output, docid_size, docid_dim)
+    token_ids, logprobs = _parse_embedding(output, docid_size, docid_dim, group_size, beam_rank)
 
     sample.tokens = prompt_ids + token_ids
     sample.response_length = docid_size
@@ -122,6 +158,7 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
     sample.status = Sample.Status.COMPLETED
     metadata = sample.metadata.setdefault("generative_retriever", {})
     metadata["docid_tokens"] = token_ids
+    metadata["beam_rank"] = beam_rank
     metadata["positional_docid"] = [token_id - 2 for token_id in token_ids]
     metadata["rq_codes"] = [
         token_id - 2 - position * docid_dim

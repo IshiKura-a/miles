@@ -15,6 +15,7 @@ if str(_MILES_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_MILES_REPO_ROOT))
 
 import miles.utils.external_utils.command_utils as U
+from examples.experimental.generative_retriever.relevance_reward import REWARD_MODES, RewardMode
 
 
 def _required_directory(value: str, name: str) -> str:
@@ -32,13 +33,18 @@ class ScriptArgs(U.ExecuteTrainConfig):
     checkpoint: str = ""
     qwen_model: str = ""
     slm_root: str = ""
+    id_mapping: str = ""
+    num_beams: int = 500
     prompt_data: str = ""
     output_dir: str = "/tmp/gr-rl"
     reward_url: str = ""
+    reward_mode: RewardMode = "continuous_relevance_unique"
     num_gpus_per_node: int = 8
     actor_num_gpus_per_node: int = 4
-    rollout_num_gpus: int = 4
-    rollout_num_gpus_per_engine: int = 1
+    rollout_num_gpus: int = 2
+    rollout_num_gpus_per_engine: int = 2
+    sglang_dp_size: int = 2
+    sglang_mem_fraction_static: float = 0.7
     rollout_batch_size: int = 32
     n_samples_per_prompt: int = 8
     global_batch_size: int = 256
@@ -49,9 +55,18 @@ class ScriptArgs(U.ExecuteTrainConfig):
 
 
 def execute(args: ScriptArgs) -> None:
+    if args.reward_mode not in REWARD_MODES:
+        raise ValueError(f"Unknown reward mode: {args.reward_mode!r}")
     checkpoint = _required_directory(args.checkpoint, "checkpoint")
     qwen_model = _required_directory(args.qwen_model, "Qwen model")
     slm_root = _required_directory(args.slm_root, "SLMv3 source")
+    mapping = Path(args.id_mapping).expanduser().resolve()
+    if not args.id_mapping or not mapping.is_file():
+        raise FileNotFoundError(f"Official ID mapping is required: {args.id_mapping!r}")
+    if args.temperature != 1.0:
+        raise ValueError("Official constrained beam search requires temperature=1")
+    if not 1 <= args.n_samples_per_prompt <= args.num_beams:
+        raise ValueError("Require 1 <= n_samples_per_prompt <= num_beams")
     prompt_data = Path(args.prompt_data).expanduser().resolve()
     if not prompt_data.is_file():
         raise FileNotFoundError(f"prompt data does not exist: {prompt_data}")
@@ -72,6 +87,10 @@ def execute(args: ScriptArgs) -> None:
                 "python -m examples.experimental.generative_retriever.prepare_sglang_bundle",
                 f"--checkpoint {quote(checkpoint)}",
                 f"--qwen-model {quote(qwen_model)}",
+                f"--slm-root {quote(slm_root)}",
+                f"--id-mapping {quote(str(mapping))}",
+                f"--num-beams {args.num_beams}",
+                f"--num-return-sequences {args.n_samples_per_prompt}",
                 f"--output {quote(os.fspath(bundle))}",
                 f"--temperature {args.temperature}",
             )
@@ -88,6 +107,7 @@ def execute(args: ScriptArgs) -> None:
         "examples.experimental.generative_retriever.sglang_encode_generate.generate "
         "--custom-rm-path examples.experimental.generative_retriever.reward.reward "
         f"--generative-retriever-reward-url {quote(args.reward_url)} "
+        f"--generative-retriever-reward-mode {args.reward_mode} "
         "--generative-retriever-docid-size 4 "
         "--generative-retriever-docid-dim 256 "
         f"--num-rollout {args.num_rollout} "
@@ -118,11 +138,13 @@ def execute(args: ScriptArgs) -> None:
     sglang_args = (
         f"--rollout-num-gpus {args.rollout_num_gpus} "
         f"--rollout-num-gpus-per-engine {args.rollout_num_gpus_per_engine} "
+        f"--sglang-dp-size {args.sglang_dp_size} "
+        "--sglang-enable-dp-attention "
         "--sglang-is-embedding "
         "--sglang-disable-radix-cache "
         "--sglang-attention-backend triton "
         "--sglang-disable-cuda-graph "
-        "--sglang-mem-fraction-static 0.7 "
+        f"--sglang-mem-fraction-static {args.sglang_mem_fraction_static} "
     )
     learner_args = (
         "--train-backend fsdp "
@@ -155,6 +177,7 @@ def execute(args: ScriptArgs) -> None:
             "GR_CHECKPOINT": checkpoint,
             "GR_QWEN_MODEL": qwen_model,
             "GR_SLM_ROOT": slm_root,
+            "GR_ID_MAPPING": str(mapping),
             "SGLANG_EXTERNAL_MODEL_PACKAGE": (
                 "examples.experimental.generative_retriever.sglang_models"
             ),

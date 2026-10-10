@@ -15,6 +15,7 @@ from typing import Any
 import aiohttp
 
 from miles.utils.types import Sample
+from examples.experimental.generative_retriever.relevance_reward import REWARD_MODES
 
 
 def _sample_payload(sample: Sample) -> dict[str, Any]:
@@ -73,8 +74,13 @@ async def reward(args: Any, samples: Sample | list[Sample], **kwargs: Any) -> fl
         raise ValueError("generative_retriever_reward_timeout must be positive")
 
     timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+    mode = getattr(args, "generative_retriever_reward_mode", "continuous_relevance_unique")
+    if mode not in REWARD_MODES:
+        raise ValueError(f"Unknown reward mode: {mode!r}")
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(url, json={"samples": [_sample_payload(sample) for sample in batch]}) as response:
+        async with session.post(
+            url, json={"samples": [_sample_payload(sample) for sample in batch], "reward_mode": mode},
+        ) as response:
             response.raise_for_status()
             rewards = _parse_rewards(await response.json(), expected_count=len(batch))
 
