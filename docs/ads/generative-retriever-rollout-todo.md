@@ -203,6 +203,8 @@ HTTP reward hook 对每个 sample 获取一个 doc ID 的平均 keyword reward�
 - 训练 rollout 使用同一个官方前缀约束执行随机采样，不使用 beam search。
 - Baseline 和训练 rollout 都是每个 query 返回 16 个 doc ID；每个 ID 为 4 个
   decoder token，且完整路径必须存在于固定官方映射的前缀树中。
+- Baseline beam 要求 ID 不重复；训练使用标准随机采样，允许随机重复并汇报
+  `distinct_docid_ratio`，不因某个 query 的低熵分布终止整个 scheduler。
 - `/encode` 返回每条 sample 的 4 个 decoder token 和 4 个 logprob。
   同一训练 group 共用一次请求，各 sample 使用不同随机采样结果。
 - Miles custom rollout 通过 router 标准 `/v1/embeddings` API 请求 packed

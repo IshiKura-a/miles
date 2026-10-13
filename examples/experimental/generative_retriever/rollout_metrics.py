@@ -31,4 +31,23 @@ def log_rollout(
         else:
             value = math.fsum(metrics) / len(metrics)
         rollout_extra_metrics[f"rollout/generative_retriever/{name}"] = value
+    groups: dict[int, list[tuple[int, ...]]] = defaultdict(list)
+    for sample in samples:
+        metadata = sample.metadata.get("generative_retriever", {})
+        positional_docid = metadata.get("positional_docid")
+        if (
+            sample.group_index is not None
+            and isinstance(positional_docid, list)
+            and all(isinstance(value, int) for value in positional_docid)
+        ):
+            groups[sample.group_index].append(tuple(positional_docid))
+    if groups:
+        distinct_ratios = [
+            len(set(docids)) / len(docids)
+            for docids in groups.values()
+            if docids
+        ]
+        rollout_extra_metrics["rollout/generative_retriever/distinct_docid_ratio"] = (
+            math.fsum(distinct_ratios) / len(distinct_ratios)
+        )
     return False
