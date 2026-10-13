@@ -1,5 +1,5 @@
-import sys
 import platform
+import sys
 
 from setuptools import find_packages, setup
 from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
@@ -15,11 +15,6 @@ def _get_platform_tag():
     if machine in ("aarch64", "arm64"):
         return "manylinux2014_aarch64"
     return f"linux_{machine}"
-
-
-def _fetch_requirements(path):
-    with open(path) as fd:
-        return [r.strip() for r in fd.readlines() if r.strip() and not r.startswith("#")]
 
 
 # Custom wheel class to modify the wheel name
@@ -38,43 +33,9 @@ class bdist_wheel(_bdist_wheel):
 
 # Setup configuration
 setup(
-    author="miles Team",
-    name="miles",
     version="0.1.0",
     packages=find_packages(include=["miles*", "miles_plugins*"]),
     include_package_data=True,
     package_data={"miles.dashboard": ["static/*"]},
-    install_requires=_fetch_requirements("requirements.txt"),
-    extras_require={
-        "fsdp": [
-            "torch>=2.0",
-        ],
-        "mlflow": [
-            "mlflow>=2.0",
-        ],
-        # standalone offline serving; the training image already has these via
-        # sglang, and polars is a base requirement (used by the collector)
-        "dashboard": [
-            "fastapi>=0.135",
-            "uvicorn>=0.41",
-            "prometheus_client>=0.24",
-        ],
-        # the openenv e2b sandbox backend, imported only when that backend is
-        # selected. 2.12 is the first release that sends the template name in
-        # the `name` field, which self-hosted AgentENV reads; older ones send
-        # the deprecated `alias` and every Template.build fails with 400
-        "e2b": [
-            "e2b>=2.12",
-        ],
-    },
-    python_requires=">=3.10",
-    classifiers=[
-        "Programming Language :: Python :: 3.10",
-        "Programming Language :: Python :: 3.11",
-        "Programming Language :: Python :: 3.12",
-        "Environment :: GPU :: NVIDIA CUDA",
-        "Topic :: Scientific/Engineering :: Artificial Intelligence",
-        "Topic :: System :: Distributed Computing",
-    ],
     cmdclass={"bdist_wheel": bdist_wheel},
 )

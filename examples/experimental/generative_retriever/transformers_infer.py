@@ -9,7 +9,6 @@ Example:
         --checkpoint /path/to/checkpoint \
         --qwen-model /path/to/Qwen3-4B \
         --slm-root /path/to/SLMv3 \
-        --transformers-path /path/to/transformers-source \
         --query "cheap accommodation oporto with global travelers"
 """
 
@@ -18,11 +17,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .constrained_decode import PrefixConstraint, load_constraint
 from .model_loading import (
     build_run_arguments,
     checkpoint_tensor_shape,
@@ -44,13 +43,7 @@ class GenerationResult:
     token_logprobs: list[float]
 
 
-def _prepare_transformers(checkpoint: Path, transformers_path: str | Path | None) -> None:
-    if transformers_path is not None:
-        if "transformers" in sys.modules:
-            raise RuntimeError("transformers_path must be configured before importing transformers")
-        source_path = require_directory(transformers_path, "Transformers source")
-        sys.path.insert(0, str(source_path))
-
+def _check_transformers_version(checkpoint: Path) -> None:
     import transformers
 
     config_path = checkpoint / "config.json"
@@ -73,13 +66,16 @@ class SLMv3Retriever:
         checkpoint: str | Path,
         qwen_model: str | Path,
         slm_root: str | Path,
-        transformers_path: str | Path | None = None,
+        id_mapping: str | Path,
         device: str = "cuda",
     ) -> None:
         self.checkpoint = require_directory(checkpoint, "checkpoint")
         self.qwen_model = require_directory(qwen_model, "Qwen model")
         self.slm_root = require_directory(slm_root, "SLMv3 source")
-        _prepare_transformers(self.checkpoint, transformers_path)
+        mapping = Path(id_mapping).expanduser().resolve()
+        if not mapping.is_file():
+            raise FileNotFoundError(f"Official ID mapping is missing: {mapping}")
+        _check_transformers_version(self.checkpoint)
 
         import torch
         from transformers import T5Config, T5ForConditionalGeneration
@@ -116,6 +112,9 @@ class SLMv3Retriever:
         self.tokenizer = self.encoder.tokenizer
         self.code_dim = run_args.code_dim
         self.code_num = run_args.code_num
+        self.constraint: PrefixConstraint = load_constraint(
+            str(self.slm_root), str(mapping), self.code_num, self.code_dim,
+        )
 
     def _render_prompt(self, query: str) -> str:
         truncated_query = self.tokenizer.decode(
@@ -134,10 +133,7 @@ class SLMv3Retriever:
         )
 
     def _allowed_tokens(self, batch_index: int, prefix: Any) -> list[int]:
-        del batch_index
-        position = prefix.shape[0] - 1
-        start = 2 + position * self.code_dim
-        return list(range(start, start + self.code_dim))
+        return self.constraint(batch_index, prefix)
 
     def generate(
         self,
@@ -218,6 +214,12 @@ class SLMv3Retriever:
                     token_logprobs=transition_scores[output_index].tolist(),
                 )
             )
+        if num_beams > 1:
+            for query_index in range(len(queries)):
+                start = query_index * num_return_sequences
+                docids = [tuple(result.positional_docid) for result in results[start:start + num_return_sequences]]
+                if len(set(docids)) != len(docids):
+                    raise RuntimeError("SLMGR constrained beam returned duplicate IDs")
         return results
 
 
@@ -226,7 +228,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--qwen-model", required=True)
     parser.add_argument("--slm-root", required=True)
-    parser.add_argument("--transformers-path")
+    parser.add_argument("--id-mapping", required=True)
     parser.add_argument("--query", action="append", required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--num-beams", type=int, default=1)
@@ -240,7 +242,7 @@ def main() -> None:
         checkpoint=args.checkpoint,
         qwen_model=args.qwen_model,
         slm_root=args.slm_root,
-        transformers_path=args.transformers_path,
+        id_mapping=args.id_mapping,
         device=args.device,
     )
     results = retriever.generate(

@@ -12,7 +12,7 @@ REWARD_MODES: tuple[RewardMode, ...] = ("continuous_relevance_unique", "discrete
 
 PM_THRESHOLD = 0.58
 SM_THRESHOLD = 0.82
-BASELINE_TOP_K = 500
+BASELINE_TOP_K = 16
 UNIQUE_WEIGHT = 1.0
 
 
@@ -22,11 +22,22 @@ class RewardBreakdown:
     sm_score: float
     normalized_pm: float
     normalized_sm: float
+    pm_pass: float
+    sm_pass: float
+    pm_relevance: float
+    sm_relevance: float
     relevance: float
+    relevance_quality: float
     is_unique: bool
+    relevance_eligible: bool
+    unique_eligible: bool
     unique_bonus: float
+    discrete_base: float
+    continuous_base: float
+    discrete_total: float
+    continuous_total: float
     reward: float
-    mode: RewardMode = "continuous_relevance_unique"
+    mode: RewardMode = "discrete_relevance_unique"
 
 
 def _normalize_score(score: float, threshold: float, name: str) -> float:
@@ -34,12 +45,12 @@ def _normalize_score(score: float, threshold: float, name: str) -> float:
         raise TypeError(f"{name} must be a numeric probability")
     if not math.isfinite(score) or not 0.0 <= score <= 1.0:
         raise ValueError(f"{name} must be finite and in [0, 1], got {score!r}")
-    return max(0.0, (score - threshold) / (1.0 - threshold))
+    return min(score / threshold, 1.0)
 
 
 def calculate_reward(
     *, pm_score: float, sm_score: float, is_unique: bool,
-    mode: RewardMode = "continuous_relevance_unique",
+    mode: RewardMode = "discrete_relevance_unique",
 ) -> RewardBreakdown:
     """Combine PM/SM with keyword novelty against the filtered baseline keyword set."""
     if not isinstance(is_unique, bool):
@@ -48,21 +59,46 @@ def calculate_reward(
         raise ValueError(f"Unknown reward mode: {mode!r}")
     normalized_pm = _normalize_score(pm_score, PM_THRESHOLD, "PM score")
     normalized_sm = _normalize_score(sm_score, SM_THRESHOLD, "SM score")
+    pm_pass = float(pm_score >= PM_THRESHOLD)
+    sm_pass = float(sm_score >= SM_THRESHOLD)
+    discrete_base = pm_pass + sm_pass
+    continuous_base = normalized_pm + normalized_sm
+    relevance_quality = continuous_base / 2.0
+    relevance_eligible = bool(pm_pass or sm_pass)
+    unique_eligible = is_unique and relevance_eligible
+    unique_bonus = UNIQUE_WEIGHT * relevance_quality if unique_eligible else 0.0
+    discrete_total = discrete_base + unique_bonus
+    continuous_total = continuous_base + unique_bonus
     if mode == "continuous_relevance_unique":
-        relevance = normalized_pm + normalized_sm
-        unique_bonus = UNIQUE_WEIGHT * relevance if is_unique else 0.0
+        pm_relevance = normalized_pm
+        sm_relevance = normalized_sm
+        relevance = continuous_base
+        reward = continuous_total
     else:
-        relevance = float(int(pm_score >= PM_THRESHOLD) + int(sm_score >= SM_THRESHOLD))
-        unique_bonus = 1.0 if relevance == 2.0 and is_unique else 0.0
+        pm_relevance = pm_pass
+        sm_relevance = sm_pass
+        relevance = discrete_base
+        reward = discrete_total
     return RewardBreakdown(
         pm_score=float(pm_score),
         sm_score=float(sm_score),
         normalized_pm=normalized_pm,
         normalized_sm=normalized_sm,
+        pm_pass=pm_pass,
+        sm_pass=sm_pass,
+        pm_relevance=pm_relevance,
+        sm_relevance=sm_relevance,
         relevance=relevance,
+        relevance_quality=relevance_quality,
         is_unique=is_unique,
+        relevance_eligible=relevance_eligible,
+        unique_eligible=unique_eligible,
         unique_bonus=unique_bonus,
-        reward=relevance + unique_bonus,
+        discrete_base=discrete_base,
+        continuous_base=continuous_base,
+        discrete_total=discrete_total,
+        continuous_total=continuous_total,
+        reward=reward,
         mode=mode,
     )
 
@@ -81,7 +117,7 @@ def build_baseline_set(keyword_scores: Mapping[str, tuple[float, float]]) -> fro
 
 def calculate_keyword_rewards(
     keyword_scores: Mapping[str, tuple[float, float]], baseline: frozenset[str],
-    *, mode: RewardMode = "continuous_relevance_unique",
+    *, mode: RewardMode = "discrete_relevance_unique",
 ) -> dict[str, RewardBreakdown]:
     if mode not in REWARD_MODES:
         raise ValueError(f"Unknown reward mode: {mode!r}")
@@ -98,7 +134,7 @@ def calculate_keyword_rewards(
 
 def calculate_docid_reward(
     keyword_scores: Mapping[str, tuple[float, float]], baseline: frozenset[str],
-    *, mode: RewardMode = "continuous_relevance_unique",
+    *, mode: RewardMode = "discrete_relevance_unique",
 ) -> float:
     """Average rewards over distinct keyword texts belonging to one doc ID."""
     if not keyword_scores:

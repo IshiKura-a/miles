@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from collections.abc import Callable
 
 import torch
@@ -89,8 +89,9 @@ def generate_beams(
         raise ValueError("Require 1 <= num_return_sequences <= num_beams")
     output = model.generate(
         encoder_outputs=BaseModelOutputWithPastAndCrossAttentions(
-            last_hidden_state=hidden_states, hidden_states=hidden_states, attentions=attention_mask,
+            last_hidden_state=cast(Any, hidden_states),
         ),
+        attention_mask=attention_mask,
         max_length=code_num + 1,
         min_length=code_num + 1,
         num_beams=num_beams,
@@ -118,3 +119,81 @@ def generate_beams(
     if any(len(set(map(tuple, rows.tolist()))) != num_return_sequences for rows in tokens):
         raise RuntimeError("SLMGR constrained beam returned duplicate IDs")
     return tokens, scores.reshape_as(tokens)
+
+
+@torch.no_grad()
+def generate_samples(
+    model: Any,
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+    constraint: PrefixConstraint,
+    *,
+    code_num: int,
+    num_return_sequences: int,
+    temperature: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if num_return_sequences <= 0:
+        raise ValueError("num_return_sequences must be positive")
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+    batch_size = hidden_states.shape[0]
+    candidates_per_attempt = max(num_return_sequences * 4, num_return_sequences)
+    collected: list[dict[tuple[int, ...], tuple[torch.Tensor, torch.Tensor]]] = [
+        {} for _ in range(batch_size)
+    ]
+    for _ in range(4):
+        output = model.generate(
+            encoder_outputs=BaseModelOutputWithPastAndCrossAttentions(
+                last_hidden_state=cast(Any, hidden_states),
+            ),
+            attention_mask=attention_mask,
+            max_length=code_num + 1,
+            min_length=code_num + 1,
+            do_sample=True,
+            temperature=temperature,
+            top_p=1.0,
+            num_beams=1,
+            num_return_sequences=candidates_per_attempt,
+            prefix_allowed_tokens_fn=constraint,
+            forced_bos_token_id=None,
+            forced_eos_token_id=None,
+            decoder_start_token_id=0,
+            return_dict_in_generate=True,
+            output_scores=True,
+        )
+        candidate_tokens = output.sequences[:, 1:]
+        candidate_scores = model.compute_transition_scores(
+            output.sequences, output.scores, normalize_logits=True,
+        )
+        expected = (batch_size * candidates_per_attempt, code_num)
+        if (
+            candidate_tokens.shape != expected
+            or candidate_scores.shape != expected
+            or not torch.isfinite(candidate_scores).all()
+        ):
+            raise RuntimeError("SLMGR constrained sampling output has invalid shape or token logprobs")
+        for output_index, sequence in enumerate(output.sequences):
+            for position in range(code_num):
+                if sequence[position + 1].item() not in constraint(0, sequence[:position + 1]):
+                    raise RuntimeError("SLMGR sampling returned a token outside the official prefix constraint")
+            query_index = output_index // candidates_per_attempt
+            token_row = candidate_tokens[output_index]
+            key = tuple(token_row.tolist())
+            if key not in collected[query_index]:
+                collected[query_index][key] = (token_row, candidate_scores[output_index])
+        if all(len(rows) >= num_return_sequences for rows in collected):
+            break
+    if any(len(rows) < num_return_sequences for rows in collected):
+        counts = [len(rows) for rows in collected]
+        raise RuntimeError(
+            f"SLMGR constrained sampling could not produce {num_return_sequences} distinct IDs: {counts}"
+        )
+    tokens = torch.stack([
+        torch.stack([row[0] for row in list(rows.values())[:num_return_sequences]])
+        for rows in collected
+    ])
+    scores = torch.stack([
+        torch.stack([row[1] for row in list(rows.values())[:num_return_sequences]])
+        for rows in collected
+    ])
+    return tokens, scores

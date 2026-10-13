@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from typing import Any, cast
 
 import torch
 from torch import nn
@@ -11,6 +12,7 @@ from transformers.models.t5.modeling_t5 import T5Stack
 from examples.experimental.generative_retriever.constrained_decode import (
     build_generation_model,
     generate_beams,
+    generate_samples,
     load_constraint,
 )
 
@@ -40,7 +42,11 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
         self.docid_dim = int(raw_gr_config["docid_dim"])
         self.num_beams = int(raw_gr_config["num_beams"])
         self.num_return_sequences = int(raw_gr_config["num_return_sequences"])
-        if not 1 <= self.num_return_sequences <= self.num_beams:
+        self.decoding_mode = raw_gr_config.get("decoding_mode", "beam")
+        self.temperature = float(raw_gr_config.get("temperature", 1.0))
+        if self.decoding_mode not in {"beam", "sample"}:
+            raise ValueError("GR decoding_mode must be 'beam' or 'sample'")
+        if self.decoding_mode == "beam" and not 1 <= self.num_return_sequences <= self.num_beams:
             raise ValueError("Require 1 <= num_return_sequences <= num_beams")
         self.constraint = load_constraint(
             raw_gr_config["slm_root"], raw_gr_config["id_mapping"], self.docid_size, self.docid_dim,
@@ -50,7 +56,7 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
         decoder_config.is_decoder = True
         decoder_config.is_encoder_decoder = True
         decoder_config.use_cache = False
-        decoder_config.num_layers = decoder_config.num_decoder_layers
+        cast(Any, decoder_config).num_layers = decoder_config.num_decoder_layers
         decoder_vocab_size = self.docid_size * self.docid_dim + 2
         decoder_config.vocab_size = decoder_vocab_size
 
@@ -109,13 +115,27 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> EmbeddingPoolerOutput:
-        token_ids, token_logprobs = generate_beams(
-            self._generation_model, hidden_states, attention_mask, self.constraint,
-            code_num=self.docid_size, num_beams=self.num_beams,
-            num_return_sequences=self.num_return_sequences,
-        )
+        if self.decoding_mode == "beam":
+            token_ids, token_logprobs = generate_beams(
+                self._generation_model, hidden_states, attention_mask, self.constraint,
+                code_num=self.docid_size, num_beams=self.num_beams,
+                num_return_sequences=self.num_return_sequences,
+            )
+        else:
+            token_ids, token_logprobs = generate_samples(
+                self._generation_model, hidden_states, attention_mask, self.constraint,
+                code_num=self.docid_size, num_return_sequences=self.num_return_sequences,
+                temperature=self.temperature,
+            )
         packed = torch.cat((token_ids.float(), token_logprobs.float()), dim=-1).flatten(1)
-        return EmbeddingPoolerOutput(embeddings=packed)
+        return self._dp_compatible_output(packed)
+
+    @staticmethod
+    def _dp_compatible_output(embeddings: torch.Tensor) -> EmbeddingPoolerOutput:
+        output = EmbeddingPoolerOutput(embeddings=embeddings)
+        cast(Any, output).next_token_logits = embeddings.new_empty((0, 0))
+        cast(Any, output).hidden_states = None
+        return output
 
     @torch.no_grad()
     def forward(
@@ -129,6 +149,11 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
         if not get_embedding:
             raise ValueError("GRQwen3ForDocIDGeneration only supports embedding-mode rollout")
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        if hidden_states.shape[0] == 0:
+            packed_width = self.num_return_sequences * self.docid_size * 2
+            return self._dp_compatible_output(
+                hidden_states.new_empty((0, packed_width)),
+            )
         hidden_states, attention_mask = self._split_hidden_states(hidden_states, forward_batch)
         return self._generate_docids(hidden_states, attention_mask)
 

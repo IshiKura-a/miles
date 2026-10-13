@@ -6,6 +6,55 @@ requires = [
 ]
 build-backend = "setuptools.build_meta"
 
+[project]
+name = "miles"
+description = "A reinforcement learning framework for large language models"
+requires-python = ">=3.10"
+authors = [{name = "miles Team"}]
+dynamic = ["dependencies", "version"]
+classifiers = [
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: System :: Distributed Computing",
+]
+
+[project.optional-dependencies]
+dashboard = [
+    "fastapi>=0.135",
+    "prometheus_client>=0.24",
+    "uvicorn>=0.41",
+]
+e2b = ["e2b>=2.12"]
+fsdp = ["torch>=2.0"]
+mlflow = ["mlflow>=2.0"]
+nvidia-runtime = ["nvidia-resiliency-ext~=0.6.0; platform_system == 'Linux'"]
+generative-retriever = [
+    "gin-config",
+    "megatron-core",
+    "sglang",
+]
+
+[dependency-groups]
+dev = [
+    "pyright[nodejs]",
+    "ruff",
+]
+
+[tool.uv.sources]
+megatron-core = { git = "https://github.com/radixark/Megatron-LM.git", rev = "fd15ee20a4f03b03680529baf4b8f7eeed64df1d" }
+sglang = { git = "https://github.com/sgl-project/sglang.git", rev = "7f79d11d948aa37b49821475e075369bb0e801f3", subdirectory = "python" }
+
+[tool.uv]
+override-dependencies = [
+    "nvidia-resiliency-ext; sys_platform == 'never'",
+]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+
 [tool.isort]
 profile = "black"  # black-compatible
 line_length = 119  # should match black parameters
@@ -24,6 +73,8 @@ line_length = 119
 
 [tool.ruff]
 line-length = 320  # TODO
+
+[tool.ruff.lint]
 select = [
     "E",      # Pycodestyle Errors (Structural/Fundamental Errors like bad indentation)
     "F",      # Pyflakes (Core Errors: Unused imports, undefined names)

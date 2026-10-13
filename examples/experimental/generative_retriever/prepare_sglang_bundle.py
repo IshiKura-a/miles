@@ -38,9 +38,10 @@ def prepare_bundle(
     output: str | Path,
     slm_root: str | Path,
     id_mapping: str | Path,
-    num_beams: int = 500,
-    num_return_sequences: int = 8,
+    num_beams: int = 1,
+    num_return_sequences: int = 16,
     temperature: float = 1.0,
+    decoding_mode: str = "sample",
 ) -> Path:
     checkpoint_path = require_directory(checkpoint, "checkpoint")
     qwen_path = require_directory(qwen_model, "Qwen model")
@@ -51,9 +52,11 @@ def prepare_bundle(
     output_path = Path(output).expanduser().resolve()
     output_path.mkdir(parents=True, exist_ok=True)
 
-    if temperature != 1.0:
-        raise ValueError("Official constrained beam search requires temperature=1")
-    if not 1 <= num_return_sequences <= num_beams:
+    if decoding_mode not in {"beam", "sample"}:
+        raise ValueError("decoding_mode must be 'beam' or 'sample'")
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+    if decoding_mode == "beam" and not 1 <= num_return_sequences <= num_beams:
         raise ValueError("Require 1 <= num_return_sequences <= num_beams")
 
     with (qwen_path / "config.json").open(encoding="utf-8") as config_file:
@@ -71,6 +74,7 @@ def prepare_bundle(
         "id_mapping": str(mapping_path),
         "num_beams": num_beams,
         "num_return_sequences": num_return_sequences,
+        "decoding_mode": decoding_mode,
     }
     (output_path / "config.json").write_text(
         json.dumps(config, indent=2, sort_keys=True) + "\n",
@@ -112,9 +116,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True)
     parser.add_argument("--slm-root", required=True)
     parser.add_argument("--id-mapping", required=True)
-    parser.add_argument("--num-beams", type=int, default=500)
-    parser.add_argument("--num-return-sequences", type=int, default=8)
+    parser.add_argument("--num-beams", type=int, default=1)
+    parser.add_argument("--num-return-sequences", type=int, default=16)
     parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--decoding-mode", choices=("beam", "sample"), default="sample")
     return parser.parse_args()
 
 
@@ -129,6 +134,7 @@ def main() -> None:
         num_beams=args.num_beams,
         num_return_sequences=args.num_return_sequences,
         temperature=args.temperature,
+        decoding_mode=args.decoding_mode,
     )
     print(os.fspath(output))
 

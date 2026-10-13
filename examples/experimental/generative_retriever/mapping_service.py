@@ -11,7 +11,7 @@ import argparse
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import uvicorn
 from fastapi import FastAPI
@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field, StrictInt, field_validator
 from examples.experimental.generative_retriever.id_text_mapping import PositionalID, _validate_id
 
 logger = logging.getLogger(__name__)
+_SERVICE_API_VERSION = 1
 
 
 class LookupRequest(BaseModel):
@@ -113,10 +114,14 @@ def create_app(mapping: str | Path) -> FastAPI:
     app = FastAPI(lifespan=lifespan)
 
     @app.get("/health")
-    def health() -> dict[str, str | int]:
+    def health() -> dict[str, Any]:
         loaded = app.state.mapping
         return {"status": "ready", "mapping_version": path.name,
-                "id_count": loaded.id_count, "rows": loaded.rows, "bytes": loaded.byte_count}
+                "id_count": loaded.id_count, "rows": loaded.rows, "bytes": loaded.byte_count,
+                "service_config": {
+                    "api_version": _SERVICE_API_VERSION,
+                    "mapping": str(path),
+                }}
 
     @app.post("/lookup", response_model=LookupResponse)
     def lookup(request: LookupRequest) -> LookupResponse:

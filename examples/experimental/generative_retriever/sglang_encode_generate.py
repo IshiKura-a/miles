@@ -4,31 +4,24 @@ from __future__ import annotations
 
 import math
 import asyncio
-from typing import Any
+from typing import Any, cast
+from weakref import WeakKeyDictionary
 
-from miles.backends.sglang_utils.sglang_router_api_client import use_legacy_router_api
 from miles.rollout.base_types import GenerateFnInput, GenerateFnOutput
-from miles.utils.http_utils import GeneralHttpClientProvider, post
+from miles.utils.http_utils import GeneralHttpClientProvider
 from miles.utils.types import Sample
 from examples.experimental.generative_retriever.relevance_reward import REWARD_MODES
 
+_REQUESTS_BY_STATE: WeakKeyDictionary[Any, dict[Any, Any]] = WeakKeyDictionary()
+_DOCID_SIZE = 4
+_DOCID_DIM = 256
+
 
 def _add_arguments(parser) -> None:
+    parser.set_defaults(wandb_always_use_train_step=True)
     parser.add_argument(
         "--generative-retriever-reward-mode", choices=REWARD_MODES,
-        default="continuous_relevance_unique",
-    )
-    parser.add_argument(
-        "--generative-retriever-docid-size",
-        type=int,
-        default=4,
-        help="Number of positional docid tokens returned by the GR policy.",
-    )
-    parser.add_argument(
-        "--generative-retriever-docid-dim",
-        type=int,
-        default=256,
-        help="Number of codes available at each docid position.",
+        default="discrete_relevance_unique",
     )
     parser.add_argument(
         "--generative-retriever-reward-url",
@@ -78,24 +71,27 @@ def _parse_embedding(
 
 
 async def _resolve_engine_url(args: Any, sample: Sample) -> str:
-    router_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
-    if use_legacy_router_api(args):
-        response = await GeneralHttpClientProvider.client().get(f"{router_url}/list_workers")
-        response.raise_for_status()
-        worker_urls = response.json().get("urls", [])
-    else:
-        response = await GeneralHttpClientProvider.client().get(f"{router_url}/workers")
-        response.raise_for_status()
-        worker_urls = sorted(
-            worker["url"]
-            for worker in response.json().get("workers", [])
-            if worker.get("is_healthy") and worker.get("worker_type") == "regular"
-        )
-    if not worker_urls:
-        raise RuntimeError(f"GR rollout router has no healthy regular workers: {router_url}")
-    routing_index = sample.group_index if sample.group_index is not None else sample.index
-    routing_index = routing_index if routing_index is not None else 0
-    return worker_urls[routing_index % len(worker_urls)]
+    del sample
+    return f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
+
+
+async def _request_embedding(args: Any, router_url: str, prompt_ids: list[int]) -> dict[str, Any]:
+    response = await GeneralHttpClientProvider.client().post(
+        f"{router_url}/v1/embeddings",
+        json={
+            "model": args.hf_checkpoint,
+            "input": prompt_ids,
+        },
+    )
+    response.raise_for_status()
+    payload = response.json()
+    data = payload.get("data")
+    if not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], dict):
+        raise ValueError("GR router returned an invalid embeddings response")
+    embedding = data[0].get("embedding")
+    if not isinstance(embedding, list):
+        raise ValueError("GR router response is missing an embedding list")
+    return {"embedding": embedding}
 
 
 def _training_prompt_ids(state: Any, sample: Sample) -> list[int]:
@@ -128,14 +124,12 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
     if not input.evaluation and sample.group_index is None:
         raise ValueError("Constrained training rollout requires sample.group_index")
     beam_rank = 0 if input.evaluation else sample.index % group_size
-    if not hasattr(input.state, "_gr_beam_requests"):
-        input.state._gr_beam_requests = {}
-    requests = input.state._gr_beam_requests
+    requests = _REQUESTS_BY_STATE.setdefault(input.state, {})
     group_key = sample.index if input.evaluation else sample.group_index
     key = (input.evaluation, group_key, engine_url, tuple(prompt_ids))
     if key not in requests:
         requests[key] = (
-            asyncio.create_task(post(f"{engine_url}/encode", {"input_ids": prompt_ids})),
+            asyncio.create_task(_request_embedding(args, engine_url, prompt_ids)),
             set(),
         )
     task, consumed = requests[key]
@@ -147,8 +141,8 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
     consumed.add(beam_rank)
     if input.evaluation or len(consumed) == group_size:
         requests.pop(key, None)
-    docid_size = args.generative_retriever_docid_size
-    docid_dim = args.generative_retriever_docid_dim
+    docid_size = _DOCID_SIZE
+    docid_dim = _DOCID_DIM
     token_ids, logprobs = _parse_embedding(output, docid_size, docid_dim, group_size, beam_rank)
 
     sample.tokens = prompt_ids + token_ids
@@ -167,4 +161,4 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
     return GenerateFnOutput(samples=sample)
 
 
-generate.add_arguments = _add_arguments
+cast(Any, generate).add_arguments = _add_arguments
