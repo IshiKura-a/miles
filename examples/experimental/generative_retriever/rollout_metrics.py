@@ -20,13 +20,14 @@ def log_rollout(
     values: dict[str, list[float]] = defaultdict(list)
     for sample in samples:
         metadata = sample.metadata.get("generative_retriever", {})
-        for name, value in metadata.get("reward_metrics", {}).items():
-            if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value)):
-                values[name].append(float(value))
+        for source in ("prepare_metrics", "reward_metrics"):
+            for name, value in metadata.get(source, {}).items():
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value)):
+                    values[name].append(float(value))
     for name, metrics in values.items():
-        if name.startswith(("cache_delta/", "routing_delta/")):
+        if name.startswith(("cache_delta/", "routing_delta/", "prepare/cache_delta/", "prepare/routing_delta/")):
             value = math.fsum(metrics)
-        elif name.startswith("cache_gauge/"):
+        elif name.startswith(("cache_gauge/", "prepare/cache_gauge/")):
             value = metrics[-1]
         else:
             value = math.fsum(metrics) / len(metrics)

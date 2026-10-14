@@ -13,9 +13,12 @@ import uvicorn
 import xxhash
 from fastapi import FastAPI, HTTPException
 
-from examples.experimental.generative_retriever.reward_service import RewardRequest
+from examples.experimental.generative_retriever.reward_service import (
+    BaselinePrepareRequest,
+    RewardRequest,
+)
 
-_SERVICE_API_VERSION = 2
+_SERVICE_API_VERSION = 3
 
 
 class RewardRouter:
@@ -26,6 +29,7 @@ class RewardRouter:
         self._executor = ThreadPoolExecutor(max_workers=len(worker_urls))
         self._routing_lock = Lock()
         self._routed_samples = [0] * len(worker_urls)
+        self._prepared_queries = [0] * len(worker_urls)
 
     def _worker_index(self, query: str) -> int:
         scores = [
@@ -103,6 +107,64 @@ class RewardRouter:
             },
         }
 
+    def prepare(self, request: BaselinePrepareRequest) -> dict[str, Any]:
+        buckets: list[list[str]] = [[] for _ in self.worker_urls]
+        for query in request.queries:
+            buckets[self._worker_index(query)].append(query)
+        with self._routing_lock:
+            for index, bucket in enumerate(buckets):
+                self._prepared_queries[index] += len(bucket)
+        futures = [
+            self._executor.submit(
+                self._post_prepare,
+                url.removesuffix("/score") + "/prepare",
+                BaselinePrepareRequest(queries=bucket),
+            )
+            if bucket else None
+            for url, bucket in zip(self.worker_urls, buckets, strict=True)
+        ]
+        responses = [future.result() if future is not None else None for future in futures]
+        return {
+            "prepared_queries": sum(
+                response["prepared_queries"]
+                for response in responses
+                if response is not None
+            ),
+            "mapping_version": next(
+                response["mapping_version"] for response in responses if response is not None
+            ),
+            "cache": {
+                f"worker_{index}": response["cache"]
+                for index, response in enumerate(responses)
+                if response is not None
+            },
+            "cache_delta": {
+                f"worker_{index}": response["cache_delta"]
+                for index, response in enumerate(responses)
+                if response is not None
+            },
+            "latency_seconds": max(
+                response["latency_seconds"] for response in responses if response is not None
+            ),
+            "routed_queries": {
+                f"worker_{index}": len(bucket)
+                for index, bucket in enumerate(buckets)
+            },
+        }
+
+    @staticmethod
+    def _post_prepare(url: str, request: BaselinePrepareRequest) -> dict[str, Any]:
+        response = httpx.post(
+            url,
+            json=request.model_dump(mode="json"),
+            timeout=900.0,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("Reward worker prepare response must be a JSON object")
+        return payload
+
     def health(self) -> dict[str, Any]:
         responses = []
         for url in self.worker_urls:
@@ -117,6 +179,7 @@ class RewardRouter:
             raise RuntimeError(f"Reward workers use different mappings: {mapping_versions}")
         with self._routing_lock:
             routed_samples = list(self._routed_samples)
+            prepared_queries = list(self._prepared_queries)
         return {
             "status": "ready",
             "mode": "router",
@@ -126,6 +189,10 @@ class RewardRouter:
             "routed_samples": {
                 f"worker_{index}": count
                 for index, count in enumerate(routed_samples)
+            },
+            "prepared_queries": {
+                f"worker_{index}": count
+                for index, count in enumerate(prepared_queries)
             },
             "service_config": {
                 "api_version": _SERVICE_API_VERSION,
@@ -158,6 +225,13 @@ def create_app(worker_urls: tuple[str, ...]) -> FastAPI:
     def score(request: RewardRequest) -> dict[str, Any]:
         try:
             return app.state.router.score(request)
+        except (httpx.HTTPError, RuntimeError, ValueError) as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+
+    @app.post("/prepare")
+    def prepare(request: BaselinePrepareRequest) -> dict[str, Any]:
+        try:
+            return app.state.router.prepare(request)
         except (httpx.HTTPError, RuntimeError, ValueError) as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
 

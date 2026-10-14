@@ -207,6 +207,9 @@ HTTP reward hook 对每个 sample 获取一个 doc ID 的平均 keyword reward�
   `distinct_docid_ratio`，不因某个 query 的低熵分布终止整个 scheduler。
 - `/encode` 返回每条 sample 的 4 个 decoder token 和 4 个 logprob。
   同一训练 group 共用一次请求，各 sample 使用不同随机采样结果。
+- 每个 query group 在提交共享 `/encode` 请求时，同时提交 reward baseline
+  prepare；prepare client 用 10ms 窗口合并最多 512 个 query。Group completion
+  同时等待 rollout 与 prepare，耗时为两条链路的最大值而非串行和。
 - Miles custom rollout 通过 router 标准 `/v1/embeddings` API 请求 packed
   token/logprob；不读取 router 中脱敏的 worker URL。
 - Learner 对每个响应 prefix 使用同一官方约束计算 logprob。
@@ -215,12 +218,29 @@ HTTP reward hook 对每个 sample 获取一个 doc ID 的平均 keyword reward�
   现有常驻服务；仅在服务不存在时启动独立进程并等待 ready 后提交训练。
   训练完成或失败均不停止健康服务，避免重复加载模型和 25GB mapping。
   只有本次新建但未通过 health 的失败进程会按明确 PID 清理。
+- 常驻 mapping/baseline/reward 服务日志写入
+  `~/.local/state/miles/generative_retriever/`，禁止写入online训练输出目录；
+  `<output_dir>/<run_id>/` 只保存该run的prompt alias、launcher日志和checkpoint。
 
 ### 训练规模
 
 - `n_samples_per_prompt=16`。
-- 每轮处理 `8192 / 16 = 512` 个 query，即 `rollout_batch_size=512`。
-- `global_batch_size=8192`，每次 rollout 恰好形成一个 training step。
+- 每轮处理 `16384 / 16 = 1024` 个 query，即 `rollout_batch_size=1024`。
+- Prompt dataset 直接读取完整 15,000,000 条 queryfeat JSONL，并在每个 epoch
+  开始时确定性 shuffle；`512` 仅是每个 training step 消费的 query 数，禁止
+  在 launcher 中截断整个数据集。源文件的 `.json` 名称通过 run 目录内的
+  `.jsonl` 符号链接适配 Miles，不复制 4.5GB 数据。
+- 当前 recipe 固定 1,000 steps，共消费 1,024,000 个不重复 dataset row，约
+  0.068 epoch；源数据自身可包含相同 query 文本。
+  Launcher 启动时统计 dataset 记录数；若固定 steps 会越过 dataset 末尾则直接
+  失败，禁止 `RolloutDataSource` 隐式 wrap。需要重复数据时必须使用显式 epoch recipe。
+- `global_batch_size=16384`，每次 rollout 恰好形成一个 training step。
+- Learner 使用动态 token batching，每卡每 microbatch 上限 33,024 tokens；
+  microbatch 数按实际 prompt 长度计算并在两个 FSDP rank 间取最大值，不使用
+  `micro_batch_size=1` 的 4,096 次逐 sample 梯度累积。
+- 冻结 Qwen encoder 直接调用 `Qwen3Model` backbone 获取 last hidden state；
+  禁止经过 `Qwen3ForCausalLM.lm_head` 物化 `[tokens, 151936]` 的无用词表 logits，
+  也不保留逐层 hidden states 或无用 KV cache。
 - Checkpoint 默认每 20 个完成的 training step 保存一次，最后一个 step 强制保存；
   路径为 `<output_dir>/<run_id>/checkpoints/iter_<step>/`，包含 model、
   optimizer、LR scheduler、RNG 和下一 rollout ID。
@@ -249,8 +269,12 @@ launcher 自己创建并持有 PID 的失败进程；禁止按名称清理或终
 
 ### Baseline / reward cache
 
-- Baseline query 结果和每个 reward worker 的 query-keyword 分数分别使用 LRU cache。
-- 每个 cache 实例的容量固定为 8,192；总容量随 reward worker 数量横向扩展。
+- Baseline service 的 query 结果，以及每个 reward worker 的 baseline set 和
+  query feature，分别使用容量 8,192 的 LRU cache。
+- 每个 reward worker 的 query-keyword score cache 容量为 131,072。正式规模
+  压测实测每 worker 单轮 working set 约 43,500 项；该容量覆盖约三轮 working set，
+  避免 8,192 容量在同一轮内淘汰并重算当前分数。
+- 所有 reward cache 的总容量随 worker 数量横向扩展。
 - Reward HTTP 响应和 `/health` 暴露 capacity、size、hits、misses、evictions。
 - W&B 对每个 request 汇报 hit/miss/eviction delta，对 capacity/size 汇报 gauge；
   不对累计计数快照做 sample 平均。
@@ -327,9 +351,24 @@ uv run python -m examples.experimental.generative_retriever.reward_router_servic
 - Router `GET /health`：全部 worker 的 readiness、映射一致性和配置。
 - `POST /score`：`samples` 中提供 `prompt` 和四个 `docid_tokens`，
   `reward_mode` 选择连续或离散模式。
+- `POST /prepare`：输入最多 512 个 query，router 按同一 rendezvous affinity
+  分配到 reward worker；worker 并发调用 baseline service，并提前完成 mapping、
+  baseline relevance、baseline set、query feature 和 query-keyword score cache。
+  Prepare 失败必须使对应 rollout group 显式失败，禁止退化为未预热的成功结果。
+- Rollout reward hook 在同一 executor 内用 10ms 窗口合并并发 group，每个
+  HTTP request 最多 512 samples；同一时刻只保留一个 router request in-flight，
+  由 router 按 query 拆到两个 worker 并行评分，结果恢复到原 group 和 sample 顺序。
+- 每个 worker 对整个 request 批量准备缺失 baseline，并把全部 query-keyword
+  cache miss 合并为批量 query encode、keyword encode 和 cross-score；禁止按
+  sample 单独调用 relevance pipeline。
+- Reward HTTP request timeout 默认 300 秒；超时显式丢弃对应 rollout group，
+  不把失败伪装为零 reward。
+- W&B 单独汇报 prepare latency、每 worker routed query、cache delta 和 gauge；
+  同一个合并 prepare request 的指标只记录一次。
 - 返回 `rewards`、逐 ID/keyword 的 `details`、request cache delta 和 cache gauge。
 - 同一 query 稳定落到同一个 worker；增加 worker 时 rendezvous hashing 只迁移
-  部分 query。每个 worker 的 LRU 容量为 8,192。
+  部分 query。每个 worker 的 query cache 容量为 8,192，query-keyword score
+  cache 容量为 131,072。
 - Router 汇报每 worker routed sample 累计值；只有观测到热点 query 造成队列
   饱和后才启用显式 secondary-worker overflow，并单独计量重复 cache，避免
   无依据的动态负载策略破坏 query affinity。

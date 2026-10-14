@@ -1,4 +1,4 @@
-"""Single-node ROCm GRPO launcher for SLMv3 generative retrieval."""
+"""Single-node eight-GPU GRPO launcher for SLMv3 generative retrieval."""
 
 from __future__ import annotations
 
@@ -22,7 +22,6 @@ if str(_MILES_REPO_ROOT) not in sys.path:
 
 import miles.utils.external_utils.command_utils as U
 from miles.utils.misc import get_current_node_ip
-from examples.experimental.generative_retriever.convert_queryfeat import convert_queryfeat
 from examples.experimental.generative_retriever.relevance_reward import REWARD_MODES, RewardMode
 from examples.experimental.generative_retriever.relevance_model import resolve_relevance_source
 
@@ -68,6 +67,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
         "train_15M.queryfeat.2026-04-01/Part0.json"
     )
     output_dir: str = "$cosmos_data_path/local/User/zihao/online_rl/gr_offline_syn/"
+    service_log_dir: str = "~/.local/state/miles/generative_retriever/"
     relevance_model: str = (
         "$cosmos_data_path/local/User/yugao/share/qualitymodel/"
         "GCQC/GV2.1/ForArcher/Large/"
@@ -79,9 +79,11 @@ class ScriptArgs(U.ExecuteTrainConfig):
     rollout_num_gpus_per_engine: int = 2
     sglang_dp_size: int = 2
     sglang_mem_fraction_static: float = 0.7
-    rollout_batch_size: int = 512
+    rollout_batch_size: int = 1024
     n_samples_per_prompt: int = 16
-    global_batch_size: int = 8192
+    global_batch_size: int = 16384
+    max_tokens_per_gpu: int = 33024
+    reward_timeout: float = 300.0
     num_rollout: int = 1000
     temperature: float = 1.0
     lr: float = 1e-6
@@ -112,22 +114,51 @@ def _validate_gpu_topology(args: ScriptArgs) -> None:
         raise ValueError("Learner and train rollout must each use exactly two GPUs")
 
 
-def _prepare_prompt_data(source: Path, destination: Path, slm_root: str) -> Path:
+@dataclass(frozen=True)
+class _PromptData:
+    path: Path
+    input_key: str
+    label_key: str | None
+    metadata_key: str | None
+    sample_count: int
+
+
+def _count_records(path: Path) -> int:
+    with path.open("rb") as stream:
+        count = sum(bool(line.strip()) for line in stream)
+    if count == 0:
+        raise ValueError(f"Prompt dataset is empty: {path}")
+    return count
+
+
+def _prepare_prompt_data(source: Path, jsonl_alias: Path) -> _PromptData:
     with source.open(encoding="utf-8") as stream:
         first = json.loads(stream.readline())
     if isinstance(first, dict) and isinstance(first.get("prompt"), str):
-        return source
+        if source.suffix != ".jsonl":
+            raise ValueError(f"Prompt dataset with prompt fields must use a .jsonl suffix: {source}")
+        return _PromptData(
+            path=source,
+            input_key="prompt",
+            label_key="label",
+            metadata_key="metadata",
+            sample_count=_count_records(source),
+        )
     if not isinstance(first, dict) or not isinstance(first.get("query"), str):
         raise ValueError(f"Prompt data must contain either prompt or query fields: {source}")
-    count = convert_queryfeat(
-        parts=[source],
-        output=destination,
-        slm_root=slm_root,
-        limit=512,
+    jsonl_alias.parent.mkdir(parents=True, exist_ok=True)
+    if jsonl_alias.exists() or jsonl_alias.is_symlink():
+        if jsonl_alias.resolve() != source:
+            raise FileExistsError(f"Prompt dataset alias points to another file: {jsonl_alias}")
+    else:
+        jsonl_alias.symlink_to(source)
+    return _PromptData(
+        path=jsonl_alias,
+        input_key="query",
+        label_key=None,
+        metadata_key=None,
+        sample_count=_count_records(source),
     )
-    if count != 512:
-        raise ValueError(f"Expected 512 queries for one rollout, converted {count}")
-    return destination
 
 
 def _service_env(gpus: str) -> dict[str, str]:
@@ -211,13 +242,13 @@ def _ensure_resident_services(
     qwen_model: str,
     slm_root: str,
     mapping: Path,
-    output_dir: Path,
+    service_log_dir: Path,
 ) -> str:
     relevance_model = _expanded_path(args.relevance_model, "Relevance model")
     relevance_source = resolve_relevance_source(
         relevance_model,
     )
-    service_dir = output_dir / args.run_id / "services"
+    service_dir = service_log_dir
     service_dir.mkdir(parents=True, exist_ok=True)
     mapping_url = f"http://127.0.0.1:{_MAPPING_PORT}"
     baseline_url = f"http://127.0.0.1:{_BASELINE_PORT}/generate"
@@ -311,13 +342,14 @@ def _ensure_resident_services(
                     "worker_count": 1,
                     "mapping_version": mapping.name,
                     "service_config": {
-                        "api_version": 3,
+                        "api_version": 6,
                         "baseline_url": baseline_url,
                         "mapping_url": mapping_url,
                         "mapping_version": mapping.name,
                         "relevance_source": str(relevance_source),
                         "relevance_model": str(relevance_model),
-                        "cache_size": 8192,
+                        "query_cache_size": 8192,
+                        "score_cache_size": 131072,
                         "baseline_top_k": args.n_samples_per_prompt,
                     },
                 },
@@ -345,7 +377,7 @@ def _ensure_resident_services(
                 "worker_count": 2,
                 "mapping_version": mapping.name,
                 "service_config": {
-                    "api_version": 2,
+                    "api_version": 3,
                     "worker_urls": [
                         f"http://127.0.0.1:{port}/score"
                         for port in _REWARD_WORKER_PORTS
@@ -429,6 +461,10 @@ def execute(args: ScriptArgs) -> None:
         raise FileNotFoundError(f"Official ID mapping is required: {args.id_mapping!r}")
     if args.temperature <= 0:
         raise ValueError("Training sampling temperature must be positive")
+    if args.reward_timeout <= 0:
+        raise ValueError("reward_timeout must be positive")
+    if args.max_tokens_per_gpu <= 0:
+        raise ValueError("max_tokens_per_gpu must be positive")
     if args.rollout_batch_size * args.n_samples_per_prompt != args.global_batch_size:
         raise ValueError(
             "One training step must contain rollout_batch_size * n_samples_per_prompt "
@@ -448,11 +484,24 @@ def execute(args: ScriptArgs) -> None:
 
     output_dir = _expanded_path(args.output_dir, "output_dir", directory=False)
     output_dir.mkdir(parents=True, exist_ok=True)
+    service_log_dir = _expanded_path(
+        args.service_log_dir,
+        "service_log_dir",
+        directory=False,
+    )
+    service_log_dir.mkdir(parents=True, exist_ok=True)
     prompt_data = _prepare_prompt_data(
         prompt_source,
         output_dir / args.run_id / "prompt_data.jsonl",
-        slm_root,
     )
+    required_queries = args.num_rollout * args.rollout_batch_size
+    if required_queries > prompt_data.sample_count:
+        raise ValueError(
+            "Fixed-step training must not reuse dataset rows implicitly: "
+            f"num_rollout * rollout_batch_size requires {required_queries} queries, "
+            f"but the dataset contains {prompt_data.sample_count}. "
+            "Use an explicit epoch-based recipe to repeat the dataset."
+        )
     bundle = output_dir / args.run_id / "sglang_bundle"
     quote = shlex.quote
     U.exec_command_cpu(
@@ -507,6 +556,8 @@ def execute(args: ScriptArgs) -> None:
         "--weight-sync-include-prefixes "
         "docEnc2decoder. decoder. lm_head. "
         "--update-weight-buffer-size 536870912 "
+        "--use-dynamic-batch-size "
+        f"--max-tokens-per-gpu {args.max_tokens_per_gpu} "
     )
     checkpoint_args = (
         f"--save {quote(os.fspath(output_dir / args.run_id / 'checkpoints'))} "
@@ -522,13 +573,14 @@ def execute(args: ScriptArgs) -> None:
         qwen_model=qwen_model,
         slm_root=slm_root,
         mapping=mapping,
-        output_dir=output_dir,
+        service_log_dir=service_log_dir,
     )
+    reward_prepare_url = reward_url.removesuffix("/score") + "/prepare"
     rollout_args = (
-            f"--prompt-data {quote(os.fspath(prompt_data))} "
-            "--input-key prompt "
-            "--label-key label "
-            "--metadata-key metadata "
+            f"--prompt-data {quote(os.fspath(prompt_data.path))} "
+            f"--input-key {quote(prompt_data.input_key)} "
+            f"{f'--label-key {quote(prompt_data.label_key)} ' if prompt_data.label_key else ''}"
+            f"{f'--metadata-key {quote(prompt_data.metadata_key)} ' if prompt_data.metadata_key else ''}"
             "--rollout-shuffle "
             "--custom-generate-function-path "
             "examples.experimental.generative_retriever.sglang_encode_generate.generate "
@@ -536,7 +588,9 @@ def execute(args: ScriptArgs) -> None:
             "--custom-rollout-log-function-path "
             "examples.experimental.generative_retriever.rollout_metrics.log_rollout "
             f"--generative-retriever-reward-url {quote(reward_url)} "
+            f"--generative-retriever-reward-prepare-url {quote(reward_prepare_url)} "
             f"--generative-retriever-reward-mode {args.reward_mode} "
+            f"--generative-retriever-reward-timeout {args.reward_timeout} "
             f"--num-rollout {args.num_rollout} "
             f"--rollout-batch-size {args.rollout_batch_size} "
             f"--n-samples-per-prompt {args.n_samples_per_prompt} "

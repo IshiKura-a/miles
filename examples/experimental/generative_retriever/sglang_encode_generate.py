@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-import math
 import asyncio
+import math
+from collections import deque
+from dataclasses import dataclass
 from typing import Any, cast
 from weakref import WeakKeyDictionary
 
@@ -13,8 +15,106 @@ from miles.utils.types import Sample
 from examples.experimental.generative_retriever.relevance_reward import REWARD_MODES
 
 _REQUESTS_BY_STATE: WeakKeyDictionary[Any, dict[Any, Any]] = WeakKeyDictionary()
+_PREPARE_BATCHERS: WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[tuple[str, float], _BaselinePrepareBatcher]
+] = WeakKeyDictionary()
 _DOCID_SIZE = 4
 _DOCID_DIM = 256
+_MAX_PREPARE_QUERIES = 512
+_PREPARE_BATCH_WAIT_SECONDS = 0.01
+
+
+@dataclass
+class _PendingPrepare:
+    query: str
+    future: asyncio.Future[dict[str, float]]
+
+
+class _BaselinePrepareBatcher:
+    def __init__(self, url: str, timeout_seconds: float) -> None:
+        self._url = url
+        self._timeout_seconds = timeout_seconds
+        self._pending: deque[_PendingPrepare] = deque()
+        self._flush_task: asyncio.Task[None] | None = None
+
+    async def submit(self, query: str) -> dict[str, float]:
+        future = asyncio.get_running_loop().create_future()
+        self._pending.append(_PendingPrepare(query=query, future=future))
+        if self._flush_task is None:
+            self._flush_task = asyncio.create_task(self._flush())
+        return await future
+
+    async def _flush(self) -> None:
+        try:
+            while self._pending:
+                await asyncio.sleep(_PREPARE_BATCH_WAIT_SECONDS)
+                requests = [
+                    self._pending.popleft()
+                    for _ in range(min(len(self._pending), _MAX_PREPARE_QUERIES))
+                ]
+                try:
+                    metrics = await self._post(requests)
+                except Exception as error:
+                    for request in requests:
+                        if not request.future.done():
+                            request.future.set_exception(error)
+                else:
+                    for index, request in enumerate(requests):
+                        if not request.future.done():
+                            request.future.set_result(metrics if index == 0 else {})
+        finally:
+            self._flush_task = None
+            if self._pending:
+                self._flush_task = asyncio.create_task(self._flush())
+
+    async def _post(self, requests: list[_PendingPrepare]) -> dict[str, float]:
+        queries = list(dict.fromkeys(request.query for request in requests))
+        response = await GeneralHttpClientProvider.client().post(
+            self._url,
+            json={"queries": queries},
+            timeout=self._timeout_seconds,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("Reward prepare endpoint must return a JSON object")
+        if payload.get("prepared_queries") != len(queries):
+            raise ValueError("Reward prepare endpoint returned an unexpected query count")
+        return _prepare_metrics(payload)
+
+
+def _get_prepare_batcher(url: str, timeout_seconds: float) -> _BaselinePrepareBatcher:
+    loop = asyncio.get_running_loop()
+    batchers = _PREPARE_BATCHERS.setdefault(loop, {})
+    key = (url, timeout_seconds)
+    batcher = batchers.get(key)
+    if batcher is None:
+        batcher = _BaselinePrepareBatcher(url, timeout_seconds)
+        batchers[key] = batcher
+    return batcher
+
+
+def _prepare_metrics(payload: dict[str, Any]) -> dict[str, float]:
+    metrics = {}
+
+    def collect(prefix: str, values: Any) -> None:
+        if not isinstance(values, dict):
+            raise ValueError(f"Reward prepare {prefix} metrics must be a JSON object")
+        for name, value in values.items():
+            path = f"{prefix}/{name}"
+            if isinstance(value, dict):
+                collect(path, value)
+            elif isinstance(value, (int, float)) and not isinstance(value, bool):
+                metrics[path] = float(value)
+
+    collect("prepare/cache_gauge", payload.get("cache", {}))
+    collect("prepare/cache_delta", payload.get("cache_delta", {}))
+    collect("prepare/routing_delta", payload.get("routed_queries", {}))
+    latency = payload.get("latency_seconds")
+    if not isinstance(latency, (int, float)) or isinstance(latency, bool):
+        raise ValueError("Reward prepare endpoint returned invalid latency")
+    metrics["prepare/latency_seconds"] = float(latency)
+    return metrics
 
 
 def _add_arguments(parser) -> None:
@@ -30,9 +130,15 @@ def _add_arguments(parser) -> None:
         help="HTTP endpoint returning retrieval rewards for generated docids.",
     )
     parser.add_argument(
+        "--generative-retriever-reward-prepare-url",
+        type=str,
+        default=None,
+        help="HTTP endpoint preparing frozen baselines concurrently with rollout.",
+    )
+    parser.add_argument(
         "--generative-retriever-reward-timeout",
         type=float,
-        default=30.0,
+        default=300.0,
         help="Retrieval-reward HTTP request timeout in seconds.",
     )
 
@@ -94,6 +200,25 @@ async def _request_embedding(args: Any, router_url: str, prompt_ids: list[int]) 
     return {"embedding": embedding}
 
 
+async def _request_embedding_and_prepare(
+    args: Any,
+    router_url: str,
+    prompt_ids: list[int],
+    query: str,
+) -> tuple[dict[str, Any], dict[str, float]]:
+    prepare_url = getattr(args, "generative_retriever_reward_prepare_url", None)
+    if not prepare_url:
+        raise ValueError("--generative-retriever-reward-prepare-url is required")
+    embedding, prepare_metrics = await asyncio.gather(
+        _request_embedding(args, router_url, prompt_ids),
+        _get_prepare_batcher(
+            prepare_url,
+            args.generative_retriever_reward_timeout,
+        ).submit(query),
+    )
+    return embedding, prepare_metrics
+
+
 def _training_prompt_ids(state: Any, sample: Sample) -> list[int]:
     if not isinstance(sample.prompt, str) or not sample.prompt.strip():
         raise ValueError("GR rollout requires a non-empty query string prompt")
@@ -117,6 +242,9 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
         raise ValueError("GR SGLang /encode rollout is single-turn and cannot continue a partial response")
 
     prompt_ids = _training_prompt_ids(input.state, sample)
+    query = sample.prompt
+    if not isinstance(query, str):
+        raise TypeError("GR rollout query must be a string")
     engine_url = await _resolve_engine_url(args, sample)
     group_size = args.n_samples_per_prompt
     if sample.index is None:
@@ -129,12 +257,19 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
     key = (input.evaluation, group_key, engine_url, tuple(prompt_ids))
     if key not in requests:
         requests[key] = (
-            asyncio.create_task(_request_embedding(args, engine_url, prompt_ids)),
+            asyncio.create_task(
+                _request_embedding_and_prepare(
+                    args,
+                    engine_url,
+                    prompt_ids,
+                    query,
+                )
+            ),
             set(),
         )
     task, consumed = requests[key]
     try:
-        output = await asyncio.shield(task)
+        output, prepare_metrics = await asyncio.shield(task)
     finally:
         if task.done() and (task.cancelled() or task.exception() is not None):
             requests.pop(key, None)
@@ -158,6 +293,8 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
         token_id - 2 - position * docid_dim
         for position, token_id in enumerate(token_ids)
     ]
+    if beam_rank == 0 and prepare_metrics:
+        metadata["prepare_metrics"] = prepare_metrics
     return GenerateFnOutput(samples=sample)
 
 

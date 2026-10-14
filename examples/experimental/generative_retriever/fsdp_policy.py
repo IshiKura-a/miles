@@ -41,17 +41,18 @@ class GRStage5Policy(nn.Module):
         self, source_model: nn.Module, pad_token_id: int, constraint: PrefixConstraint,
     ) -> None:
         super().__init__()
-        self.config = source_model.encoder_list[0].model.encoder.config
+        source: Any = source_model
+        self.config = source.encoder_list[0].model.encoder.config
         self.config.tie_word_embeddings = False
         self.pad_token_id = pad_token_id
-        self.code_dim = source_model.docid_dim
-        self.code_num = source_model.docid_size
+        self.code_dim: int = source.docid_dim
+        self.code_num: int = source.docid_size
         self.constraint = constraint
 
-        self.encoder_list = source_model.encoder_list
-        self.docEnc2decoder = source_model.docEnc2decoder
-        self.decoder = source_model.decoder
-        self.lm_head = source_model.lm_head
+        self.encoder_list: Any = source.encoder_list
+        self.docEnc2decoder: Any = source.docEnc2decoder
+        self.decoder: Any = source.decoder
+        self.lm_head: Any = source.lm_head
 
         self.encoder_list.requires_grad_(False)
         for module in self.modules():
@@ -90,13 +91,17 @@ class GRStage5Policy(nn.Module):
         ).flip(1)
         attention_mask = padded_prompts.ne(self.pad_token_id).long()
         with torch.no_grad():
-            outputs = self.encoder_list[0].model.encoder(
+            causal_lm = self.encoder_list[0].model.encoder
+            backbone = getattr(causal_lm, "model", None)
+            if backbone is None:
+                raise TypeError("GR Qwen encoder must expose its backbone as .model")
+            outputs = backbone(
                 input_ids=padded_prompts,
                 attention_mask=attention_mask,
                 return_dict=True,
-                output_hidden_states=True,
+                use_cache=False,
             )
-            hidden_states = outputs.hidden_states[-1]
+            hidden_states = outputs.last_hidden_state
         return hidden_states, attention_mask, prompt_lengths
 
     @staticmethod
