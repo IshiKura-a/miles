@@ -16,7 +16,7 @@ uv run python -m examples.experimental.generative_retriever.prepare_uv_cuda
 uv lock --check
 uv sync --extra generative-retriever --check
 uv run ruff check examples/experimental/generative_retriever
-uv run pyright examples/experimental/generative_retriever/{baseline_service,constrained_decode,good_count_eval,good_count_router_service,good_count_service,id_text_mapping,relevance_model,relevance_reward,reward,reward_router_service,reward_service,rollout_metrics,run_grpo,sglang_encode_generate,transformers_infer}.py
+uv run pyright examples/experimental/generative_retriever/{baseline_service,constrained_decode,data_source,fsdp_policy,good_count_eval,good_count_router_service,good_count_service,id_text_mapping,model_loading,relevance_model,relevance_reward,reward,reward_router_service,reward_service,rollout_metrics,run_grpo,sglang_encode_generate,transformers_infer}.py
 ```
 
 当前锁定 Megatron-LM commit 为
@@ -246,15 +246,21 @@ HTTP reward hook 对每个 sample 获取一个 doc ID 的平均 keyword reward�
 - 默认执行 `train_async.py`，Train N 与 Rollout N+1 重叠，
   `update_weights_interval=1`，使用 rollout logprob 作为 behavior-policy denominator；
   `--no-one-step-async` 切换为同步训练。
+- 中断后使用原 `--run-id` 加 `--resume`，从该 run 的最新完整 checkpoint
+  恢复模型、optimizer、LR scheduler 和数据位置；异步预取的未训练 query 在
+  恢复后重新生成。`--num-rollout` 仍表示总 rollout 数。
 
 ```bash
 uv run python -m examples.experimental.generative_retriever.run_grpo \
   --run-id <run_id> --lr 2e-6
+
+uv run python -m examples.experimental.generative_retriever.run_grpo \
+  --run-id <existing_run_id> --resume
 ```
 
 ### 训练日志
 
-- W&B 指标按各自的 train/rollout/eval step 绑定，支持 1–8 层 metric 路径。
+- W&B 指标按 train/rollout/eval 前缀注册 step；图表横坐标仍需核验。
 - 每个 query group 汇报 reward std、range、unique reward count、
   top-1/top-2 gap 的 mean、median、p10、p90、min、max，以及 zero-std group 比例。
 - GRPO 且 `kl_coef=0` 时，按 group sample std 归一化语义汇报 advantage

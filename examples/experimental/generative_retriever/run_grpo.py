@@ -89,6 +89,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     temperature: float = 1.0
     lr: float = 2e-6
     save_interval: int = 20
+    resume: bool = False
     extra_args: str = ""
 
 
@@ -487,6 +488,20 @@ def execute(args: ScriptArgs) -> None:
 
     output_dir = _expanded_path(args.output_dir, "output_dir", directory=False)
     output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir = output_dir / args.run_id / "checkpoints"
+    if args.resume:
+        tracker = checkpoint_dir / "latest_checkpointed_iteration.txt"
+        if not tracker.is_file():
+            raise FileNotFoundError(f"GR resume checkpoint tracker is missing: {tracker}")
+        iteration = int(tracker.read_text().strip())
+        if iteration <= 0 or not (
+            checkpoint_dir / f"iter_{iteration:07d}" / "meta.json"
+        ).is_file():
+            raise ValueError(f"GR resume checkpoint is incomplete at iteration {iteration}")
+        if not (
+            checkpoint_dir / "rollout" / f"global_dataset_state_dict_{iteration - 1}.pt"
+        ).is_file():
+            raise FileNotFoundError("GR resume requires the matching rollout dataset state")
     service_log_dir = _expanded_path(
         args.service_log_dir,
         "service_log_dir",
@@ -554,6 +569,8 @@ def execute(args: ScriptArgs) -> None:
     )
     learner_args = (
         "--train-backend fsdp "
+        "--data-source-path "
+        "examples.experimental.generative_retriever.data_source.GRRolloutDataSource "
         "--custom-fsdp-model-factory-path "
         "examples.experimental.generative_retriever.fsdp_policy.build_gr_stage5_policy "
         "--weight-sync-include-prefixes "
@@ -563,7 +580,8 @@ def execute(args: ScriptArgs) -> None:
         f"--max-tokens-per-gpu {args.max_tokens_per_gpu} "
     )
     checkpoint_args = (
-        f"--save {quote(os.fspath(output_dir / args.run_id / 'checkpoints'))} "
+        f"--save {quote(os.fspath(checkpoint_dir))} "
+        f"{f'--load {quote(os.fspath(checkpoint_dir))} ' if args.resume else ''}"
         f"--save-interval {args.save_interval} "
     )
     misc_args = (

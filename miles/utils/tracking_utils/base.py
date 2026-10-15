@@ -19,14 +19,6 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 logger = logging.getLogger(__name__)
-_MAX_METRIC_PATH_DEPTH = 8
-
-
-def _metric_path_patterns(prefix: str) -> tuple[str, ...]:
-    return tuple(
-        f"{prefix}/" + "/".join(["*"] * depth)
-        for depth in range(1, _MAX_METRIC_PATH_DEPTH + 1)
-    )
 
 
 class TrackingBackend(ABC):
@@ -74,8 +66,7 @@ class WandbBackend(TrackingBackend):
         import wandb
 
         wandb.define_metric(step_key)
-        for pattern in _metric_path_patterns(prefix):
-            wandb.define_metric(pattern, step_metric=step_key)
+        wandb.define_metric(f"{prefix}/*", step_metric=step_key)
         self._defined_step_key_groups.add((prefix, step_key))
 
     def finish(self) -> None:

@@ -6,7 +6,6 @@ import wandb
 from wandb.sdk.lib.runid import generate_id
 
 from miles.utils.env_report import decode_env_report
-from miles.utils.tracking_utils.base import _metric_path_patterns
 
 logger = logging.getLogger(__name__)
 
@@ -171,5 +170,4 @@ def _init_wandb_common():
     for step_key in set(metric_groups.values()):
         wandb.define_metric(step_key)
     for prefix, step_key in metric_groups.items():
-        for pattern in _metric_path_patterns(prefix):
-            wandb.define_metric(pattern, step_metric=step_key)
+        wandb.define_metric(f"{prefix}/*", step_metric=step_key)
