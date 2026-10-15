@@ -8,6 +8,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+_POLICY_HEAD_PREFIXES = ("docEnc2decoder.", "decoder.", "lm_head.")
+
 
 def require_directory(path: str | Path, name: str) -> Path:
     resolved = Path(path).expanduser().resolve()
@@ -25,10 +27,11 @@ def import_slmv3(slm_root: Path) -> dict[str, Any]:
     import transformers
 
     # Model imports can replace Transformers' lazy module; patch the active module before utils.
+    transformers_dynamic: Any = transformers
     if not hasattr(transformers, "MT5Tokenizer"):
-        transformers.MT5Tokenizer = transformers.T5Tokenizer
+        transformers_dynamic.MT5Tokenizer = transformers.T5Tokenizer
     if not hasattr(transformers, "MT5TokenizerFast"):
-        transformers.MT5TokenizerFast = transformers.T5TokenizerFast
+        transformers_dynamic.MT5TokenizerFast = transformers_dynamic.T5TokenizerFast
 
     utils_module = importlib.import_module("utils")
     encoder_module = importlib.import_module("CustomizedEncoder")
@@ -135,3 +138,33 @@ def load_checkpoint(model: Any, checkpoint: Path) -> None:
     ]
     if missing_prefixes:
         raise ValueError(f"checkpoint is missing required model components: {missing_prefixes}")
+
+
+def load_policy_head_checkpoint(model: Any, checkpoint: str | Path) -> int:
+    import torch
+
+    path = Path(checkpoint).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Policy checkpoint does not exist: {path}")
+    payload = torch.load(path, map_location="cpu", mmap=True, weights_only=True)
+    try:
+        state_dict = payload["model_state"]["model"]
+    except (KeyError, TypeError) as error:
+        raise ValueError(f"Policy checkpoint has an invalid state-dict structure: {path}") from error
+    selected = {
+        name: tensor
+        for name, tensor in state_dict.items()
+        if name.startswith(_POLICY_HEAD_PREFIXES)
+    }
+    expected = {
+        name for name in model.state_dict() if name.startswith(_POLICY_HEAD_PREFIXES)
+    }
+    missing = expected - selected.keys()
+    unexpected = selected.keys() - expected
+    if missing or unexpected:
+        raise ValueError(
+            f"Policy checkpoint head keys mismatch: missing={sorted(missing)}, "
+            f"unexpected={sorted(unexpected)}"
+        )
+    model.load_state_dict(selected, strict=False)
+    return len(selected)

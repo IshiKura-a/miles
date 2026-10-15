@@ -6,6 +6,7 @@ import wandb
 from wandb.sdk.lib.runid import generate_id
 
 from miles.utils.env_report import decode_env_report
+from miles.utils.tracking_utils.base import _metric_path_patterns
 
 logger = logging.getLogger(__name__)
 
@@ -78,12 +79,12 @@ def init_wandb_primary(args):
         init_kwargs["dir"] = args.wandb_dir
         logger.info(f"W&B logs will be stored in: {args.wandb_dir}")
 
-    wandb.init(**init_kwargs)
+    run = wandb.init(**init_kwargs)
 
     _init_wandb_common()
 
     # Set wandb_run_id in args for easy access throughout the training process
-    args.wandb_run_id = wandb.run.id
+    args.wandb_run_id = run.id
 
 
 def _compute_config_for_logging(args):
@@ -159,12 +160,16 @@ def init_wandb_secondary(args, router_addr=None):
 
 
 def _init_wandb_common():
-    wandb.define_metric("train/step")
-    wandb.define_metric("train/*", step_metric="train/step")
-    wandb.define_metric("rollout/step")
-    wandb.define_metric("rollout/*", step_metric="rollout/step")
-    wandb.define_metric("multi_turn/*", step_metric="rollout/step")
-    wandb.define_metric("passrate/*", step_metric="rollout/step")
-    wandb.define_metric("eval/step")
-    wandb.define_metric("eval/*", step_metric="eval/step")
-    wandb.define_metric("perf/*", step_metric="rollout/step")
+    metric_groups = {
+        "train": "train/step",
+        "rollout": "rollout/step",
+        "multi_turn": "rollout/step",
+        "passrate": "rollout/step",
+        "perf": "rollout/step",
+        "eval": "eval/step",
+    }
+    for step_key in set(metric_groups.values()):
+        wandb.define_metric(step_key)
+    for prefix, step_key in metric_groups.items():
+        for pattern in _metric_path_patterns(prefix):
+            wandb.define_metric(pattern, step_metric=step_key)

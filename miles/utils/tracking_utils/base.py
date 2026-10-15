@@ -19,6 +19,14 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 logger = logging.getLogger(__name__)
+_MAX_METRIC_PATH_DEPTH = 8
+
+
+def _metric_path_patterns(prefix: str) -> tuple[str, ...]:
+    return tuple(
+        f"{prefix}/" + "/".join(["*"] * depth)
+        for depth in range(1, _MAX_METRIC_PATH_DEPTH + 1)
+    )
 
 
 class TrackingBackend(ABC):
@@ -66,7 +74,8 @@ class WandbBackend(TrackingBackend):
         import wandb
 
         wandb.define_metric(step_key)
-        wandb.define_metric(f"{prefix}/*", step_metric=step_key)
+        for pattern in _metric_path_patterns(prefix):
+            wandb.define_metric(pattern, step_metric=step_key)
         self._defined_step_key_groups.add((prefix, step_key))
 
     def finish(self) -> None:
@@ -128,7 +137,7 @@ class PrometheusBackend(TrackingBackend):
     def log(self, metrics: dict[str, Any], step: int | None = None, **kwargs) -> None:
         from .prometheus_utils import get_prometheus
 
-        prom = get_prometheus()
+        prom: Any = get_prometheus()
         assert prom is not None, (
             "Prometheus collector is not initialized; ensure init_tracking(..., primary=...) ran on the "
             "driver and workers can resolve the miles_prometheus_collector Ray actor."

@@ -16,8 +16,7 @@ from dataclasses import dataclass
 from typing import Any
 from weakref import WeakKeyDictionary
 
-import aiohttp
-
+from miles.utils.http_utils import GeneralHttpClientProvider
 from miles.utils.types import Sample
 from examples.experimental.generative_retriever.relevance_reward import REWARD_MODES
 
@@ -43,7 +42,7 @@ class _RewardBatcher:
     def __init__(self, url: str, mode: str, timeout_seconds: float) -> None:
         self._url = url
         self._mode = mode
-        self._timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+        self._timeout_seconds = timeout_seconds
         self._pending: deque[_PendingRequest] = deque()
         self._flush_task: asyncio.Task[None] | None = None
 
@@ -89,16 +88,17 @@ class _RewardBatcher:
 
     async def _post(self, requests: list[_PendingRequest]) -> _BatchResult:
         payloads = [payload for request in requests for payload in request.payloads]
-        async with aiohttp.ClientSession(timeout=self._timeout) as session:
-            async with session.post(
+        async with asyncio.timeout(self._timeout_seconds):
+            response = await GeneralHttpClientProvider.client().post(
                 self._url,
                 json={"samples": payloads, "reward_mode": self._mode},
-            ) as response:
-                response.raise_for_status()
-                rewards, details, cache, request_metrics = _parse_rewards(
-                    await response.json(),
-                    expected_count=len(payloads),
-                )
+                timeout=self._timeout_seconds,
+            )
+            response.raise_for_status()
+            rewards, details, cache, request_metrics = _parse_rewards(
+                response.json(),
+                expected_count=len(payloads),
+            )
         return _BatchResult(rewards, details, cache, request_metrics)
 
     @staticmethod

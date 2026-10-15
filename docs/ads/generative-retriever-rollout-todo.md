@@ -1,6 +1,7 @@
 # Generative Retriever RL
 
-更新：2026-10-13。当前阶段：最小端到端已通过，待正式规模和在线 W&B 验收。
+更新：2026-10-15。当前实现的两卡 learner 更新与 checkpoint 重载已验证；
+默认学习率 `2e-6` 的完整在线训练尚未重新运行。
 
 ## 环境
 
@@ -15,7 +16,7 @@ uv run python -m examples.experimental.generative_retriever.prepare_uv_cuda
 uv lock --check
 uv sync --extra generative-retriever --check
 uv run ruff check examples/experimental/generative_retriever
-uv run pyright examples/experimental/generative_retriever/{baseline_service,constrained_decode,relevance_model,relevance_reward,reward,reward_router_service,reward_service,rollout_metrics,run_grpo,sglang_encode_generate,transformers_infer}.py
+uv run pyright examples/experimental/generative_retriever/{baseline_service,constrained_decode,good_count_eval,good_count_router_service,good_count_service,id_text_mapping,relevance_model,relevance_reward,reward,reward_router_service,reward_service,rollout_metrics,run_grpo,sglang_encode_generate,transformers_infer}.py
 ```
 
 当前锁定 Megatron-LM commit 为
@@ -30,12 +31,12 @@ Torch 2.13.0+cu130、Transformers 5.12.1，CUDA 可用且识别 8 张 GPU。
 
 - GR 输出为四段 RQ semantic doc ID。
 - Baseline 使用原始 Stage5 checkpoint，训练期间不更新。
+- 训练默认学习率为 `2e-6`，使用 constant schedule。
 - Baseline 和 train rollout 的每 query doc ID 数量必须相同；当前正式值为 16。
 - 使用 **SLMGR_dev 的 constrained decoder**：`infer_mode=2`，有效 ID 来自固定版本的官方映射。
 - Baseline 比较集合由这 16 个 ID 对应的全部 keyword 中，PM ≥ 0.58
   且 SM ≥ 0.82 的 keyword 去重构成。
 - Unique 按候选 keyword 是否属于该比较集合判定。
-- 先完成少量验证，再扩大规模。
 - SLMGR_dev 除获准的 `SLMv3/model.py` 外只读。
 
 ### SLMv3 外部源码 patch
@@ -177,10 +178,12 @@ Baseline 的 16 个 ID 展开后，逐 keyword 打分，双阈值筛选并去重
 
 Constrained baseline 调用：
 
-- 官方 `utils.get_tokenizer_and_model` 加载原始 checkpoint。
+- [model_loading.py](../../examples/experimental/generative_retriever/model_loading.py)
+  构建 SLMv3 模型并加载原始 checkpoint。
 - 官方 `utils.get_restrict_decode_vocab(args, docid_list, id_bias=2)` 构建有效 ID 前缀树。
 - `args.infer_mode=2`，约束函数为 `constraint_restrict_decode_vocab`。
-- 官方 `ASITrainer.prediction_step` 调用生成，`num_beams=num_return_sequences=16`。
+- [SLMv3Retriever](../../examples/experimental/generative_retriever/transformers_infer.py)
+  调用模型 `generate`，`num_beams=num_return_sequences=16`。
 
 Relevance 使用原源码快照中的 `MultiCupGraphenePipeline`：
 
@@ -203,58 +206,63 @@ HTTP reward hook 对每个 sample 获取一个 doc ID 的平均 keyword reward�
 - 训练 rollout 使用同一个官方前缀约束执行随机采样，不使用 beam search。
 - Baseline 和训练 rollout 都是每个 query 返回 16 个 doc ID；每个 ID 为 4 个
   decoder token，且完整路径必须存在于固定官方映射的前缀树中。
-- Baseline beam 要求 ID 不重复；训练使用标准随机采样，允许随机重复并汇报
-  `distinct_docid_ratio`，不因某个 query 的低熵分布终止整个 scheduler。
+- Baseline beam 返回不同 ID；训练随机采样允许重复，汇报 `distinct_docid_ratio`。
 - `/encode` 返回每条 sample 的 4 个 decoder token 和 4 个 logprob。
   同一训练 group 共用一次请求，各 sample 使用不同随机采样结果。
 - 每个 query group 在提交共享 `/encode` 请求时，同时提交 reward baseline
   prepare；prepare client 用 10ms 窗口合并最多 512 个 query。Group completion
   同时等待 rollout 与 prepare，耗时为两条链路的最大值而非串行和。
-- Miles custom rollout 通过 router 标准 `/v1/embeddings` API 请求 packed
-  token/logprob；不读取 router 中脱敏的 worker URL。
+- Miles custom rollout 通过 router 标准 `/v1/embeddings` API 请求 packed token/logprob。
 - Learner 对每个响应 prefix 使用同一官方约束计算 logprob。
 - GR 服务配置为两卡、DP=2、`mem-fraction-static=0.7`。
 - Launcher 先检查 mapping、baseline 和 reward `/health`，配置匹配时复用
   现有常驻服务；仅在服务不存在时启动独立进程并等待 ready 后提交训练。
-  训练完成或失败均不停止健康服务，避免重复加载模型和 25GB mapping。
-  只有本次新建但未通过 health 的失败进程会按明确 PID 清理。
+  健康服务跨训练进程常驻；启动失败时清理本次创建的进程。
 - 常驻 mapping/baseline/reward 服务日志写入
-  `~/.local/state/miles/generative_retriever/`，禁止写入online训练输出目录；
-  `<output_dir>/<run_id>/` 只保存该run的prompt alias、launcher日志和checkpoint。
+  `~/.local/state/miles/generative_retriever/`；
+  `<output_dir>/<run_id>/` 保存 prompt alias、launcher 日志和 checkpoint。
 
 ### 训练规模
 
 - `n_samples_per_prompt=16`。
 - 每轮处理 `16384 / 16 = 1024` 个 query，即 `rollout_batch_size=1024`。
-- Prompt dataset 直接读取完整 15,000,000 条 queryfeat JSONL，并在每个 epoch
-  开始时确定性 shuffle；`512` 仅是每个 training step 消费的 query 数，禁止
-  在 launcher 中截断整个数据集。源文件的 `.json` 名称通过 run 目录内的
-  `.jsonl` 符号链接适配 Miles，不复制 4.5GB 数据。
+- Prompt dataset 读取完整 15,000,000 条 queryfeat JSONL，确定性 shuffle。
+  源文件通过 run 目录内的 `.jsonl` 符号链接接入 Miles。
 - 当前 recipe 固定 1,000 steps，共消费 1,024,000 个不重复 dataset row，约
   0.068 epoch；源数据自身可包含相同 query 文本。
-  Launcher 启动时统计 dataset 记录数；若固定 steps 会越过 dataset 末尾则直接
-  失败，禁止 `RolloutDataSource` 隐式 wrap。需要重复数据时必须使用显式 epoch recipe。
+  Launcher 校验固定 steps 所需的数据量；重复数据使用显式 epoch recipe。
 - `global_batch_size=16384`，每次 rollout 恰好形成一个 training step。
 - Learner 使用动态 token batching，每卡每 microbatch 上限 33,024 tokens；
-  microbatch 数按实际 prompt 长度计算并在两个 FSDP rank 间取最大值，不使用
-  `micro_batch_size=1` 的 4,096 次逐 sample 梯度累积。
-- 冻结 Qwen encoder 直接调用 `Qwen3Model` backbone 获取 last hidden state；
-  禁止经过 `Qwen3ForCausalLM.lm_head` 物化 `[tokens, 151936]` 的无用词表 logits，
-  也不保留逐层 hidden states 或无用 KV cache。
+  microbatch 数按实际 prompt 长度计算并在两个 FSDP rank 间取最大值。
+- 冻结 Qwen encoder 调用 `Qwen3Model` backbone 获取 last hidden state，
+  不计算词表 logits，不保留逐层 hidden states 或 KV cache。
 - Checkpoint 默认每 20 个完成的 training step 保存一次，最后一个 step 强制保存；
   路径为 `<output_dir>/<run_id>/checkpoints/iter_<step>/`，包含 model、
   optimizer、LR scheduler、RNG 和下一 rollout ID。
-- GR rollout 固定按 training global step 汇报；该行为由 rollout 注册时设置，
-  不是可调实验参数。Rollout/reward/cache 指标的 `rollout/step` 必须等于
-  对应的 training global step。
+- Rollout/reward/cache 指标以对应的 training global step 汇报。
 - 正式在线汇报需要由运行环境或 AzureML secret 注入 `WANDB_API_KEY`；
-  禁止写入仓库、workspace 或 launcher 参数。
 - 输出根目录为
   `$cosmos_data_path/local/User/zihao/online_rl/gr_offline_syn/`。
+- 默认执行 `train_async.py`，Train N 与 Rollout N+1 重叠，
+  `update_weights_interval=1`，使用 rollout logprob 作为 behavior-policy denominator；
+  `--no-one-step-async` 切换为同步训练。
+
+```bash
+uv run python -m examples.experimental.generative_retriever.run_grpo \
+  --run-id <run_id> --lr 2e-6
+```
+
+### 训练日志
+
+- W&B 指标按各自的 train/rollout/eval step 绑定，支持 1–8 层 metric 路径。
+- 每个 query group 汇报 reward std、range、unique reward count、
+  top-1/top-2 gap 的 mean、median、p10、p90、min、max，以及 zero-std group 比例。
+- GRPO 且 `kl_coef=0` 时，按 group sample std 归一化语义汇报 advantage
+  absolute mean/max 和每组 absolute mean 分布。
 
 ### GPU 分配
 
-单机必须恰好使用 8 卡，固定角色如下，禁止角色复用、空卡或把服务临时挪到 CPU：
+当前单机 recipe 使用 8 卡，角色如下：
 
 | 物理 GPU | 角色 | 数量 |
 | --- | --- | --- |
@@ -264,22 +272,7 @@ HTTP reward hook 对每个 sample 获取一个 doc ID 的平均 keyword reward�
 | 6-7 | relevance reward | 2 |
 
 Launcher 固定设置四个角色的 GPU visibility：Ray 只看到 0-3，
-baseline 进程只看到 4-5，reward 进程只看到 6-7。服务停止时只终止
-launcher 自己创建并持有 PID 的失败进程；禁止按名称清理或终止任何已有 GPU 进程。
-
-### Baseline / reward cache
-
-- Baseline service 的 query 结果，以及每个 reward worker 的 baseline set 和
-  query feature，分别使用容量 8,192 的 LRU cache。
-- 每个 reward worker 的 query-keyword score cache 容量为 131,072。正式规模
-  压测实测每 worker 单轮 working set 约 43,500 项；该容量覆盖约三轮 working set，
-  避免 8,192 容量在同一轮内淘汰并重算当前分数。
-- 所有 reward cache 的总容量随 worker 数量横向扩展。
-- Reward HTTP 响应和 `/health` 暴露 capacity、size、hits、misses、evictions。
-- W&B 对每个 request 汇报 hit/miss/eviction delta，对 capacity/size 汇报 gauge；
-  不对累计计数快照做 sample 平均。
-- 服务跨训练进程常驻并复用，模型和映射只加载一次，不允许每个 step 或每次
-  launcher 重载。
+baseline 进程只看到 4-5，reward 进程只看到 6-7。
 
 ### 常驻 ID-text 服务
 
@@ -287,7 +280,7 @@ launcher 自己创建并持有 PID 的失败进程；禁止按名称清理或终
 启动时加载一次固定版本官方映射，后续查询读取内存。
 
 ```bash
-python -m examples.experimental.generative_retriever.mapping_service \
+uv run python -m examples.experimental.generative_retriever.mapping_service \
   --mapping "$cosmos_data_path/shares/bingads.data.selection/data/User/tianchiyang/OnlineServing/UniASI/PublishTables/asiv3index5selmarketna/RawData/asiindex_mapping20261005022223.tsv" \
   --host 127.0.0.1 --port 30488
 ```
@@ -296,7 +289,7 @@ python -m examples.experimental.generative_retriever.mapping_service \
 - `POST /lookup`：请求 `{"docids":[[244,394,617,1009]]}`，
   返回按输入顺序排列的 keyword list、ID 和 `ok` / `not_found` 状态。
 - 同一 ID 内完全相同的 keyword 去重。
-- 客户端入口为 `id_text_mapping.lookup_service`，每批最多 4,096 个 ID。
+- 客户端入口为 `id_text_mapping.lookup_service`，去重后自动拆成最多 4,096 IDs 的请求。
 - 当前服务地址为 `http://127.0.0.1:30488`，驻留内存约 25 GiB。
 
 ### 常驻 baseline 服务
@@ -324,7 +317,7 @@ CUDA_VISIBLE_DEVICES=4,5 uv run python -m \
 
 [reward_service.py](../../examples/experimental/generative_retriever/reward_service.py)
 是单 GPU worker。GPU 6 和 7 各运行一个隔离进程，分别缓存 baseline set、
-query feature 和 query-keyword 分数；[reward_router_service.py](../../examples/experimental/generative_retriever/reward_router_service.py)
+query/keyword feature 和 query-keyword 分数；[reward_router_service.py](../../examples/experimental/generative_retriever/reward_router_service.py)
 在 CPU 上按 query 做 rendezvous hashing，并恢复输入 sample 顺序。
 Baseline cache miss 时 worker 调用常驻 baseline 服务生成同样数量的 ID，
 经 mapping 服务展开并评分后在线构建 `B(q)`。
@@ -353,47 +346,115 @@ uv run python -m examples.experimental.generative_retriever.reward_router_servic
   `reward_mode` 选择连续或离散模式。
 - `POST /prepare`：输入最多 512 个 query，router 按同一 rendezvous affinity
   分配到 reward worker；worker 并发调用 baseline service，并提前完成 mapping、
-  baseline relevance、baseline set、query feature 和 query-keyword score cache。
-  Prepare 失败必须使对应 rollout group 显式失败，禁止退化为未预热的成功结果。
+  baseline relevance、baseline set、两侧 feature 和 query-keyword score cache。
 - Rollout reward hook 在同一 executor 内用 10ms 窗口合并并发 group，每个
   HTTP request 最多 512 samples；同一时刻只保留一个 router request in-flight，
   由 router 按 query 拆到两个 worker 并行评分，结果恢复到原 group 和 sample 顺序。
-- 每个 worker 对整个 request 批量准备缺失 baseline，并把全部 query-keyword
-  cache miss 合并为批量 query encode、keyword encode 和 cross-score；禁止按
-  sample 单独调用 relevance pipeline。
-- Reward HTTP request timeout 默认 300 秒；超时显式丢弃对应 rollout group，
-  不把失败伪装为零 reward。
+- Worker 批量准备 baseline，按最多 4,096 pairs 分块评分，分别去重编码 query
+  和 keyword。Baseline、query feature、keyword feature 各缓存 8,192 条，
+  query-keyword score 缓存 131,072 条。
+- Worker、router 和 rollout reward hook 复用 HTTP 连接；reward request 的
+  total timeout 默认为 300 秒。依赖服务失败或超时使对应 rollout group 失败。
 - W&B 单独汇报 prepare latency、每 worker routed query、cache delta 和 gauge；
   同一个合并 prepare request 的指标只记录一次。
+- Cache 指标包括 capacity、size、hits、misses、evictions；W&B 汇报请求内
+  hit/miss/eviction delta 和 capacity/size gauge。
 - 返回 `rewards`、逐 ID/keyword 的 `details`、request cache delta 和 cache gauge。
-- 同一 query 稳定落到同一个 worker；增加 worker 时 rendezvous hashing 只迁移
-  部分 query。每个 worker 的 query cache 容量为 8,192，query-keyword score
-  cache 容量为 131,072。
-- Router 汇报每 worker routed sample 累计值；只有观测到热点 query 造成队列
-  饱和后才启用显式 secondary-worker overflow，并单独计量重复 cache，避免
-  无依据的动态负载策略破坏 query affinity。
+- 同一 query 按 rendezvous hashing 稳定路由到同一个 worker；
+  router 汇报每 worker routed sample 累计值。
 - Launcher 自动使用 `http://127.0.0.1:30489/score`，无需单独配置 URL。
 
-## 已验证
+## 离线 good-count eval 与训练资源隔离
 
-- 固定映射含 **43,844,117 个不同有效 ID**。
-- uv lock/sync、Ruff 和本次变更文件 Pyright 均通过。
-- GPU 4-5 的真实 baseline 服务 health 返回两个 worker；真实 query 生成
-  16 个不同 ID、四段 logprob 全部有限，首次延迟约 1.16 秒。
-- 这 16 个 ID 全部存在于固定官方映射，共展开 204 个 keyword；
-  第二次 baseline 请求命中 LRU，服务端延迟约 32 微秒。
-- Standalone SGLang rollout health 和真实 `/v1/embeddings` 通过；单 query
-  返回 16 个不同 constrained ID、128 个 packed value，全部 logprob 有限。
-- 两个隔离 reward worker 和 query-affinity router 的真实 16-sample group
-  通过；discrete/continuous reward、threshold weight、unique gate 和 doc ID
-  keyword 平均均与公式一致。
-- 1-query × 16-sample 最小 GRPO 端到端成功；16 个 sample 全部进入训练，
-  rollout 通过 router `/v1/embeddings`，reward 分项和 cache 指标进入 W&B。
-- 最小 learner step 0 的 loss 为 0.0017508、gradient norm 为 4.15625，
-  train-rollout logprob absolute difference 为 0，forward/backward 和 optimizer
-  完成；训练权重同步到 rollout 成功，weight version 从 1 更新到 2。
+### 固定评测集与已有结果
+
+- 数据源：`$cosmos_data_path/local/Users/tianchiyang/Data/MZLog/`
+  `TA_PA_UnifiedData_202411to202511/TAKeyword/demand_1M.queryfeat/Part0`。
+  该数据的 `query` 字段为空；**使用 `keyword` 原文作为评测 query**，
+  不是从搜索 query 验证集抽样，也不对 keyword 添加模板或改写。
+- 从全部 distinct、非空 keyword 文本中做 reservoir sampling，固定 seed
+  `20261015`，本次样本数为 **1,000**。同一个 manifest 用于 baseline 和 policy。
+- 已评测 checkpoint：run `261014-112122-gr-full`，`iter_0000200`。
+  `/home/aiscuser/models/gr-policy-step200.pt` 的全部 44 个 policy-head tensor
+  已与该 distributed checkpoint 逐一比对一致。
+- 本次 manifest 与结果目录：
+  `~/.local/state/miles/generative_retriever/eval/261014-112122-gr-full-step200-1k-20261015/`。
+  `queries.jsonl` 保存 query、源 row index 和 market；`evaluation.json` 保存
+  数据来源、字段、seed、抽样计数及 manifest SHA-256；
+  `baseline.jsonl` 和 `policy.jsonl` 保存逐 query 结果。
+
+### Step 200 的 1K 评测结果（2026-10-15）
+
+Baseline 和 policy 均完成 1,000 个 query 的 constrained top-16，逐 query
+校验 ID 去重和 `good_keywords = policy_SM_keywords - baseline_SM_keywords`。
+
+| 指标 | 结果 |
+| --- | --- |
+| Good count total / mean | 19 / 0.019 |
+| Good count 为 0 的 query | 997 / 1,000（99.7%） |
+| Median、p10、p90、p95、p99 | 均为 0 |
+| Good count max | 17 |
+| Top-16 doc ID 集合发生变化的 query | 3 / 1,000 |
+| Baseline / policy SM keyword 平均数量 | 64.225 / 64.233 |
+| 新增 / 丢失 / 净增 SM keyword 总数 | 19 / 11 / 8 |
+| Baseline / policy 评测耗时 | 123.4 秒 / 24.5 秒 |
+
+Policy 阶段复用同一 scorer 的 baseline 评分缓存，耗时不能解读为模型自身
+推理速度提升。3 个产生新增 SM keyword 的 query 为：
+`best hotels new york`（17）、`download gps maps app`（1）、
+`grand mondial login`（1）。该 step 200 与 baseline 的匹配权重数值相同，
+以上结果不作为训练收益；权重比较详见评测目录的 `checkpoint_diff.json`。
+
+完整统计保存在上述目录的 `summary.json`；原有常驻服务未替换，评测专用的
+policy 和 scoring 服务已在完成后关闭。
+
+### 评测接口
+
+[good_count_eval.py](../../examples/experimental/generative_retriever/good_count_eval.py)
+提供 `baseline` / `policy` 两种离线模式，复用
+[good_count_service.py](../../examples/experimental/generative_retriever/good_count_service.py)
+和训练 reward 相同的 [RelevanceScorer](../../examples/experimental/generative_retriever/relevance_model.py)。
+训练 baseline 要同时通过 PM/SM，good-count eval 只看 SM：
+
+```text
+B_SM(q) = {k in baseline keywords | SM(q,k) >= 0.82}
+P_SM(q) = {k in policy keywords | SM(q,k) >= 0.82}
+good_count(q) = |P_SM(q) - B_SM(q)|
+```
+
+汇报 total、zero fraction、mean、median、p10、p90、p95、p99、max；
+baseline 结果按同一 manifest 和模型配置跨 policy checkpoint 复用。
+
+Mapping 查询统一使用 HTTP connection pool，按 doc ID 去重并自动拆成最多
+4,096 IDs 的请求；baseline 服务对同一请求中的重复 query 只执行一次生成。
+Policy checkpoint 的全部 head keys 与模型一致。
+
+- 每个 query 生成 16 个 positional doc IDs，展开后的全部 distinct keywords 参与评分。
+- 当前批评分与下一批生成重叠；每个服务最多一个 request in-flight，按 manifest
+  顺序写入完成的批次；服务错误使评测失败。
+- 运行前拒绝空/重复 query manifest、缺失 baseline 和不匹配的续跑输出；
+  已完成 query 不重复生成。输出文件按 manifest、checkpoint 和 mode 隔离。
+- 离线 worker 可用 `--devices` 指定独立 GPU，或用
+  [good_count_router_service.py](../../examples/experimental/generative_retriever/good_count_router_service.py)
+  将 query 固定路由到单 GPU 进程。HTTP connections 和 tower/pair caches 都可复用。
+- 离线 eval 在训练暂停后运行，或使用独立 GPU 资源。
+
+```bash
+uv run python -m examples.experimental.generative_retriever.good_count_eval \
+  --mode baseline --manifest /path/to/queries.jsonl \
+  --output /path/to/baseline.jsonl \
+  --generate-url http://127.0.0.1:30587/generate \
+  --score-url http://127.0.0.1:30589/score
+
+uv run python -m examples.experimental.generative_retriever.good_count_eval \
+  --mode policy --manifest /path/to/queries.jsonl \
+  --baseline-results /path/to/baseline.jsonl --output /path/to/policy.jsonl \
+  --generate-url http://127.0.0.1:30588/generate \
+  --score-url http://127.0.0.1:30589/score
+```
 
 ## 待完成
 
-- 用 512 个 query 完成一次 8,192 global batch 的端到端验证。
-- 设置 `WANDB_API_KEY` 后验证在线 W&B、reward/cache 指标和 training global step。
+- 默认 `2e-6` 的完整在线训练与新 checkpoint 评测。
+- 训练内定期 good-count eval；当前入口仅用于离线评测。
+- Relevance kernel 可用性及真实负载性能验证。

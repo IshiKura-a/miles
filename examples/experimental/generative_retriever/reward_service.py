@@ -12,16 +12,15 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
 from threading import Lock
 from typing import Annotated, Any
-from urllib.error import HTTPError, URLError
 
 import httpx
-import numpy as np
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, StrictInt, field_validator
@@ -29,16 +28,17 @@ from pydantic import BaseModel, Field, StrictInt, field_validator
 from examples.experimental.generative_retriever.id_text_mapping import _validate_id, lookup_service
 from examples.experimental.generative_retriever.lru_cache import LRUCache
 from examples.experimental.generative_retriever.relevance_model import (
+    RelevanceScorer,
     load_relevance_pipeline_factory,
     resolve_relevance_source,
 )
 from examples.experimental.generative_retriever.relevance_reward import (
     RewardMode, build_baseline_set,
-    calculate_docid_reward, calculate_keyword_rewards,
+    calculate_keyword_rewards,
 )
 
 logger = logging.getLogger(__name__)
-_SERVICE_API_VERSION = 6
+_SERVICE_API_VERSION = 7
 _QUERY_CACHE_SIZE = 8192
 _SCORE_CACHE_SIZE = 131072
 
@@ -96,24 +96,34 @@ class KeywordRewardEngine:
         self.baseline_top_k = baseline_top_k
         self._baseline_queries: set[str] = set()
         self.baselines: LRUCache[str, frozenset[str]] = LRUCache(query_cache_size)
-        self._score_cache: LRUCache[tuple[str, str], tuple[float, float]] = LRUCache(
-            score_cache_size
-        )
         relevance_source = resolve_relevance_source(relevance_model)
         pipeline_factory = load_relevance_pipeline_factory(relevance_source)
-        self.pipeline = pipeline_factory(
+        pipeline = pipeline_factory(
             relevance_model, cup="large", device=device, dtype="bf16",
             batch_size=batch_size, cross_batch_size=256, show_progress=False,
         )
+        self.scorer = RelevanceScorer(
+            pipeline, feature_cache_size=query_cache_size, score_cache_size=score_cache_size,
+        )
         self._lock = Lock()
-        self._query_features: LRUCache[str, np.ndarray] = LRUCache(query_cache_size)
+        self._client = httpx.Client(timeout=300.0)
 
     def _cache_stats(self) -> dict[str, Any]:
         return {
             "baseline": asdict(self.baselines.stats()),
-            "reward": asdict(self._score_cache.stats()),
-            "query_features": asdict(self._query_features.stats()),
+            "reward": asdict(self.scorer.scores.stats()),
+            "query_features": asdict(self.scorer.query_features.stats()),
+            "keyword_features": asdict(self.scorer.keyword_features.stats()),
         }
+
+    def _lookup_docids(
+        self,
+        docids: list[tuple[int, int, int, int]],
+    ) -> dict[tuple[int, int, int, int], tuple[str, ...]]:
+        return lookup_service(
+            self.mapping_url, docids,
+            expected_mapping_version=self.mapping_version, client=self._client,
+        )
 
     @staticmethod
     def _cache_delta(
@@ -127,45 +137,6 @@ class KeywordRewardEngine:
             }
             for name in after
         }
-
-    def _score_missing(self, pairs: list[tuple[str, str]]) -> None:
-        missing_pairs = [
-            pair for pair in dict.fromkeys(pairs)
-            if self._score_cache.get(pair) is None
-        ]
-        if not missing_pairs:
-            return
-
-        query_features = {}
-        missing_queries = []
-        for query in dict.fromkeys(query for query, _ in missing_pairs):
-            features = self._query_features.get(query)
-            if features is None:
-                missing_queries.append(query)
-            else:
-                query_features[query] = features
-        if missing_queries:
-            encoded_queries = self.pipeline.encode_query(missing_queries)
-            if encoded_queries.shape[0] != len(missing_queries):
-                raise RuntimeError("Official relevance model returned invalid query features")
-            for index, query in enumerate(missing_queries):
-                features = encoded_queries[index:index + 1]
-                self._query_features.put(query, features)
-                query_features[query] = features
-
-        features = self.pipeline.encode_keyword([keyword for _, keyword in missing_pairs])
-        scores = self.pipeline.cross_score(
-            np.concatenate([query_features[query] for query, _ in missing_pairs], axis=0),
-            features,
-        )
-        if (
-            scores.shape != (len(missing_pairs), 4)
-            or not np.isfinite(scores).all()
-            or not ((scores >= 0) & (scores <= 1)).all()
-        ):
-            raise RuntimeError("Official relevance model returned invalid scores")
-        for pair, score in zip(missing_pairs, scores, strict=True):
-            self._score_cache.put(pair, (float(score[1]), float(score[2])))
 
     def _prepare_baselines(self, queries: list[str]) -> dict[str, frozenset[str]]:
         baselines = {}
@@ -181,10 +152,9 @@ class KeywordRewardEngine:
         if not self.baseline_url:
             raise KeyError(f"Prepared baseline missing for queries {missing_queries!r}")
 
-        response = httpx.post(
+        response = self._client.post(
             self.baseline_url,
             json={"queries": missing_queries},
-            timeout=300.0,
         )
         response.raise_for_status()
         payload = response.json()
@@ -215,11 +185,9 @@ class KeywordRewardEngine:
                 raise ValueError("Baseline service returned duplicate doc IDs")
             query_docids[query] = docids
 
-        mapping = lookup_service(
-            self.mapping_url,
-            [docid for query in missing_queries for docid in query_docids[query]],
-            expected_mapping_version=self.mapping_version,
-        )
+        mapping = self._lookup_docids([
+            docid for query in missing_queries for docid in query_docids[query]
+        ])
         query_keywords = {
             query: list(dict.fromkeys(
                 keyword
@@ -228,20 +196,16 @@ class KeywordRewardEngine:
             ))
             for query in missing_queries
         }
-        self._score_missing([
+        pair_scores = self.scorer.score([
             (query, keyword)
             for query in missing_queries
             for keyword in query_keywords[query]
         ])
         for query in missing_queries:
-            scores = {}
-            for keyword in query_keywords[query]:
-                score = self._score_cache.get((query, keyword))
-                if score is None:
-                    raise RuntimeError(
-                        "Baseline keyword score disappeared from the resident LRU cache"
-                    )
-                scores[keyword] = score
+            scores = {
+                keyword: pair_scores[(query, keyword)]
+                for keyword in query_keywords[query]
+            }
             baseline = build_baseline_set(scores)
             self.baselines.put(query, baseline)
             self._baseline_queries.add(query)
@@ -269,9 +233,7 @@ class KeywordRewardEngine:
              sample.docid_tokens[2] - 2, sample.docid_tokens[3] - 2)
             for sample in request.samples
         ]
-        mapping = lookup_service(
-            self.mapping_url, docids, expected_mapping_version=self.mapping_version,
-        )
+        mapping = self._lookup_docids(docids)
         with self._lock:
             before = self._cache_stats()
             baselines = self._prepare_baselines([
@@ -281,7 +243,7 @@ class KeywordRewardEngine:
                 list(dict.fromkeys(mapping[docid]))
                 for docid in docids
             ]
-            self._score_missing([
+            pair_scores = self.scorer.score([
                 (sample.prompt, keyword)
                 for sample, keywords in zip(request.samples, sample_keywords, strict=True)
                 for keyword in keywords
@@ -291,19 +253,15 @@ class KeywordRewardEngine:
             for sample, docid, keywords in zip(
                 request.samples, docids, sample_keywords, strict=True,
             ):
-                scores = {}
-                for keyword in keywords:
-                    score = self._score_cache.get((sample.prompt, keyword))
-                    if score is None:
-                        raise RuntimeError("Reward score disappeared from the resident LRU cache")
-                    scores[keyword] = score
+                scores = {
+                    keyword: pair_scores[(sample.prompt, keyword)]
+                    for keyword in keywords
+                }
                 baseline = baselines[sample.prompt]
                 breakdown = calculate_keyword_rewards(
                     scores, baseline, mode=request.reward_mode,
                 )
-                value = calculate_docid_reward(
-                    scores, baseline, mode=request.reward_mode,
-                )
+                value = math.fsum(result.reward for result in breakdown.values()) / len(breakdown)
                 rewards.append(value)
                 details.append({
                     "query": sample.prompt, "docid": docid, "keyword_count": len(scores),
@@ -311,7 +269,7 @@ class KeywordRewardEngine:
                     "keywords": [{"keyword": keyword, **asdict(result)}
                                  for keyword, result in breakdown.items()],
                 })
-                logger.info("reward_mode=%s docid=%s keywords=%d reward=%f",
+                logger.debug("reward_mode=%s docid=%s keywords=%d reward=%f",
                             request.reward_mode, docid, len(scores), value)
             cache = self._cache_stats()
         return {
@@ -323,6 +281,9 @@ class KeywordRewardEngine:
             "cache": cache,
             "cache_delta": self._cache_delta(before, cache),
         }
+
+    def close(self) -> None:
+        self._client.close()
 
 
 def create_app(
@@ -350,8 +311,11 @@ def create_app(
             _SCORE_CACHE_SIZE,
             baseline_top_k,
         )
-        yield
-        del app.state.engine
+        try:
+            yield
+        finally:
+            app.state.engine.close()
+            del app.state.engine
 
     app = FastAPI(lifespan=lifespan)
 
@@ -365,11 +329,7 @@ def create_app(
             "device": "cuda:0",
             "mapping_version": engine.mapping_version,
             "baseline_queries": len(engine._baseline_queries),
-            "cache": {
-                "baseline": asdict(engine.baselines.stats()),
-                "reward": asdict(engine._score_cache.stats()),
-                "query_features": asdict(engine._query_features.stats()),
-            },
+            "cache": engine._cache_stats(),
             "service_config": {
                 "api_version": _SERVICE_API_VERSION,
                 "baseline_url": baseline_url,
@@ -378,7 +338,9 @@ def create_app(
                 "relevance_source": str(resolve_relevance_source(relevance_model)),
                 "relevance_model": str(Path(relevance_model).expanduser().resolve()),
                 "query_cache_size": _QUERY_CACHE_SIZE,
+                "keyword_cache_size": _QUERY_CACHE_SIZE,
                 "score_cache_size": _SCORE_CACHE_SIZE,
+                "pair_batch_size": engine.scorer.pair_batch_size,
                 "baseline_top_k": baseline_top_k,
             },
         }
@@ -393,7 +355,7 @@ def create_app(
         except LookupError as error:
             logger.error("Official mapping lookup failed: %s", error)
             raise HTTPException(status_code=422, detail=str(error)) from error
-        except (HTTPError, URLError, httpx.HTTPError) as error:
+        except httpx.HTTPError as error:
             logger.error("Dependent service unavailable: %s", error)
             raise HTTPException(status_code=502, detail=str(error)) from error
 
@@ -407,7 +369,7 @@ def create_app(
         except LookupError as error:
             logger.error("Official mapping lookup failed during preparation: %s", error)
             raise HTTPException(status_code=422, detail=str(error)) from error
-        except (HTTPError, URLError, httpx.HTTPError) as error:
+        except httpx.HTTPError as error:
             logger.error("Dependent service unavailable during preparation: %s", error)
             raise HTTPException(status_code=502, detail=str(error)) from error
     return app

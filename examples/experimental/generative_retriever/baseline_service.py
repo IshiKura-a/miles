@@ -17,6 +17,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel, Field, field_validator
 
 from examples.experimental.generative_retriever.lru_cache import LRUCache
+from examples.experimental.generative_retriever.model_loading import load_policy_head_checkpoint
 from examples.experimental.generative_retriever.transformers_infer import GenerationResult, SLMv3Retriever
 
 logger = logging.getLogger(__name__)
@@ -57,26 +58,27 @@ class BaselinePool:
         qwen_model: str,
         slm_root: str,
         id_mapping: str,
-        devices: tuple[str, str],
+        devices: tuple[str, ...],
         cache_size: int,
         docids_per_query: int,
+        policy_checkpoint: str | None = None,
     ) -> None:
         self.devices = devices
         self.cache: LRUCache[str, list[dict[str, Any]]] = LRUCache(cache_size)
         self.docids_per_query = docids_per_query
         self._cache_lock = Lock()
-        self.workers = [
-            _Worker(
-                SLMv3Retriever(
-                    checkpoint=checkpoint,
-                    qwen_model=qwen_model,
-                    slm_root=slm_root,
-                    id_mapping=id_mapping,
-                    device=device,
-                )
+        self.workers = []
+        for device in devices:
+            retriever = SLMv3Retriever(
+                checkpoint=checkpoint,
+                qwen_model=qwen_model,
+                slm_root=slm_root,
+                id_mapping=id_mapping,
+                device=device,
             )
-            for device in devices
-        ]
+            if policy_checkpoint is not None:
+                load_policy_head_checkpoint(retriever.model, policy_checkpoint)
+            self.workers.append(_Worker(retriever))
         self._executor = ThreadPoolExecutor(max_workers=len(self.workers))
 
     @staticmethod
@@ -94,18 +96,18 @@ class BaselinePool:
     def generate(self, request: BaselineRequest) -> dict[str, Any]:
         started = time.perf_counter()
         resolved: dict[int, list[dict[str, Any]]] = {}
-        pending: list[tuple[int, str]] = []
+        pending: dict[str, list[int]] = {}
         with self._cache_lock:
             for index, query in enumerate(request.queries):
                 cached = self.cache.get(query)
                 if cached is None:
-                    pending.append((index, query))
+                    pending.setdefault(query, []).append(index)
                 else:
                     resolved[index] = cached
 
-        buckets: list[list[tuple[int, str]]] = [[] for _ in self.workers]
-        for pending_index, item in enumerate(pending):
-            buckets[pending_index % len(self.workers)].append(item)
+        buckets: list[list[str]] = [[] for _ in self.workers]
+        for pending_index, query in enumerate(pending):
+            buckets[pending_index % len(self.workers)].append(query)
         futures = []
         for worker, bucket in zip(self.workers, buckets, strict=True):
             if bucket:
@@ -113,18 +115,19 @@ class BaselinePool:
                     bucket,
                     self._executor.submit(
                         worker.generate,
-                        [query for _, query in bucket],
+                        bucket,
                         self.docids_per_query,
                     ),
                 ))
         for bucket, future in futures:
             generated = future.result()
-            for query_index, (index, query) in enumerate(bucket):
+            if len(generated) != len(bucket) * self.docids_per_query:
+                raise RuntimeError("Baseline worker returned an invalid beam group count")
+            for query_index, query in enumerate(bucket):
                 start = query_index * self.docids_per_query
                 rows = self._serialize(generated[start:start + self.docids_per_query])
-                if len(rows) != self.docids_per_query:
-                    raise RuntimeError("Baseline worker returned an incomplete beam group")
-                resolved[index] = rows
+                for index in pending[query]:
+                    resolved[index] = rows
                 with self._cache_lock:
                     self.cache.put(query, rows)
 
@@ -143,6 +146,17 @@ class BaselinePool:
         self._executor.shutdown(wait=True)
 
 
+def _parse_devices(raw_devices: str) -> tuple[str, ...]:
+    devices = tuple(device.strip() for device in raw_devices.split(",") if device.strip())
+    return _validate_devices(devices)
+
+
+def _validate_devices(devices: tuple[str, ...]) -> tuple[str, ...]:
+    if not devices or len(set(devices)) != len(devices):
+        raise ValueError("Baseline devices must be a non-empty tuple of distinct devices")
+    return devices
+
+
 def create_app(
     *,
     checkpoint: str,
@@ -150,8 +164,10 @@ def create_app(
     slm_root: str,
     id_mapping: str,
     docids_per_query: int = 16,
+    devices: tuple[str, ...] = ("cuda:0", "cuda:1"),
+    policy_checkpoint: str | None = None,
 ) -> FastAPI:
-    devices = ("cuda:0", "cuda:1")
+    devices = _validate_devices(devices)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -163,6 +179,7 @@ def create_app(
             devices=devices,
             cache_size=_CACHE_SIZE,
             docids_per_query=docids_per_query,
+            policy_checkpoint=policy_checkpoint,
         )
         yield
         app.state.pool.close()
@@ -188,6 +205,11 @@ def create_app(
                 "devices": list(devices),
                 "cache_size": _CACHE_SIZE,
                 "docids_per_query": docids_per_query,
+                **(
+                    {"policy_checkpoint": str(Path(policy_checkpoint).expanduser().resolve())}
+                    if policy_checkpoint is not None
+                    else {}
+                ),
             },
         }
 
@@ -205,6 +227,8 @@ def main() -> None:
     parser.add_argument("--slm-root", required=True)
     parser.add_argument("--id-mapping", required=True)
     parser.add_argument("--docids-per-query", type=int, default=16)
+    parser.add_argument("--devices", default="cuda:0,cuda:1")
+    parser.add_argument("--policy-checkpoint")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=30487)
     args = parser.parse_args()
@@ -216,6 +240,8 @@ def main() -> None:
             slm_root=args.slm_root,
             id_mapping=args.id_mapping,
             docids_per_query=args.docids_per_query,
+            devices=_parse_devices(args.devices),
+            policy_checkpoint=args.policy_checkpoint,
         ),
         host=args.host,
         port=args.port,

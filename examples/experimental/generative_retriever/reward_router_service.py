@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from threading import Lock
@@ -18,7 +19,7 @@ from examples.experimental.generative_retriever.reward_service import (
     RewardRequest,
 )
 
-_SERVICE_API_VERSION = 3
+_SERVICE_API_VERSION = 4
 
 
 class RewardRouter:
@@ -27,6 +28,7 @@ class RewardRouter:
             raise ValueError("Reward router requires distinct worker URLs")
         self.worker_urls = worker_urls
         self._executor = ThreadPoolExecutor(max_workers=len(worker_urls))
+        self._client = httpx.Client(timeout=900.0)
         self._routing_lock = Lock()
         self._routed_samples = [0] * len(worker_urls)
         self._prepared_queries = [0] * len(worker_urls)
@@ -38,12 +40,10 @@ class RewardRouter:
         ]
         return max(range(len(scores)), key=scores.__getitem__)
 
-    @staticmethod
-    def _post(url: str, request: RewardRequest) -> dict[str, Any]:
-        response = httpx.post(
+    def _post(self, url: str, request: RewardRequest | BaselinePrepareRequest) -> dict[str, Any]:
+        response = self._client.post(
             url,
             json=request.model_dump(mode="json"),
-            timeout=900.0,
         )
         response.raise_for_status()
         payload = response.json()
@@ -59,48 +59,47 @@ class RewardRouter:
             for index, bucket in enumerate(buckets):
                 self._routed_samples[index] += len(bucket)
         futures = [
-            self._executor.submit(
+            (index, self._executor.submit(
                 self._post,
                 url,
                 RewardRequest(
                     samples=[sample for _, sample in bucket],
                     reward_mode=request.reward_mode,
                 ),
-            )
-            if bucket else None
-            for url, bucket in zip(self.worker_urls, buckets, strict=True)
+            ))
+            for index, (url, bucket) in enumerate(zip(self.worker_urls, buckets, strict=True))
+            if bucket
         ]
-        responses = [future.result() if future is not None else None for future in futures]
-        rewards: list[float | None] = [None] * len(request.samples)
-        details: list[dict[str, Any] | None] = [None] * len(request.samples)
-        for bucket, response in zip(buckets, responses, strict=True):
-            if response is None:
-                continue
+        responses = {index: future.result() for index, future in futures}
+        rewards: dict[int, float] = {}
+        details: dict[int, dict[str, Any]] = {}
+        for worker_index, response in responses.items():
+            bucket = buckets[worker_index]
+            worker_rewards = response.get("rewards")
+            worker_details = response.get("details")
+            if (
+                not isinstance(worker_rewards, list)
+                or len(worker_rewards) != len(bucket)
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(value)
+                    for value in worker_rewards
+                )
+                or not isinstance(worker_details, list)
+                or len(worker_details) != len(bucket)
+                or any(not isinstance(detail, dict) for detail in worker_details)
+                or response.get("reward_mode") != request.reward_mode
+            ):
+                raise ValueError("Reward worker returned invalid rewards or details")
             for position, (index, _) in enumerate(bucket):
-                rewards[index] = response["rewards"][position]
-                details[index] = response["details"][position]
-        if any(value is None for value in rewards) or any(value is None for value in details):
-            raise RuntimeError("Reward router did not restore every sample")
+                rewards[index] = worker_rewards[position]
+                details[index] = worker_details[position]
         return {
-            "rewards": rewards,
-            "details": details,
+            "rewards": [rewards[index] for index in range(len(request.samples))],
+            "details": [details[index] for index in range(len(request.samples))],
             "reward_mode": request.reward_mode,
-            "mapping_version": next(
-                response["mapping_version"] for response in responses if response is not None
-            ),
-            "cache": {
-                f"worker_{index}": response["cache"]
-                for index, response in enumerate(responses)
-                if response is not None
-            },
-            "cache_delta": {
-                f"worker_{index}": response["cache_delta"]
-                for index, response in enumerate(responses)
-                if response is not None
-            },
-            "latency_seconds": max(
-                response["latency_seconds"] for response in responses if response is not None
-            ),
+            **self._response_metrics(responses),
             "routed_samples": {
                 f"worker_{index}": len(bucket)
                 for index, bucket in enumerate(buckets)
@@ -109,43 +108,26 @@ class RewardRouter:
 
     def prepare(self, request: BaselinePrepareRequest) -> dict[str, Any]:
         buckets: list[list[str]] = [[] for _ in self.worker_urls]
-        for query in request.queries:
+        for query in dict.fromkeys(request.queries):
             buckets[self._worker_index(query)].append(query)
         with self._routing_lock:
             for index, bucket in enumerate(buckets):
                 self._prepared_queries[index] += len(bucket)
         futures = [
-            self._executor.submit(
-                self._post_prepare,
+            (index, self._executor.submit(
+                self._post,
                 url.removesuffix("/score") + "/prepare",
                 BaselinePrepareRequest(queries=bucket),
-            )
-            if bucket else None
-            for url, bucket in zip(self.worker_urls, buckets, strict=True)
+            ))
+            for index, (url, bucket) in enumerate(zip(self.worker_urls, buckets, strict=True))
+            if bucket
         ]
-        responses = [future.result() if future is not None else None for future in futures]
+        responses = {index: future.result() for index, future in futures}
         return {
             "prepared_queries": sum(
-                response["prepared_queries"]
-                for response in responses
-                if response is not None
+                response["prepared_queries"] for response in responses.values()
             ),
-            "mapping_version": next(
-                response["mapping_version"] for response in responses if response is not None
-            ),
-            "cache": {
-                f"worker_{index}": response["cache"]
-                for index, response in enumerate(responses)
-                if response is not None
-            },
-            "cache_delta": {
-                f"worker_{index}": response["cache_delta"]
-                for index, response in enumerate(responses)
-                if response is not None
-            },
-            "latency_seconds": max(
-                response["latency_seconds"] for response in responses if response is not None
-            ),
+            **self._response_metrics(responses),
             "routed_queries": {
                 f"worker_{index}": len(bucket)
                 for index, bucket in enumerate(buckets)
@@ -153,22 +135,29 @@ class RewardRouter:
         }
 
     @staticmethod
-    def _post_prepare(url: str, request: BaselinePrepareRequest) -> dict[str, Any]:
-        response = httpx.post(
-            url,
-            json=request.model_dump(mode="json"),
-            timeout=900.0,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        if not isinstance(payload, dict):
-            raise ValueError("Reward worker prepare response must be a JSON object")
-        return payload
+    def _response_metrics(responses: dict[int, dict[str, Any]]) -> dict[str, Any]:
+        version = next(iter(responses.values())).get("mapping_version")
+        if not isinstance(version, str) or not version:
+            raise ValueError("Reward worker returned an invalid mapping version")
+        if any(response.get("mapping_version") != version for response in responses.values()):
+            raise ValueError("Reward workers use different mappings")
+        return {
+            "mapping_version": version,
+            "cache": {
+                f"worker_{index}": response["cache"]
+                for index, response in responses.items()
+            },
+            "cache_delta": {
+                f"worker_{index}": response["cache_delta"]
+                for index, response in responses.items()
+            },
+            "latency_seconds": max(response["latency_seconds"] for response in responses.values()),
+        }
 
     def health(self) -> dict[str, Any]:
         responses = []
         for url in self.worker_urls:
-            response = httpx.get(url.removesuffix("/score") + "/health", timeout=10.0)
+            response = self._client.get(url.removesuffix("/score") + "/health", timeout=10.0)
             response.raise_for_status()
             payload = response.json()
             if payload.get("status") != "ready" or payload.get("worker_count") != 1:
@@ -202,15 +191,18 @@ class RewardRouter:
 
     def close(self) -> None:
         self._executor.shutdown(wait=True)
+        self._client.close()
 
 
 def create_app(worker_urls: tuple[str, ...]) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.router = RewardRouter(worker_urls)
-        yield
-        app.state.router.close()
-        del app.state.router
+        try:
+            yield
+        finally:
+            app.state.router.close()
+            del app.state.router
 
     app = FastAPI(lifespan=lifespan)
 

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-import json
-from urllib.request import Request, urlopen
+
+import httpx
 
 PositionalID = tuple[int, int, int, int]
 
@@ -78,36 +79,39 @@ def lookup_texts(mapping: str | Path, docids: Iterable[PositionalID]) -> Mapping
 def lookup_service(
     service_url: str, docids: Iterable[PositionalID], *, timeout: float = 30.0,
     expected_mapping_version: str | None = None,
+    client: httpx.Client | None = None,
 ) -> dict[PositionalID, tuple[str, ...]]:
-    requested = list(docids)
-    if not requested or len(requested) > 4096:
-        raise ValueError("Mapping service lookup requires 1..4096 IDs")
+    requested = list(dict.fromkeys(docids))
+    if not requested:
+        raise ValueError("Mapping service lookup requires at least one ID")
     for docid in requested:
         _validate_id(docid)
-    request = Request(
-        f"{service_url.rstrip('/')}/lookup",
-        data=json.dumps({"docids": requested}).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-    )
-    with urlopen(request, timeout=timeout) as response:
-        payload = json.load(response)
-    if expected_mapping_version is not None and (
-        not isinstance(payload, dict) or payload.get("mapping_version") != expected_mapping_version
-    ):
-        raise ValueError(f"Mapping service version does not match {expected_mapping_version!r}")
-    results = payload.get("results") if isinstance(payload, dict) else None
-    if not isinstance(results, list) or len(results) != len(requested):
-        raise ValueError("Mapping service returned an invalid result count")
+    url = f"{service_url.rstrip('/')}/lookup"
     texts = {}
-    for docid, result in zip(requested, results, strict=True):
-        if not isinstance(result, dict) or result.get("docid") != list(docid):
-            raise ValueError("Mapping service returned results in an unexpected ID order")
-        if result.get("status") != "ok":
-            raise LookupError(f"Official mapping ID unavailable: {docid}, status={result.get('status')!r}")
-        keywords = result.get("keywords")
-        if not isinstance(keywords, list) or not keywords or any(
-            not isinstance(text, str) or not text.strip() for text in keywords
-        ):
-            raise ValueError(f"Mapping service returned invalid keyword texts for {docid}")
-        texts[docid] = tuple(keywords)
+    with httpx.Client(timeout=timeout) if client is None else nullcontext(client) as session:
+        for start in range(0, len(requested), 4096):
+            chunk = requested[start:start + 4096]
+            response = session.post(url, json={"docids": chunk}, timeout=timeout)
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise ValueError("Mapping service response must be a JSON object")
+            if expected_mapping_version is not None and (
+                payload.get("mapping_version") != expected_mapping_version
+            ):
+                raise ValueError(f"Mapping service version does not match {expected_mapping_version!r}")
+            results = payload.get("results")
+            if not isinstance(results, list) or len(results) != len(chunk):
+                raise ValueError("Mapping service returned an invalid result count")
+            for docid, result in zip(chunk, results, strict=True):
+                if not isinstance(result, dict) or result.get("docid") != list(docid):
+                    raise ValueError("Mapping service returned results in an unexpected ID order")
+                if result.get("status") != "ok":
+                    raise LookupError(f"Official mapping ID unavailable: {docid}, status={result.get('status')!r}")
+                keywords = result.get("keywords")
+                if not isinstance(keywords, list) or not keywords or any(
+                    not isinstance(text, str) or not text.strip() for text in keywords
+                ):
+                    raise ValueError(f"Mapping service returned invalid keyword texts for {docid}")
+                texts[docid] = tuple(keywords)
     return texts

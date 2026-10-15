@@ -6,18 +6,22 @@ import importlib
 import os
 import sys
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Protocol, cast
+
+import numpy as np
+
+from examples.experimental.generative_retriever.lru_cache import LRUCache
 
 EXPECTED_GRAPHENE_COMMIT = "a57cb597de0891c1e0a2612d12366188b96aa0cc"
 _PIPELINE_PATH = Path("graphene/multi_cup/multi_cup_graphene_pipeline.py")
 
 
 class RelevancePipeline(Protocol):
-    def encode_query(self, queries: list[str]) -> Any: ...
+    def encode_query(self, queries: list[str]) -> np.ndarray: ...
 
-    def encode_keyword(self, keywords: list[str]) -> Any: ...
+    def encode_keyword(self, keywords: list[str]) -> np.ndarray: ...
 
-    def cross_score(self, query_vectors: Any, keyword_vectors: Any) -> Any: ...
+    def cross_score(self, query_vectors: np.ndarray, keyword_vectors: np.ndarray) -> np.ndarray: ...
 
 
 class RelevancePipelineFactory(Protocol):
@@ -31,6 +35,88 @@ class RelevancePipelineFactory(Protocol):
         cross_batch_size: int,
         show_progress: bool,
     ) -> RelevancePipeline: ...
+
+
+class RelevanceScorer:
+    """Batch distinct tower inputs; keep active results independent of LRU eviction.
+
+    The caller serializes access to the pipeline and caches.
+    """
+
+    def __init__(
+        self,
+        pipeline: RelevancePipeline,
+        *,
+        feature_cache_size: int = 8192,
+        score_cache_size: int = 131072,
+        pair_batch_size: int = 4096,
+    ) -> None:
+        if pair_batch_size <= 0:
+            raise ValueError("Relevance pair batch size must be positive")
+        self.pipeline = pipeline
+        self.pair_batch_size = pair_batch_size
+        self.query_features: LRUCache[str, np.ndarray] = LRUCache(feature_cache_size)
+        self.keyword_features: LRUCache[str, np.ndarray] = LRUCache(feature_cache_size)
+        self.scores: LRUCache[tuple[str, str], tuple[float, float]] = LRUCache(
+            score_cache_size
+        )
+
+    def _encode(
+        self, texts: list[str], *, query: bool,
+    ) -> dict[str, np.ndarray]:
+        cache = self.query_features if query else self.keyword_features
+        resolved = {}
+        missing = []
+        for text in dict.fromkeys(texts):
+            features = cache.get(text)
+            if features is None:
+                missing.append(text)
+            else:
+                resolved[text] = features
+        if missing:
+            encode = self.pipeline.encode_query if query else self.pipeline.encode_keyword
+            encoded = encode(missing)
+            if (
+                encoded.ndim != 3
+                or encoded.shape[0] != len(missing)
+                or not np.isfinite(encoded).all()
+            ):
+                raise RuntimeError("Official relevance model returned invalid tower features")
+            for index, text in enumerate(missing):
+                # Copy so a cached row does not retain the entire encoded batch.
+                features = encoded[index:index + 1].copy()
+                cache.put(text, features)
+                resolved[text] = features
+        return resolved
+
+    def score(self, pairs: list[tuple[str, str]]) -> dict[tuple[str, str], tuple[float, float]]:
+        resolved = {}
+        missing = []
+        for pair in dict.fromkeys(pairs):
+            score = self.scores.get(pair)
+            if score is None:
+                missing.append(pair)
+            else:
+                resolved[pair] = score
+        for start in range(0, len(missing), self.pair_batch_size):
+            chunk = missing[start:start + self.pair_batch_size]
+            queries = self._encode([query for query, _ in chunk], query=True)
+            keywords = self._encode([keyword for _, keyword in chunk], query=False)
+            scores = self.pipeline.cross_score(
+                np.concatenate([queries[query] for query, _ in chunk], axis=0),
+                np.concatenate([keywords[keyword] for _, keyword in chunk], axis=0),
+            )
+            if (
+                scores.shape != (len(chunk), 4)
+                or not np.isfinite(scores).all()
+                or not ((scores >= 0) & (scores <= 1)).all()
+            ):
+                raise RuntimeError("Official relevance model returned invalid scores")
+            for pair, row in zip(chunk, scores, strict=True):
+                score = (float(row[1]), float(row[2]))
+                self.scores.put(pair, score)
+                resolved[pair] = score
+        return resolved
 
 
 def _validate_source(path: Path) -> Path:

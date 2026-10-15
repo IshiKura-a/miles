@@ -85,8 +85,9 @@ class ScriptArgs(U.ExecuteTrainConfig):
     max_tokens_per_gpu: int = 33024
     reward_timeout: float = 300.0
     num_rollout: int = 1000
+    one_step_async: bool = True
     temperature: float = 1.0
-    lr: float = 1e-6
+    lr: float = 2e-6
     save_interval: int = 20
     extra_args: str = ""
 
@@ -342,14 +343,16 @@ def _ensure_resident_services(
                     "worker_count": 1,
                     "mapping_version": mapping.name,
                     "service_config": {
-                        "api_version": 6,
+                        "api_version": 7,
                         "baseline_url": baseline_url,
                         "mapping_url": mapping_url,
                         "mapping_version": mapping.name,
                         "relevance_source": str(relevance_source),
                         "relevance_model": str(relevance_model),
                         "query_cache_size": 8192,
+                        "keyword_cache_size": 8192,
                         "score_cache_size": 131072,
+                        "pair_batch_size": 4096,
                         "baseline_top_k": args.n_samples_per_prompt,
                     },
                 },
@@ -377,7 +380,7 @@ def _ensure_resident_services(
                 "worker_count": 2,
                 "mapping_version": mapping.name,
                 "service_config": {
-                    "api_version": 3,
+                    "api_version": 4,
                     "worker_urls": [
                         f"http://127.0.0.1:{port}/score"
                         for port in _REWARD_WORKER_PORTS
@@ -622,6 +625,7 @@ def execute(args: ScriptArgs) -> None:
                 train_args=train_args,
                 num_gpus_per_node=4,
                 megatron_model_type=None,
+                train_script="train_async.py" if args.one_step_async else "train.py",
                 extra_env_vars={
                     "GR_CHECKPOINT": checkpoint,
                     "GR_QWEN_MODEL": qwen_model,

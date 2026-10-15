@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import torch
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
+from transformers.modeling_outputs import CausalLMOutput
 from transformers.models.t5.modeling_t5 import T5Attention
 from examples.experimental.generative_retriever.constrained_decode import PrefixConstraint, load_constraint
 
@@ -139,7 +139,7 @@ class GRStage5Policy(nn.Module):
         response_lengths: list[int] | torch.Tensor,
         total_lengths: list[int] | torch.Tensor,
         **kwargs: Any,
-    ) -> SimpleNamespace:
+    ) -> CausalLMOutput:
         del kwargs
         response_lengths = [int(length) for length in response_lengths]
         total_lengths = [int(length) for length in total_lengths]
@@ -196,7 +196,7 @@ class GRStage5Policy(nn.Module):
                 if not allowed or responses[index, position].item() not in allowed:
                     raise ValueError(f"GR response violates official prefix constraint at position {position}")
                 position_logits[allowed] = response_logits[index, position, allowed]
-        return SimpleNamespace(logits=logits)
+        return CausalLMOutput(logits=logits)
 
 
 def build_gr_stage5_policy(checkpoint_path: str, args: Any, init_context) -> GRStage5Policy:
