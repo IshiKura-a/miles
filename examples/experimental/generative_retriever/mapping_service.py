@@ -2,7 +2,7 @@
 
 Run:
     python -m examples.experimental.generative_retriever.mapping_service \
-        --mapping /path/to/asiindex_mapping20261005022223.tsv --port 30488
+        --mapping /path/to/asiindex_mapping.ta_listing.tsv --port 30488
 """
 
 from __future__ import annotations

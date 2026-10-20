@@ -39,7 +39,7 @@ def prepare_bundle(
     slm_root: str | Path,
     id_mapping: str | Path,
     num_beams: int = 1,
-    num_return_sequences: int = 16,
+    num_return_sequences: int = 64,
     temperature: float = 1.0,
     decoding_mode: str = "sample",
 ) -> Path:
@@ -117,7 +117,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--slm-root", required=True)
     parser.add_argument("--id-mapping", required=True)
     parser.add_argument("--num-beams", type=int, default=1)
-    parser.add_argument("--num-return-sequences", type=int, default=16)
+    parser.add_argument("--num-return-sequences", type=int, default=64)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--decoding-mode", choices=("beam", "sample"), default="sample")
     return parser.parse_args()

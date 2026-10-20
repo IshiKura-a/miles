@@ -20,7 +20,7 @@ from miles.utils.http_utils import GeneralHttpClientProvider
 from miles.utils.types import Sample
 from examples.experimental.generative_retriever.relevance_reward import REWARD_MODES
 
-_MAX_REWARD_SAMPLES_PER_REQUEST = 512
+_MAX_REWARD_SAMPLES_PER_REQUEST = 2048
 _REWARD_BATCH_WAIT_SECONDS = 0.01
 
 
@@ -189,7 +189,18 @@ def _parse_rewards(
     routed_samples = response.get("routed_samples", {})
     if not isinstance(routed_samples, dict):
         raise ValueError("generative retriever routing metrics must be a JSON object")
-    return rewards, details, cache, {"cache": cache_delta, "routing": routed_samples}
+    latency = response.get("latency_seconds")
+    if (
+        isinstance(latency, bool)
+        or not isinstance(latency, (int, float))
+        or not math.isfinite(latency)
+        or latency < 0
+    ):
+        raise ValueError("generative retriever reward response has invalid latency")
+    return rewards, details, cache, {
+        "cache": cache_delta, "routing": routed_samples,
+        "score_latency_seconds": float(latency),
+    }
 
 
 def _store_breakdown(
@@ -244,6 +255,9 @@ def _store_breakdown(
         else 0.0
     )
     metrics["train_total"] = metrics["reward"]
+    if "score_latency_seconds" in request_metrics:
+        metrics["score/latency_seconds"] = request_metrics["score_latency_seconds"]
+        metrics["score/request_count"] = 1.0
 
     def collect_cache_metrics(prefix: str, values: dict[str, Any], metric_prefix: str) -> None:
         for name, value in values.items():

@@ -120,8 +120,8 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--reward-mode", choices=REWARD_MODES, default="discrete_relevance_unique")
     args = parser.parse_args()
-    if args.max_queries <= 0 or args.batch_size <= 0:
-        raise ValueError("max-queries and batch-size must be positive")
+    if args.max_queries <= 0 or args.batch_size < 4 or args.batch_size % 4:
+        raise ValueError("max-queries must be positive and batch-size a positive multiple of 4")
     evidence = json.loads(Path(args.baseline_results).read_text(encoding="utf-8"))
     if evidence.get("infer_mode") != 2 or evidence.get("constraint_function") != "constraint_restrict_decode_vocab":
         raise ValueError("Baseline evidence must use the SLMGR constrained decoder")

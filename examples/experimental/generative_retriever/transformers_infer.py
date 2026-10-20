@@ -139,8 +139,8 @@ class SLMv3Retriever:
         self,
         queries: list[str],
         *,
-        num_beams: int = 1,
-        num_return_sequences: int = 1,
+        num_beams: int = 64,
+        num_return_sequences: int = 64,
     ) -> list[GenerationResult]:
         import torch
         from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
@@ -231,8 +231,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--id-mapping", required=True)
     parser.add_argument("--query", action="append", required=True)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--num-beams", type=int, default=1)
-    parser.add_argument("--num-return-sequences", type=int, default=1)
+    parser.add_argument("--num-beams", type=int, default=64)
+    parser.add_argument("--num-return-sequences", type=int, default=64)
     return parser.parse_args()
 
 

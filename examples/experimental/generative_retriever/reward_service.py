@@ -38,7 +38,7 @@ from examples.experimental.generative_retriever.relevance_reward import (
 )
 
 logger = logging.getLogger(__name__)
-_SERVICE_API_VERSION = 7
+_SERVICE_API_VERSION = 8
 _QUERY_CACHE_SIZE = 8192
 _SCORE_CACHE_SIZE = 131072
 
@@ -62,7 +62,7 @@ class RewardSample(BaseModel):
 
 
 class RewardRequest(BaseModel):
-    samples: Annotated[list[RewardSample], Field(min_length=1, max_length=512)]
+    samples: Annotated[list[RewardSample], Field(min_length=1, max_length=2048)]
     reward_mode: RewardMode = "discrete_relevance_unique"
 
 
@@ -89,6 +89,8 @@ class KeywordRewardEngine:
         query_cache_size: int,
         score_cache_size: int,
         baseline_top_k: int,
+        *,
+        pair_batch_size: int,
     ) -> None:
         self.mapping_version = mapping_version
         self.mapping_url = mapping_url
@@ -104,6 +106,7 @@ class KeywordRewardEngine:
         )
         self.scorer = RelevanceScorer(
             pipeline, feature_cache_size=query_cache_size, score_cache_size=score_cache_size,
+            pair_batch_size=pair_batch_size,
         )
         self._lock = Lock()
         self._client = httpx.Client(timeout=300.0)
@@ -292,11 +295,12 @@ def create_app(
     mapping_version: str,
     relevance_model: str,
     *,
-    batch_size: int = 32,
-    baseline_top_k: int = 16,
+    batch_size: int = 2048,
+    baseline_top_k: int = 64,
+    pair_batch_size: int = 8192,
 ) -> FastAPI:
-    if batch_size <= 0:
-        raise ValueError("batch_size must be positive")
+    if batch_size < 4 or batch_size % 4:
+        raise ValueError("batch_size must be a positive multiple of 4")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -310,6 +314,7 @@ def create_app(
             _QUERY_CACHE_SIZE,
             _SCORE_CACHE_SIZE,
             baseline_top_k,
+            pair_batch_size=pair_batch_size,
         )
         try:
             yield
@@ -340,6 +345,7 @@ def create_app(
                 "query_cache_size": _QUERY_CACHE_SIZE,
                 "keyword_cache_size": _QUERY_CACHE_SIZE,
                 "score_cache_size": _SCORE_CACHE_SIZE,
+                "batch_size": batch_size,
                 "pair_batch_size": engine.scorer.pair_batch_size,
                 "baseline_top_k": baseline_top_k,
             },
@@ -383,8 +389,9 @@ def main() -> None:
     parser.add_argument("--relevance-model", required=True)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=30489)
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--baseline-top-k", type=int, default=16)
+    parser.add_argument("--batch-size", type=int, default=2048)
+    parser.add_argument("--pair-batch-size", type=int, default=8192)
+    parser.add_argument("--baseline-top-k", type=int, default=64)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
     uvicorn.run(
@@ -395,6 +402,7 @@ def main() -> None:
             relevance_model=args.relevance_model,
             batch_size=args.batch_size,
             baseline_top_k=args.baseline_top_k,
+            pair_batch_size=args.pair_batch_size,
         ),
         host=args.host,
         port=args.port,

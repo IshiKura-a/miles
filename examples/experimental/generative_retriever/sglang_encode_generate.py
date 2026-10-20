@@ -114,6 +114,7 @@ def _prepare_metrics(payload: dict[str, Any]) -> dict[str, float]:
     if not isinstance(latency, (int, float)) or isinstance(latency, bool):
         raise ValueError("Reward prepare endpoint returned invalid latency")
     metrics["prepare/latency_seconds"] = float(latency)
+    metrics["prepare/request_count"] = 1.0
     return metrics
 
 

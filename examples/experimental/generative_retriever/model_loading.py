@@ -39,6 +39,7 @@ def import_slmv3(slm_root: Path) -> dict[str, Any]:
         "RunArguments": utils_module.RunArguments,
         "T5MultiWithGivenQueryDocEncoderDSI": model_module.T5MultiWithGivenQueryDocEncoderDSI,
         "Encoder_QWen1216t": encoder_module.Encoder_QWen1216t,
+        "DataSupport_QWen1216t": encoder_module.DataSupport_QWen1216t,
         "get_restrict_decode_vocab": utils_module.get_restrict_decode_vocab,
     }
 

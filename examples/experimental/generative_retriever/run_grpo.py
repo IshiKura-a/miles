@@ -57,9 +57,8 @@ class ScriptArgs(U.ExecuteTrainConfig):
     qwen_model: str = "$cosmos_data_path/local/Users/tianchiyang/LLM/Qwen/Qwen3-4B/"
     slm_root: str = "/home/aiscuser/SLMGR_dev/SLMv3"
     id_mapping: str = (
-        "$cosmos_data_path/shares/bingads.data.selection/data/User/tianchiyang/"
-        "OnlineServing/UniASI/PublishTables/asiv3index5selmarketna/RawData/"
-        "asiindex_mapping20261005022223.tsv"
+        "$cosmos_data_path/local/User/zihao/online_rl/gr_offline_syn/index/"
+        "globalindex1_latest_ta_listing_20261019/asiindex_mapping.ta_listing.tsv"
     )
     prompt_data: str = (
         "$cosmos_data_path/local/Users/tianchiyang/Data/MZLog/"
@@ -79,11 +78,12 @@ class ScriptArgs(U.ExecuteTrainConfig):
     rollout_num_gpus_per_engine: int = 2
     sglang_dp_size: int = 2
     sglang_mem_fraction_static: float = 0.7
+    sglang_server_concurrency: int = 4096
     rollout_batch_size: int = 1024
-    n_samples_per_prompt: int = 16
-    global_batch_size: int = 16384
+    n_samples_per_prompt: int = 64
+    global_batch_size: int = 65536
     max_tokens_per_gpu: int = 33024
-    reward_timeout: float = 300.0
+    reward_timeout: float = 1200.0
     num_rollout: int = 1000
     one_step_async: bool = True
     temperature: float = 1.0
@@ -333,6 +333,10 @@ def _ensure_resident_services(
                     os.fspath(relevance_model),
                     "--baseline-top-k",
                     str(args.n_samples_per_prompt),
+                    "--batch-size",
+                    "2048",
+                    "--pair-batch-size",
+                    "8192",
                     "--port",
                     str(port),
                 ],
@@ -344,7 +348,7 @@ def _ensure_resident_services(
                     "worker_count": 1,
                     "mapping_version": mapping.name,
                     "service_config": {
-                        "api_version": 7,
+                        "api_version": 8,
                         "baseline_url": baseline_url,
                         "mapping_url": mapping_url,
                         "mapping_version": mapping.name,
@@ -353,7 +357,8 @@ def _ensure_resident_services(
                         "query_cache_size": 8192,
                         "keyword_cache_size": 8192,
                         "score_cache_size": 131072,
-                        "pair_batch_size": 4096,
+                        "batch_size": 2048,
+                        "pair_batch_size": 8192,
                         "baseline_top_k": args.n_samples_per_prompt,
                     },
                 },
@@ -381,7 +386,7 @@ def _ensure_resident_services(
                 "worker_count": 2,
                 "mapping_version": mapping.name,
                 "service_config": {
-                    "api_version": 4,
+                    "api_version": 5,
                     "worker_urls": [
                         f"http://127.0.0.1:{port}/score"
                         for port in _REWARD_WORKER_PORTS
@@ -469,6 +474,8 @@ def execute(args: ScriptArgs) -> None:
         raise ValueError("reward_timeout must be positive")
     if args.max_tokens_per_gpu <= 0:
         raise ValueError("max_tokens_per_gpu must be positive")
+    if args.sglang_server_concurrency < args.n_samples_per_prompt:
+        raise ValueError("SGLang concurrency must fit at least one complete query group")
     if args.rollout_batch_size * args.n_samples_per_prompt != args.global_batch_size:
         raise ValueError(
             "One training step must contain rollout_batch_size * n_samples_per_prompt "
@@ -555,6 +562,7 @@ def execute(args: ScriptArgs) -> None:
         "--eps-clip 0.2 "
         "--eps-clip-high 0.28 "
         "--use-rollout-logprobs "
+        "--skip-actor-forward-only "
     )
     sglang_args = (
         f"--rollout-num-gpus {args.rollout_num_gpus} "
@@ -565,6 +573,7 @@ def execute(args: ScriptArgs) -> None:
         "--sglang-disable-radix-cache "
         "--sglang-attention-backend triton "
         "--sglang-disable-cuda-graph "
+        f"--sglang-server-concurrency {args.sglang_server_concurrency} "
         f"--sglang-mem-fraction-static {args.sglang_mem_fraction_static} "
     )
     learner_args = (

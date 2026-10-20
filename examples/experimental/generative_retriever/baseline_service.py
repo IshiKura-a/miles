@@ -163,7 +163,7 @@ def create_app(
     qwen_model: str,
     slm_root: str,
     id_mapping: str,
-    docids_per_query: int = 16,
+    docids_per_query: int = 64,
     devices: tuple[str, ...] = ("cuda:0", "cuda:1"),
     policy_checkpoint: str | None = None,
 ) -> FastAPI:
@@ -226,7 +226,7 @@ def main() -> None:
     parser.add_argument("--qwen-model", required=True)
     parser.add_argument("--slm-root", required=True)
     parser.add_argument("--id-mapping", required=True)
-    parser.add_argument("--docids-per-query", type=int, default=16)
+    parser.add_argument("--docids-per-query", type=int, default=64)
     parser.add_argument("--devices", default="cuda:0,cuda:1")
     parser.add_argument("--policy-checkpoint")
     parser.add_argument("--host", default="127.0.0.1")

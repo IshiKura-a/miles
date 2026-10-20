@@ -1592,10 +1592,9 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 action="store_true",
                 default=False,
                 help=(
-                    "Skip the standalone Megatron actor forward-only pass. With --use-rollout-logprobs, "
-                    "those log-probs remain the old-policy baseline; otherwise detached training log-probs "
-                    "are reused and the actor importance log-ratio is exactly 0. This requires a single "
-                    "optimizer step. The skipped pass's rollout/log_probs metric is not emitted."
+                    "Skip the standalone actor log-prob pass. FSDP requires "
+                    "--use-rollout-logprobs; both backends require a single optimizer step. "
+                    "The skipped pass's rollout/log_probs and rollout/entropy metrics are omitted."
                 ),
             )
             # Off-Policy Correction using Importance Sampling: https://fengyao.notion.site/off-policy-rl
@@ -3586,7 +3585,9 @@ def miles_validate_args(args):
 
 def validate_skip_actor_forward_only(args) -> None:
     option = "--skip-actor-forward-only"
-    assert args.train_backend == "megatron", f"{option} only supports --train-backend megatron"
+    assert args.train_backend in ("megatron", "fsdp"), f"{option} only supports megatron and fsdp"
+    if args.train_backend == "fsdp":
+        assert args.use_rollout_logprobs, f"{option} requires --use-rollout-logprobs with FSDP"
     assert args.loss_type == "policy_loss", f"{option} only supports --loss-type policy_loss"
     assert args.compute_advantages_and_returns, f"{option} requires actor advantage computation"
 
@@ -3596,16 +3597,7 @@ def validate_skip_actor_forward_only(args) -> None:
             ("--keep-old-actor", args.keep_old_actor),
             ("--kl-coef", args.kl_coef != 0),
             ("--use-opd", args.use_opd),
-            ("--hidden-dropout", args.hidden_dropout != 0),
-            ("--attention-dropout", args.attention_dropout != 0),
             ("--lora-dropout", args.lora_dropout != 0),
-            ("--moe-input-jitter-eps", args.moe_input_jitter_eps not in (None, 0)),
-            ("--moe-router-force-load-balancing", args.moe_router_force_load_balancing),
-            ("--moe-router-force-biased", args.moe_router_force_biased is not None),
-            (
-                "--moe-router-load-balancing-type sinkhorn",
-                "sinkhorn" in args.moe_router_load_balancing_type,
-            ),
             ("--use-rollout-entropy", args.use_rollout_entropy),
             ("--true-on-policy-mode", args.true_on_policy_mode),
             ("--log-correct-samples", args.log_correct_samples),
@@ -3635,6 +3627,22 @@ def validate_skip_actor_forward_only(args) -> None:
         )
         if enabled
     ]
+    if args.train_backend == "megatron":
+        incompatible_options.extend(
+            name
+            for name, enabled in (
+                ("--hidden-dropout", args.hidden_dropout != 0),
+                ("--attention-dropout", args.attention_dropout != 0),
+                ("--moe-input-jitter-eps", args.moe_input_jitter_eps not in (None, 0)),
+                ("--moe-router-force-load-balancing", args.moe_router_force_load_balancing),
+                ("--moe-router-force-biased", args.moe_router_force_biased is not None),
+                (
+                    "--moe-router-load-balancing-type sinkhorn",
+                    "sinkhorn" in args.moe_router_load_balancing_type,
+                ),
+            )
+            if enabled
+        )
     assert not incompatible_options, f"{option} is incompatible with: {', '.join(incompatible_options)}"
 
     assert args.num_steps_per_rollout in (None, 1), (

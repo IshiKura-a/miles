@@ -498,10 +498,16 @@ class FSDPTrainRayActor(TrainRayActor):
                 ref_results = self._compute_log_prob("ref", data_iterator, num_microbatches, store_prefix="ref_")
             rollout_data.update(ref_results)
 
-        with routing_replay.stage(routing_replay.log_prob_stage(self.args)):
-            actor_results = self._compute_log_prob("actor", data_iterator, num_microbatches)
+        if self.args.skip_actor_forward_only:
+            if rollout_data.get("log_probs") is not None:
+                raise ValueError("skip-actor-forward-only requires rollout data without actor log_probs")
+            if rollout_data.get("rollout_log_probs") is None:
+                raise ValueError("skip-actor-forward-only requires rollout_log_probs")
+        else:
+            with routing_replay.stage(routing_replay.log_prob_stage(self.args)):
+                actor_results = self._compute_log_prob("actor", data_iterator, num_microbatches)
+            rollout_data.update(actor_results)
         routing_replay.rewind()
-        rollout_data.update(actor_results)
 
         compute_advantages_and_returns(self.args, rollout_data)
 

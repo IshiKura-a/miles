@@ -1,4 +1,4 @@
-"""Route reward batches across two isolated single-GPU reward workers."""
+"""Route reward batches across isolated single-GPU reward workers."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from examples.experimental.generative_retriever.reward_service import (
     RewardRequest,
 )
 
-_SERVICE_API_VERSION = 4
+_SERVICE_API_VERSION = 5
 
 
 class RewardRouter:

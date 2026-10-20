@@ -1,4 +1,4 @@
-"""Score policy doc IDs by SM-qualified distinct keywords on multiple GPUs."""
+"""Score policy doc IDs by distinct keyword with both PM and SM relevance."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from threading import Lock
 from typing import Annotated, Any
 
@@ -25,11 +26,11 @@ from examples.experimental.generative_retriever.relevance_model import (
     load_relevance_pipeline_factory,
     resolve_relevance_source,
 )
-from examples.experimental.generative_retriever.relevance_reward import SM_THRESHOLD
+from examples.experimental.generative_retriever.relevance_reward import PM_THRESHOLD, SM_THRESHOLD
 
 class GoodCountSample(BaseModel):
     query: str
-    docids: Annotated[list[PositionalID], Field(min_length=1, max_length=16)]
+    docids: Annotated[list[PositionalID], Field(min_length=1, max_length=64)]
 
     @field_validator("query")
     @classmethod
@@ -68,10 +69,11 @@ class GoodCountPool:
     ) -> None:
         if not devices or len(set(devices)) != len(devices):
             raise ValueError("Good-count devices must be distinct and non-empty")
-        if batch_size <= 0:
-            raise ValueError("Good-count batch size must be positive")
+        if batch_size < 4 or batch_size % 4:
+            raise ValueError("Good-count batch size must be a positive multiple of 4")
         self.mapping_url = mapping_url
         self.mapping_version = mapping_version
+        self.relevance_model = str(Path(relevance_model).expanduser().resolve())
         relevance_source = resolve_relevance_source(relevance_model)
         factory = load_relevance_pipeline_factory(relevance_source)
         self.workers = [
@@ -93,7 +95,11 @@ class GoodCountPool:
         self._client = httpx.Client()
 
     @staticmethod
-    def _score(worker: _Worker, samples: list[GoodCountSample], mapping: dict[PositionalID, tuple[str, ...]]):
+    def _score(
+        worker: _Worker,
+        samples: list[GoodCountSample],
+        mapping: dict[PositionalID, tuple[str, ...]],
+    ):
         keywords_by_sample = [
             list(dict.fromkeys(keyword for docid in sample.docids for keyword in mapping[docid]))
             for sample in samples
@@ -105,18 +111,28 @@ class GoodCountPool:
         ]
         with worker.lock:
             pair_scores = worker.scorer.score(pairs)
-        return [
-            {
+        results = []
+        for sample, keywords in zip(samples, keywords_by_sample, strict=True):
+            scores = [
+                {
+                    "keyword": keyword,
+                    "pm_score": pair_scores[(sample.query, keyword)][0],
+                    "sm_score": pair_scores[(sample.query, keyword)][1],
+                }
+                for keyword in keywords
+            ]
+            results.append({
                 "query": sample.query,
-                "keyword_count": len(keywords),
-                "sm_keywords": [
-                    keyword
-                    for keyword in keywords
-                    if pair_scores[(sample.query, keyword)][1] >= SM_THRESHOLD
+                "keyword_count": len(scores),
+                "keyword_scores": scores,
+                "pm_keywords": [
+                    row["keyword"] for row in scores if row["pm_score"] >= PM_THRESHOLD
                 ],
-            }
-            for sample, keywords in zip(samples, keywords_by_sample, strict=True)
-        ]
+                "sm_keywords": [
+                    row["keyword"] for row in scores if row["sm_score"] >= SM_THRESHOLD
+                ],
+            })
+        return results
 
     def score(self, request: GoodCountRequest) -> dict[str, Any]:
         mapping = lookup_service(
@@ -147,6 +163,8 @@ class GoodCountPool:
                 results[index] = result
         return {
             "results": [results[index] for index in range(len(request.samples))],
+            "mapping_version": self.mapping_version,
+            "relevance_model": self.relevance_model,
             "routed_samples": {
                 f"worker_{index}": len(bucket)
                 for index, bucket in enumerate(buckets)
@@ -189,6 +207,7 @@ def create_app(
             "status": "ready",
             "worker_count": len(app.state.pool.workers),
             "mapping_version": mapping_version,
+            "relevance_model": app.state.pool.relevance_model,
         }
 
     @app.post("/score")

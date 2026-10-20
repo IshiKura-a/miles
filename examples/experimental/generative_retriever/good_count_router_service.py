@@ -49,16 +49,28 @@ class GoodCountRouter:
             if bucket
         ]
         results: dict[int, dict[str, Any]] = {}
+        versions: set[tuple[str, str]] = set()
         for bucket, future in futures:
-            worker_results = future.result().get("results")
+            payload = future.result()
+            worker_results = payload.get("results")
             if not isinstance(worker_results, list) or len(worker_results) != len(bucket):
                 raise ValueError("Good-count worker returned an invalid result count")
+            version = payload.get("mapping_version")
+            model = payload.get("relevance_model")
+            if not isinstance(version, str) or not isinstance(model, str) or not version or not model:
+                raise ValueError("Good-count worker returned invalid scoring provenance")
+            versions.add((version, model))
             for (index, sample), result in zip(bucket, worker_results, strict=True):
                 if not isinstance(result, dict) or result.get("query") != sample.query:
                     raise ValueError("Good-count worker changed query ordering")
                 results[index] = result
+        if len(versions) != 1:
+            raise ValueError("Good-count workers use different scoring models or mappings")
+        mapping_version, relevance_model = versions.pop()
         return {
             "results": [results[index] for index in range(len(request.samples))],
+            "mapping_version": mapping_version,
+            "relevance_model": relevance_model,
             "routed_samples": {
                 f"worker_{index}": len(bucket)
                 for index, bucket in enumerate(buckets)
@@ -95,12 +107,18 @@ def create_app(worker_urls: tuple[str, ...]) -> FastAPI:
                 if not isinstance(payload, dict) or payload.get("status") != "ready":
                     raise ValueError("A good-count worker is not ready")
                 responses.append(payload)
-            versions = {response.get("mapping_version") for response in responses}
-            if len(versions) != 1 or None in versions:
-                raise ValueError("Good-count workers use different mappings")
+            versions = {
+                (response.get("mapping_version"), response.get("relevance_model"))
+                for response in responses
+            }
+            if len(versions) != 1:
+                raise ValueError("Good-count workers use different scoring models or mappings")
+            mapping_version, relevance_model = versions.pop()
+            if not isinstance(mapping_version, str) or not mapping_version or not isinstance(relevance_model, str) or not relevance_model:
+                raise ValueError("Good-count worker returned invalid scoring provenance")
             return {
                 "status": "ready", "worker_count": len(worker_urls),
-                "mapping_version": versions.pop(),
+                "mapping_version": mapping_version, "relevance_model": relevance_model,
             }
         except (httpx.HTTPError, ValueError) as error:
             raise HTTPException(status_code=503, detail=str(error)) from error

@@ -108,7 +108,9 @@ def log_rollout(
                 if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value)):
                     values[name].append(float(value))
     for name, metrics in values.items():
-        if name.startswith(("cache_delta/", "routing_delta/", "prepare/cache_delta/", "prepare/routing_delta/")):
+        if name.endswith("/request_count") or name.startswith(
+            ("cache_delta/", "routing_delta/", "prepare/cache_delta/", "prepare/routing_delta/")
+        ):
             value = math.fsum(metrics)
         elif name.startswith(("cache_gauge/", "prepare/cache_gauge/")):
             value = metrics[-1]

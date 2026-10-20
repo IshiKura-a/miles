@@ -75,10 +75,12 @@ class RelevanceScorer:
                 resolved[text] = features
         if missing:
             encode = self.pipeline.encode_query if query else self.pipeline.encode_keyword
-            encoded = encode(missing)
+            # The tower changes a row's output for batches of 1-3.
+            padded = missing + [missing[-1]] * (-len(missing) % 4)
+            encoded = encode(padded)
             if (
                 encoded.ndim != 3
-                or encoded.shape[0] != len(missing)
+                or encoded.shape[0] != len(padded)
                 or not np.isfinite(encoded).all()
             ):
                 raise RuntimeError("Official relevance model returned invalid tower features")
