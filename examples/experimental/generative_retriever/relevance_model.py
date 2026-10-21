@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import importlib
+import logging
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Protocol, cast
 
@@ -14,6 +16,7 @@ from examples.experimental.generative_retriever.lru_cache import LRUCache
 
 EXPECTED_GRAPHENE_COMMIT = "a57cb597de0891c1e0a2612d12366188b96aa0cc"
 _PIPELINE_PATH = Path("graphene/multi_cup/multi_cup_graphene_pipeline.py")
+logger = logging.getLogger(__name__)
 
 
 class RelevancePipeline(Protocol):
@@ -50,13 +53,14 @@ class RelevanceScorer:
         feature_cache_size: int = 8192,
         score_cache_size: int = 131072,
         pair_batch_size: int = 4096,
+        keyword_cache_size: int = 8192,
     ) -> None:
         if pair_batch_size <= 0:
             raise ValueError("Relevance pair batch size must be positive")
         self.pipeline = pipeline
         self.pair_batch_size = pair_batch_size
         self.query_features: LRUCache[str, np.ndarray] = LRUCache(feature_cache_size)
-        self.keyword_features: LRUCache[str, np.ndarray] = LRUCache(feature_cache_size)
+        self.keyword_features: LRUCache[str, np.ndarray] = LRUCache(keyword_cache_size)
         self.scores: LRUCache[tuple[str, str], tuple[float, float]] = LRUCache(
             score_cache_size
         )
@@ -92,6 +96,7 @@ class RelevanceScorer:
         return resolved
 
     def score(self, pairs: list[tuple[str, str]]) -> dict[tuple[str, str], tuple[float, float]]:
+        started = time.perf_counter()
         resolved = {}
         missing = []
         for pair in dict.fromkeys(pairs):
@@ -100,24 +105,40 @@ class RelevanceScorer:
                 missing.append(pair)
             else:
                 resolved[pair] = score
+        lookup_seconds = time.perf_counter() - started
+        query_seconds = keyword_seconds = cross_seconds = store_seconds = 0.0
         for start in range(0, len(missing), self.pair_batch_size):
             chunk = missing[start:start + self.pair_batch_size]
+            phase = time.perf_counter()
             queries = self._encode([query for query, _ in chunk], query=True)
+            query_seconds += time.perf_counter() - phase
+            phase = time.perf_counter()
             keywords = self._encode([keyword for _, keyword in chunk], query=False)
+            keyword_seconds += time.perf_counter() - phase
+            phase = time.perf_counter()
             scores = self.pipeline.cross_score(
                 np.concatenate([queries[query] for query, _ in chunk], axis=0),
                 np.concatenate([keywords[keyword] for _, keyword in chunk], axis=0),
             )
+            cross_seconds += time.perf_counter() - phase
             if (
                 scores.shape != (len(chunk), 4)
                 or not np.isfinite(scores).all()
                 or not ((scores >= 0) & (scores <= 1)).all()
             ):
                 raise RuntimeError("Official relevance model returned invalid scores")
+            phase = time.perf_counter()
             for pair, row in zip(chunk, scores, strict=True):
                 score = (float(row[1]), float(row[2]))
                 self.scores.put(pair, score)
                 resolved[pair] = score
+            store_seconds += time.perf_counter() - phase
+        logger.info(
+            "graphene_score_stage pairs=%d misses=%d lookup_s=%.3f query_s=%.3f "
+            "keyword_s=%.3f cross_s=%.3f store_s=%.3f total_s=%.3f",
+            len(pairs), len(missing), lookup_seconds, query_seconds, keyword_seconds,
+            cross_seconds, store_seconds, time.perf_counter() - started,
+        )
         return resolved
 
 

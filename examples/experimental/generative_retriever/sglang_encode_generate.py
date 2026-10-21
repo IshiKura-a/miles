@@ -16,7 +16,7 @@ from examples.experimental.generative_retriever.relevance_reward import REWARD_M
 
 _REQUESTS_BY_STATE: WeakKeyDictionary[Any, dict[Any, Any]] = WeakKeyDictionary()
 _PREPARE_BATCHERS: WeakKeyDictionary[
-    asyncio.AbstractEventLoop, dict[tuple[str, float], _BaselinePrepareBatcher]
+    asyncio.AbstractEventLoop, dict[tuple[str, float, int], _BaselinePrepareBatcher]
 ] = WeakKeyDictionary()
 _DOCID_SIZE = 4
 _DOCID_DIM = 256
@@ -31,9 +31,13 @@ class _PendingPrepare:
 
 
 class _BaselinePrepareBatcher:
-    def __init__(self, url: str, timeout_seconds: float) -> None:
+    def __init__(self, url: str, timeout_seconds: float, concurrency: int) -> None:
+        if concurrency <= 0:
+            raise ValueError("Baseline prepare concurrency must be positive")
         self._url = url
         self._timeout_seconds = timeout_seconds
+        self._slots = asyncio.Semaphore(concurrency)
+        self._requests: set[asyncio.Task[None]] = set()
         self._pending: deque[_PendingPrepare] = deque()
         self._flush_task: asyncio.Task[None] | None = None
 
@@ -48,24 +52,35 @@ class _BaselinePrepareBatcher:
         try:
             while self._pending:
                 await asyncio.sleep(_PREPARE_BATCH_WAIT_SECONDS)
+                await self._slots.acquire()
                 requests = [
                     self._pending.popleft()
                     for _ in range(min(len(self._pending), _MAX_PREPARE_QUERIES))
                 ]
-                try:
-                    metrics = await self._post(requests)
-                except Exception as error:
-                    for request in requests:
-                        if not request.future.done():
-                            request.future.set_exception(error)
-                else:
-                    for index, request in enumerate(requests):
-                        if not request.future.done():
-                            request.future.set_result(metrics if index == 0 else {})
+                task = asyncio.create_task(self._dispatch(requests))
+                self._requests.add(task)
+                task.add_done_callback(self._requests.discard)
         finally:
             self._flush_task = None
             if self._pending:
                 self._flush_task = asyncio.create_task(self._flush())
+
+    async def _dispatch(self, requests: list[_PendingPrepare]) -> None:
+        try:
+            metrics = await self._post(requests)
+            for index, request in enumerate(requests):
+                if not request.future.done():
+                    request.future.set_result(metrics if index == 0 else {})
+        except asyncio.CancelledError:
+            for request in requests:
+                request.future.cancel()
+            raise
+        except Exception as error:
+            for request in requests:
+                if not request.future.done():
+                    request.future.set_exception(error)
+        finally:
+            self._slots.release()
 
     async def _post(self, requests: list[_PendingPrepare]) -> dict[str, float]:
         queries = list(dict.fromkeys(request.query for request in requests))
@@ -83,13 +98,15 @@ class _BaselinePrepareBatcher:
         return _prepare_metrics(payload)
 
 
-def _get_prepare_batcher(url: str, timeout_seconds: float) -> _BaselinePrepareBatcher:
+def _get_prepare_batcher(
+    url: str, timeout_seconds: float, concurrency: int,
+) -> _BaselinePrepareBatcher:
     loop = asyncio.get_running_loop()
     batchers = _PREPARE_BATCHERS.setdefault(loop, {})
-    key = (url, timeout_seconds)
+    key = (url, timeout_seconds, concurrency)
     batcher = batchers.get(key)
     if batcher is None:
-        batcher = _BaselinePrepareBatcher(url, timeout_seconds)
+        batcher = _BaselinePrepareBatcher(url, timeout_seconds, concurrency)
         batchers[key] = batcher
     return batcher
 
@@ -142,6 +159,9 @@ def _add_arguments(parser) -> None:
         default=300.0,
         help="Retrieval-reward HTTP request timeout in seconds.",
     )
+    parser.add_argument("--generative-retriever-reward-batch-size", type=int, default=2048)
+    parser.add_argument("--generative-retriever-reward-concurrency", type=int, default=1)
+    parser.add_argument("--generative-retriever-prepare-concurrency", type=int, default=1)
 
 
 def _parse_embedding(
@@ -215,6 +235,7 @@ async def _request_embedding_and_prepare(
         _get_prepare_batcher(
             prepare_url,
             args.generative_retriever_reward_timeout,
+            args.generative_retriever_prepare_concurrency,
         ).submit(query),
     )
     return embedding, prepare_metrics
@@ -242,7 +263,6 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
     if sample.response or sample.response_length:
         raise ValueError("GR SGLang /encode rollout is single-turn and cannot continue a partial response")
 
-    prompt_ids = _training_prompt_ids(input.state, sample)
     query = sample.prompt
     if not isinstance(query, str):
         raise TypeError("GR rollout query must be a string")
@@ -255,8 +275,9 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
     beam_rank = 0 if input.evaluation else sample.index % group_size
     requests = _REQUESTS_BY_STATE.setdefault(input.state, {})
     group_key = sample.index if input.evaluation else sample.group_index
-    key = (input.evaluation, group_key, engine_url, tuple(prompt_ids))
+    key = (input.evaluation, group_key, engine_url, query)
     if key not in requests:
+        prompt_ids = _training_prompt_ids(input.state, sample)
         requests[key] = (
             asyncio.create_task(
                 _request_embedding_and_prepare(
@@ -267,8 +288,9 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
                 )
             ),
             set(),
+            prompt_ids,
         )
-    task, consumed = requests[key]
+    task, consumed, prompt_ids = requests[key]
     try:
         output, prepare_metrics = await asyncio.shield(task)
     finally:

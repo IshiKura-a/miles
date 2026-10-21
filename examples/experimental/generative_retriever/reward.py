@@ -39,17 +39,25 @@ class _PendingRequest:
 
 
 class _RewardBatcher:
-    def __init__(self, url: str, mode: str, timeout_seconds: float) -> None:
+    def __init__(
+        self, url: str, mode: str, timeout_seconds: float, *,
+        max_samples: int = _MAX_REWARD_SAMPLES_PER_REQUEST, concurrency: int = 1,
+    ) -> None:
+        if max_samples <= 0 or concurrency <= 0:
+            raise ValueError("Reward request batch size and concurrency must be positive")
         self._url = url
         self._mode = mode
         self._timeout_seconds = timeout_seconds
+        self._max_samples = max_samples
+        self._slots = asyncio.Semaphore(concurrency)
+        self._requests: set[asyncio.Task[None]] = set()
         self._pending: deque[_PendingRequest] = deque()
         self._flush_task: asyncio.Task[None] | None = None
 
     async def submit(self, payloads: list[dict[str, Any]]) -> _BatchResult:
-        if not 0 < len(payloads) <= _MAX_REWARD_SAMPLES_PER_REQUEST:
+        if not 0 < len(payloads) <= self._max_samples:
             raise ValueError(
-                f"reward batch must contain 1-{_MAX_REWARD_SAMPLES_PER_REQUEST} samples"
+                f"reward batch must contain 1-{self._max_samples} samples"
             )
         future = asyncio.get_running_loop().create_future()
         self._pending.append(_PendingRequest(payloads=payloads, future=future))
@@ -62,7 +70,7 @@ class _RewardBatcher:
         sample_count = 0
         while self._pending:
             request = self._pending[0]
-            if requests and sample_count + len(request.payloads) > _MAX_REWARD_SAMPLES_PER_REQUEST:
+            if requests and sample_count + len(request.payloads) > self._max_samples:
                 break
             requests.append(self._pending.popleft())
             sample_count += len(request.payloads)
@@ -72,19 +80,30 @@ class _RewardBatcher:
         try:
             while self._pending:
                 await asyncio.sleep(_REWARD_BATCH_WAIT_SECONDS)
+                await self._slots.acquire()
                 requests = self._take_batch()
-                try:
-                    result = await self._post(requests)
-                except Exception as error:
-                    for request in requests:
-                        if not request.future.done():
-                            request.future.set_exception(error)
-                else:
-                    self._resolve(requests, result)
+                task = asyncio.create_task(self._dispatch(requests))
+                self._requests.add(task)
+                task.add_done_callback(self._requests.discard)
         finally:
             self._flush_task = None
             if self._pending:
                 self._flush_task = asyncio.create_task(self._flush())
+
+    async def _dispatch(self, requests: list[_PendingRequest]) -> None:
+        try:
+            result = await self._post(requests)
+            self._resolve(requests, result)
+        except asyncio.CancelledError:
+            for request in requests:
+                request.future.cancel()
+            raise
+        except Exception as error:
+            for request in requests:
+                if not request.future.done():
+                    request.future.set_exception(error)
+        finally:
+            self._slots.release()
 
     async def _post(self, requests: list[_PendingRequest]) -> _BatchResult:
         payloads = [payload for request in requests for payload in request.payloads]
@@ -119,17 +138,22 @@ class _RewardBatcher:
 
 
 _BATCHERS: WeakKeyDictionary[
-    asyncio.AbstractEventLoop, dict[tuple[str, str, float], _RewardBatcher]
+    asyncio.AbstractEventLoop, dict[tuple[str, str, float, int, int], _RewardBatcher]
 ] = WeakKeyDictionary()
 
 
-def _get_batcher(url: str, mode: str, timeout_seconds: float) -> _RewardBatcher:
+def _get_batcher(
+    url: str, mode: str, timeout_seconds: float, *,
+    max_samples: int = _MAX_REWARD_SAMPLES_PER_REQUEST, concurrency: int = 1,
+) -> _RewardBatcher:
     loop = asyncio.get_running_loop()
     batchers = _BATCHERS.setdefault(loop, {})
-    key = (url, mode, timeout_seconds)
+    key = (url, mode, timeout_seconds, max_samples, concurrency)
     batcher = batchers.get(key)
     if batcher is None:
-        batcher = _RewardBatcher(url, mode, timeout_seconds)
+        batcher = _RewardBatcher(
+            url, mode, timeout_seconds, max_samples=max_samples, concurrency=concurrency,
+        )
         batchers[key] = batcher
     return batcher
 
@@ -298,10 +322,17 @@ async def reward(args: Any, samples: Sample | list[Sample], **kwargs: Any) -> fl
     if mode not in REWARD_MODES:
         raise ValueError(f"Unknown reward mode: {mode!r}")
     rewards: list[float] = []
-    batcher = _get_batcher(url, mode, timeout_seconds)
-    for start in range(0, len(batch), _MAX_REWARD_SAMPLES_PER_REQUEST):
-        sample_chunk = batch[start:start + _MAX_REWARD_SAMPLES_PER_REQUEST]
-        result = await batcher.submit([_sample_payload(sample) for sample in sample_chunk])
+    max_samples = args.generative_retriever_reward_batch_size
+    concurrency = args.generative_retriever_reward_concurrency
+    batcher = _get_batcher(
+        url, mode, timeout_seconds, max_samples=max_samples, concurrency=concurrency,
+    )
+    chunks = [batch[start:start + max_samples] for start in range(0, len(batch), max_samples)]
+    results = await asyncio.gather(*(
+        batcher.submit([_sample_payload(sample) for sample in chunk])
+        for chunk in chunks
+    ))
+    for sample_chunk, result in zip(chunks, results, strict=True):
         rewards.extend(result.rewards)
         for index, (sample, detail) in enumerate(
             zip(sample_chunk, result.details, strict=True)

@@ -14,6 +14,7 @@ import argparse
 import logging
 import math
 import time
+from concurrent.futures import Future
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
@@ -23,7 +24,7 @@ from typing import Annotated, Any
 import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field, StrictInt, field_validator
+from pydantic import BaseModel, Field, StrictInt, create_model, field_validator
 
 from examples.experimental.generative_retriever.id_text_mapping import _validate_id, lookup_service
 from examples.experimental.generative_retriever.lru_cache import LRUCache
@@ -38,7 +39,7 @@ from examples.experimental.generative_retriever.relevance_reward import (
 )
 
 logger = logging.getLogger(__name__)
-_SERVICE_API_VERSION = 8
+_SERVICE_API_VERSION = 9
 _QUERY_CACHE_SIZE = 8192
 _SCORE_CACHE_SIZE = 131072
 
@@ -62,8 +63,18 @@ class RewardSample(BaseModel):
 
 
 class RewardRequest(BaseModel):
-    samples: Annotated[list[RewardSample], Field(min_length=1, max_length=2048)]
+    samples: Annotated[list[RewardSample], Field(min_length=1)]
     reward_mode: RewardMode = "discrete_relevance_unique"
+
+
+def reward_request_model(max_samples: int) -> type[RewardRequest]:
+    if max_samples <= 0:
+        raise ValueError("Reward request sample limit must be positive")
+    return create_model(
+        f"RewardRequestMax{max_samples}",
+        __base__=RewardRequest,
+        samples=(list[RewardSample], Field(min_length=1, max_length=max_samples)),
+    )
 
 
 class BaselinePrepareRequest(BaseModel):
@@ -91,6 +102,7 @@ class KeywordRewardEngine:
         baseline_top_k: int,
         *,
         pair_batch_size: int,
+        keyword_cache_size: int = 8192,
     ) -> None:
         self.mapping_version = mapping_version
         self.mapping_url = mapping_url
@@ -106,9 +118,10 @@ class KeywordRewardEngine:
         )
         self.scorer = RelevanceScorer(
             pipeline, feature_cache_size=query_cache_size, score_cache_size=score_cache_size,
-            pair_batch_size=pair_batch_size,
+            pair_batch_size=pair_batch_size, keyword_cache_size=keyword_cache_size,
         )
         self._lock = Lock()
+        self._baseline_inflight: dict[str, Future[frozenset[str]]] = {}
         self._client = httpx.Client(timeout=300.0)
 
     def _cache_stats(self) -> dict[str, Any]:
@@ -141,20 +154,18 @@ class KeywordRewardEngine:
             for name in after
         }
 
-    def _prepare_baselines(self, queries: list[str]) -> dict[str, frozenset[str]]:
-        baselines = {}
-        missing_queries = []
-        for query in dict.fromkeys(queries):
-            baseline = self.baselines.get(query)
-            if baseline is None:
-                missing_queries.append(query)
-            else:
-                baselines[query] = baseline
-        if not missing_queries:
-            return baselines
-        if not self.baseline_url:
-            raise KeyError(f"Prepared baseline missing for queries {missing_queries!r}")
+    @staticmethod
+    def _sum_cache_deltas(
+        first: dict[str, dict[str, int]], second: dict[str, dict[str, int]],
+    ) -> dict[str, dict[str, int]]:
+        return {
+            name: {counter: value + second[name][counter] for counter, value in counts.items()}
+            for name, counts in first.items()
+        }
 
+    def _generate_baseline_docids(
+        self, missing_queries: list[str],
+    ) -> dict[str, list[tuple[int, int, int, int]]]:
         response = self._client.post(
             self.baseline_url,
             json={"queries": missing_queries},
@@ -187,46 +198,102 @@ class KeywordRewardEngine:
             if len(set(docids)) != self.baseline_top_k:
                 raise ValueError("Baseline service returned duplicate doc IDs")
             query_docids[query] = docids
+        return query_docids
 
-        mapping = self._lookup_docids([
-            docid for query in missing_queries for docid in query_docids[query]
-        ])
-        query_keywords = {
-            query: list(dict.fromkeys(
-                keyword
-                for docid in query_docids[query]
-                for keyword in mapping[docid]
-            ))
-            for query in missing_queries
-        }
-        pair_scores = self.scorer.score([
-            (query, keyword)
-            for query in missing_queries
-            for keyword in query_keywords[query]
-        ])
-        for query in missing_queries:
-            scores = {
-                keyword: pair_scores[(query, keyword)]
-                for keyword in query_keywords[query]
-            }
-            baseline = build_baseline_set(scores)
-            self.baselines.put(query, baseline)
-            self._baseline_queries.add(query)
-            baselines[query] = baseline
-        return baselines
+    def _prepare_baselines(
+        self, queries: list[str],
+    ) -> tuple[dict[str, frozenset[str]], dict[str, dict[str, int]]]:
+        started = time.perf_counter()
+        baselines: dict[str, frozenset[str]] = {}
+        owned: dict[str, Future[frozenset[str]]] = {}
+        waiting: dict[str, Future[frozenset[str]]] = {}
+        with self._lock:
+            before = self._cache_stats()
+            for query in dict.fromkeys(queries):
+                baseline = self.baselines.get(query)
+                if baseline is not None:
+                    baselines[query] = baseline
+                elif query in self._baseline_inflight:
+                    waiting[query] = self._baseline_inflight[query]
+                else:
+                    future: Future[frozenset[str]] = Future()
+                    self._baseline_inflight[query] = future
+                    owned[query] = future
+            initial_delta = self._cache_delta(before, self._cache_stats())
+        delta = initial_delta
+        if owned:
+            missing_queries = list(owned)
+            try:
+                if not self.baseline_url:
+                    raise KeyError(f"Prepared baseline missing for queries {missing_queries!r}")
+                query_docids = self._generate_baseline_docids(missing_queries)
+                generated_at = time.perf_counter()
+                mapping = self._lookup_docids([
+                    docid for query in missing_queries for docid in query_docids[query]
+                ])
+                query_keywords = {
+                    query: list(dict.fromkeys(
+                        keyword
+                        for docid in query_docids[query]
+                        for keyword in mapping[docid]
+                    ))
+                    for query in missing_queries
+                }
+                mapped_at = time.perf_counter()
+                with self._lock:
+                    acquired_at = time.perf_counter()
+                    before_scoring = self._cache_stats()
+                    pair_scores = self.scorer.score([
+                        (query, keyword)
+                        for query in missing_queries
+                        for keyword in query_keywords[query]
+                    ])
+                    scored_at = time.perf_counter()
+                    for query in missing_queries:
+                        scores = {
+                            keyword: pair_scores[(query, keyword)]
+                            for keyword in query_keywords[query]
+                        }
+                        baseline = build_baseline_set(scores)
+                        self.baselines.put(query, baseline)
+                        self._baseline_queries.add(query)
+                        baselines[query] = baseline
+                    delta = self._sum_cache_deltas(
+                        initial_delta, self._cache_delta(before_scoring, self._cache_stats()),
+                    )
+                    for query, future in owned.items():
+                        future.set_result(baselines[query])
+                        del self._baseline_inflight[query]
+                finished = time.perf_counter()
+                logger.info(
+                    "reward_baseline_stage queries=%d missing=%d baseline_s=%.3f mapping_s=%.3f "
+                    "lock_wait_s=%.3f graphene_s=%.3f build_s=%.3f total_s=%.3f",
+                    len(queries), len(owned), generated_at - started, mapped_at - generated_at,
+                    acquired_at - mapped_at, scored_at - acquired_at, finished - scored_at,
+                    finished - started,
+                )
+            except Exception as error:
+                with self._lock:
+                    for query, future in owned.items():
+                        if not future.done():
+                            future.set_exception(error)
+                        self._baseline_inflight.pop(query, None)
+                raise
+        for query, future in waiting.items():
+            baselines[query] = future.result()
+        return baselines, delta
 
     def prepare_baselines(self, request: BaselinePrepareRequest) -> dict[str, Any]:
         started = time.perf_counter()
+        baselines, delta = self._prepare_baselines(request.queries)
         with self._lock:
-            before = self._cache_stats()
-            baselines = self._prepare_baselines(request.queries)
             cache = self._cache_stats()
         return {
             "prepared_queries": len(baselines),
             "mapping_version": self.mapping_version,
             "latency_seconds": time.perf_counter() - started,
             "cache": cache,
-            "cache_delta": self._cache_delta(before, cache),
+            "cache_delta": delta,
         }
 
     def score(self, request: RewardRequest) -> dict[str, Any]:
@@ -237,20 +304,25 @@ class KeywordRewardEngine:
             for sample in request.samples
         ]
         mapping = self._lookup_docids(docids)
+        mapped_at = time.perf_counter()
+        baselines, baseline_delta = self._prepare_baselines([
+            sample.prompt for sample in request.samples
+        ])
+        prepared_at = time.perf_counter()
         with self._lock:
+            acquired_at = time.perf_counter()
             before = self._cache_stats()
-            baselines = self._prepare_baselines([
-                sample.prompt for sample in request.samples
-            ])
             sample_keywords = [
                 list(dict.fromkeys(mapping[docid]))
                 for docid in docids
             ]
-            pair_scores = self.scorer.score([
+            pairs = [
                 (sample.prompt, keyword)
                 for sample, keywords in zip(request.samples, sample_keywords, strict=True)
                 for keyword in keywords
-            ])
+            ]
+            pair_scores = self.scorer.score(pairs)
+            scored_at = time.perf_counter()
             rewards = []
             details = []
             for sample, docid, keywords in zip(
@@ -275,14 +347,24 @@ class KeywordRewardEngine:
                 logger.debug("reward_mode=%s docid=%s keywords=%d reward=%f",
                             request.reward_mode, docid, len(scores), value)
             cache = self._cache_stats()
+        finished = time.perf_counter()
+        logger.info(
+            "reward_score_stage samples=%d pairs=%d mapping_s=%.3f lock_wait_s=%.3f "
+            "baseline_s=%.3f graphene_s=%.3f breakdown_s=%.3f total_s=%.3f",
+            len(request.samples), len(pairs), mapped_at - started, acquired_at - prepared_at,
+            prepared_at - mapped_at, scored_at - acquired_at, finished - scored_at,
+            finished - started,
+        )
         return {
             "rewards": rewards,
             "details": details,
             "reward_mode": request.reward_mode,
             "mapping_version": self.mapping_version,
-            "latency_seconds": time.perf_counter() - started,
+            "latency_seconds": finished - started,
             "cache": cache,
-            "cache_delta": self._cache_delta(before, cache),
+            "cache_delta": self._sum_cache_deltas(
+                baseline_delta, self._cache_delta(before, cache),
+            ),
         }
 
     def close(self) -> None:
@@ -298,9 +380,15 @@ def create_app(
     batch_size: int = 2048,
     baseline_top_k: int = 64,
     pair_batch_size: int = 8192,
+    max_samples_per_request: int = 2048,
+    keyword_cache_size: int = _QUERY_CACHE_SIZE,
+    score_cache_size: int = _SCORE_CACHE_SIZE,
 ) -> FastAPI:
     if batch_size < 4 or batch_size % 4:
         raise ValueError("batch_size must be a positive multiple of 4")
+    if keyword_cache_size <= 0 or score_cache_size <= 0:
+        raise ValueError("Reward cache capacities must be positive")
+    request_model = reward_request_model(max_samples_per_request)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -312,9 +400,10 @@ def create_app(
             "cuda:0",
             batch_size,
             _QUERY_CACHE_SIZE,
-            _SCORE_CACHE_SIZE,
+            score_cache_size,
             baseline_top_k,
             pair_batch_size=pair_batch_size,
+            keyword_cache_size=keyword_cache_size,
         )
         try:
             yield
@@ -343,15 +432,15 @@ def create_app(
                 "relevance_source": str(resolve_relevance_source(relevance_model)),
                 "relevance_model": str(Path(relevance_model).expanduser().resolve()),
                 "query_cache_size": _QUERY_CACHE_SIZE,
-                "keyword_cache_size": _QUERY_CACHE_SIZE,
-                "score_cache_size": _SCORE_CACHE_SIZE,
+                "keyword_cache_size": keyword_cache_size,
+                "score_cache_size": score_cache_size,
                 "batch_size": batch_size,
                 "pair_batch_size": engine.scorer.pair_batch_size,
                 "baseline_top_k": baseline_top_k,
+                "max_samples_per_request": max_samples_per_request,
             },
         }
 
-    @app.post("/score")
     def score(request: RewardRequest) -> dict[str, Any]:
         try:
             return app.state.engine.score(request)
@@ -364,6 +453,9 @@ def create_app(
         except httpx.HTTPError as error:
             logger.error("Dependent service unavailable: %s", error)
             raise HTTPException(status_code=502, detail=str(error)) from error
+
+    score.__annotations__["request"] = request_model
+    app.post("/score")(score)
 
     @app.post("/prepare")
     def prepare(request: BaselinePrepareRequest) -> dict[str, Any]:
@@ -392,6 +484,9 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=2048)
     parser.add_argument("--pair-batch-size", type=int, default=8192)
     parser.add_argument("--baseline-top-k", type=int, default=64)
+    parser.add_argument("--max-samples-per-request", type=int, default=2048)
+    parser.add_argument("--keyword-cache-size", type=int, default=_QUERY_CACHE_SIZE)
+    parser.add_argument("--score-cache-size", type=int, default=_SCORE_CACHE_SIZE)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
     uvicorn.run(
@@ -403,6 +498,9 @@ def main() -> None:
             batch_size=args.batch_size,
             baseline_top_k=args.baseline_top_k,
             pair_batch_size=args.pair_batch_size,
+            max_samples_per_request=args.max_samples_per_request,
+            keyword_cache_size=args.keyword_cache_size,
+            score_cache_size=args.score_cache_size,
         ),
         host=args.host,
         port=args.port,

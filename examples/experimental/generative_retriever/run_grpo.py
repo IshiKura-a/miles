@@ -84,6 +84,12 @@ class ScriptArgs(U.ExecuteTrainConfig):
     global_batch_size: int = 65536
     max_tokens_per_gpu: int = 33024
     reward_timeout: float = 1200.0
+    reward_batch_size: int = 2048
+    reward_request_concurrency: int = 1
+    prepare_concurrency: int = 1
+    reward_forward_concurrency: int = 1
+    reward_keyword_cache_size: int = 8192
+    reward_score_cache_size: int = 131072
     num_rollout: int = 1000
     one_step_async: bool = True
     temperature: float = 1.0
@@ -337,6 +343,12 @@ def _ensure_resident_services(
                     "2048",
                     "--pair-batch-size",
                     "8192",
+                    "--max-samples-per-request",
+                    str(args.reward_batch_size),
+                    "--keyword-cache-size",
+                    str(args.reward_keyword_cache_size),
+                    "--score-cache-size",
+                    str(args.reward_score_cache_size),
                     "--port",
                     str(port),
                 ],
@@ -348,18 +360,19 @@ def _ensure_resident_services(
                     "worker_count": 1,
                     "mapping_version": mapping.name,
                     "service_config": {
-                        "api_version": 8,
+                        "api_version": 9,
                         "baseline_url": baseline_url,
                         "mapping_url": mapping_url,
                         "mapping_version": mapping.name,
                         "relevance_source": str(relevance_source),
                         "relevance_model": str(relevance_model),
                         "query_cache_size": 8192,
-                        "keyword_cache_size": 8192,
-                        "score_cache_size": 131072,
+                        "keyword_cache_size": args.reward_keyword_cache_size,
+                        "score_cache_size": args.reward_score_cache_size,
                         "batch_size": 2048,
                         "pair_batch_size": 8192,
                         "baseline_top_k": args.n_samples_per_prompt,
+                        "max_samples_per_request": args.reward_batch_size,
                     },
                 },
             )
@@ -377,6 +390,10 @@ def _ensure_resident_services(
                 ),
                 "--port",
                 str(_REWARD_PORT),
+                "--max-samples-per-request",
+                str(args.reward_batch_size),
+                "--forward-concurrency",
+                str(args.reward_forward_concurrency),
             ],
             _service_env(""),
             f"http://127.0.0.1:{_REWARD_PORT}/health",
@@ -386,11 +403,13 @@ def _ensure_resident_services(
                 "worker_count": 2,
                 "mapping_version": mapping.name,
                 "service_config": {
-                    "api_version": 5,
+                    "api_version": 6,
                     "worker_urls": [
                         f"http://127.0.0.1:{port}/score"
                         for port in _REWARD_WORKER_PORTS
-                    ]
+                    ],
+                    "max_samples_per_request": args.reward_batch_size,
+                    "forward_concurrency": args.reward_forward_concurrency,
                 },
             },
         )
@@ -472,6 +491,12 @@ def execute(args: ScriptArgs) -> None:
         raise ValueError("Training sampling temperature must be positive")
     if args.reward_timeout <= 0:
         raise ValueError("reward_timeout must be positive")
+    if min(
+        args.reward_batch_size, args.reward_request_concurrency, args.prepare_concurrency,
+        args.reward_forward_concurrency,
+        args.reward_keyword_cache_size, args.reward_score_cache_size,
+    ) <= 0:
+        raise ValueError("Reward batch, concurrency and cache settings must be positive")
     if args.max_tokens_per_gpu <= 0:
         raise ValueError("max_tokens_per_gpu must be positive")
     if args.sglang_server_concurrency < args.n_samples_per_prompt:
@@ -621,6 +646,9 @@ def execute(args: ScriptArgs) -> None:
             f"--generative-retriever-reward-prepare-url {quote(reward_prepare_url)} "
             f"--generative-retriever-reward-mode {args.reward_mode} "
             f"--generative-retriever-reward-timeout {args.reward_timeout} "
+            f"--generative-retriever-reward-batch-size {args.reward_batch_size} "
+            f"--generative-retriever-reward-concurrency {args.reward_request_concurrency} "
+            f"--generative-retriever-prepare-concurrency {args.prepare_concurrency} "
             f"--num-rollout {args.num_rollout} "
             f"--rollout-batch-size {args.rollout_batch_size} "
             f"--n-samples-per-prompt {args.n_samples_per_prompt} "

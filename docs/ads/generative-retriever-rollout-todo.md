@@ -173,7 +173,7 @@ HTTP reward hook 对每个 sample 返回一个 doc ID 的平均 keyword reward�
   使用当前映射的 ID 前缀约束。Baseline 为 top-64 beam，训练 rollout 为每 query
   64 次随机采样；doc ID 含 4 个 decoder token，训练样本允许重复 ID。
 - Rollout 经 SGLang router 的 `/v1/embeddings` 返回 token 和 logprob；
-  同一 query group 共享生成请求，并行准备 reward baseline。Prepare 请求
+  同一 query group 只分词一次并共享生成请求，并行准备 reward baseline。Prepare 请求
   每 10ms 合并，最多 512 个 query；learner 使用同一前缀约束计算 logprob。
 - Rollout engine 使用两卡 DP=2、`mem-fraction-static=0.7`；
   `sglang-server-concurrency=4096` 可同时容纳 64 个完整的 64-sample query group。
@@ -321,6 +321,20 @@ uv run python -m examples.experimental.generative_retriever.reward_router_servic
 - Rollout hook 在 10ms 窗口合并最多 2,048 个 sample，训练 HTTP 超时默认 1,200 秒；
   日志分别记录 prepare 和 score 请求的数量与平均服务时延。
   训练 reward URL 为 `http://127.0.0.1:30489/score`。
+  Worker 日志的 `reward_baseline_stage`、`reward_score_stage` 和
+  `graphene_score_stage` 分别记录 baseline 生成、映射、tower/cross 评分、
+  请求锁等待与聚合耗时；router 日志记录转发耗时。不输出 query/keyword 原文，
+  用于区分模型计算和 HTTP/CPU 排队瓶颈。
+
+### 两机 16 GPU reward 配置
+
+两机 16×MI300X 使用
+8 learner、4 rollout、4 frozen baseline、8 reward worker（其中 4 个与
+rollout 同卡），每步 4,096 query × 64 sample。Reward 配置为
+每个 `/score` 请求最多 2,048 sample、客户端并发 8、router 每 worker
+转发并发 1、prepare 并发 1；baseline 模型和 reward 定义不变。
+首轮完整 rollout 中，最后一个 `/prepare` 到最后一个 `/score` 的间隔
+从客户端并发 1 时约 58–59 秒降至并发 8 时的 2.2 秒。
 
 ## 离线 good-count eval 与训练资源隔离
 

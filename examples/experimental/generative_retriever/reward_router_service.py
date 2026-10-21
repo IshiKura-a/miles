@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import math
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from threading import Lock
@@ -17,18 +19,34 @@ from fastapi import FastAPI, HTTPException
 from examples.experimental.generative_retriever.reward_service import (
     BaselinePrepareRequest,
     RewardRequest,
+    reward_request_model,
 )
 
-_SERVICE_API_VERSION = 5
+_SERVICE_API_VERSION = 6
+logger = logging.getLogger(__name__)
 
 
 class RewardRouter:
-    def __init__(self, worker_urls: tuple[str, ...]) -> None:
+    def __init__(
+        self, worker_urls: tuple[str, ...], *,
+        max_samples_per_request: int = 2048, forward_concurrency: int = 1,
+    ) -> None:
         if not worker_urls or len(set(worker_urls)) != len(worker_urls):
             raise ValueError("Reward router requires distinct worker URLs")
+        if forward_concurrency <= 0:
+            raise ValueError("Reward forwarding concurrency must be positive")
         self.worker_urls = worker_urls
-        self._executor = ThreadPoolExecutor(max_workers=len(worker_urls))
-        self._client = httpx.Client(timeout=900.0)
+        self._request_model = reward_request_model(max_samples_per_request)
+        self.max_samples_per_request = max_samples_per_request
+        self.forward_concurrency = forward_concurrency
+        self._executor = ThreadPoolExecutor(max_workers=len(worker_urls) * forward_concurrency)
+        connections = len(worker_urls) * (forward_concurrency + 1)
+        self._client = httpx.Client(
+            timeout=900.0,
+            limits=httpx.Limits(
+                max_connections=connections, max_keepalive_connections=connections,
+            ),
+        )
         self._routing_lock = Lock()
         self._routed_samples = [0] * len(worker_urls)
         self._prepared_queries = [0] * len(worker_urls)
@@ -52,6 +70,7 @@ class RewardRouter:
         return payload
 
     def score(self, request: RewardRequest) -> dict[str, Any]:
+        started = time.perf_counter()
         buckets: list[list[tuple[int, Any]]] = [[] for _ in self.worker_urls]
         for index, sample in enumerate(request.samples):
             buckets[self._worker_index(sample.prompt)].append((index, sample))
@@ -62,7 +81,7 @@ class RewardRouter:
             (index, self._executor.submit(
                 self._post,
                 url,
-                RewardRequest(
+                self._request_model(
                     samples=[sample for _, sample in bucket],
                     reward_mode=request.reward_mode,
                 ),
@@ -71,6 +90,7 @@ class RewardRouter:
             if bucket
         ]
         responses = {index: future.result() for index, future in futures}
+        forwarded_at = time.perf_counter()
         rewards: dict[int, float] = {}
         details: dict[int, dict[str, Any]] = {}
         for worker_index, response in responses.items():
@@ -95,7 +115,7 @@ class RewardRouter:
             for position, (index, _) in enumerate(bucket):
                 rewards[index] = worker_rewards[position]
                 details[index] = worker_details[position]
-        return {
+        result = {
             "rewards": [rewards[index] for index in range(len(request.samples))],
             "details": [details[index] for index in range(len(request.samples))],
             "reward_mode": request.reward_mode,
@@ -105,8 +125,16 @@ class RewardRouter:
                 for index, bucket in enumerate(buckets)
             },
         }
+        logger.info(
+            "reward_route_score samples=%d active_workers=%d forward_s=%.3f "
+            "aggregate_s=%.3f total_s=%.3f",
+            len(request.samples), len(responses), forwarded_at - started,
+            time.perf_counter() - forwarded_at, time.perf_counter() - started,
+        )
+        return result
 
     def prepare(self, request: BaselinePrepareRequest) -> dict[str, Any]:
+        started = time.perf_counter()
         buckets: list[list[str]] = [[] for _ in self.worker_urls]
         for query in dict.fromkeys(request.queries):
             buckets[self._worker_index(query)].append(query)
@@ -123,7 +151,7 @@ class RewardRouter:
             if bucket
         ]
         responses = {index: future.result() for index, future in futures}
-        return {
+        result = {
             "prepared_queries": sum(
                 response["prepared_queries"] for response in responses.values()
             ),
@@ -133,6 +161,11 @@ class RewardRouter:
                 for index, bucket in enumerate(buckets)
             },
         }
+        logger.info(
+            "reward_route_prepare queries=%d active_workers=%d total_s=%.3f",
+            len(request.queries), len(responses), time.perf_counter() - started,
+        )
+        return result
 
     @staticmethod
     def _response_metrics(responses: dict[int, dict[str, Any]]) -> dict[str, Any]:
@@ -162,6 +195,12 @@ class RewardRouter:
             payload = response.json()
             if payload.get("status") != "ready" or payload.get("worker_count") != 1:
                 raise RuntimeError(f"Reward worker is not ready: {payload}")
+            worker_limit = payload["service_config"]["max_samples_per_request"]
+            if worker_limit < self.max_samples_per_request:
+                raise RuntimeError(
+                    f"Reward worker request limit {worker_limit} is below router limit "
+                    f"{self.max_samples_per_request}"
+                )
             responses.append(payload)
         mapping_versions = {response["mapping_version"] for response in responses}
         if len(mapping_versions) != 1:
@@ -186,6 +225,8 @@ class RewardRouter:
             "service_config": {
                 "api_version": _SERVICE_API_VERSION,
                 "worker_urls": list(self.worker_urls),
+                "max_samples_per_request": self.max_samples_per_request,
+                "forward_concurrency": self.forward_concurrency,
             },
         }
 
@@ -194,10 +235,17 @@ class RewardRouter:
         self._client.close()
 
 
-def create_app(worker_urls: tuple[str, ...]) -> FastAPI:
+def create_app(
+    worker_urls: tuple[str, ...], *,
+    max_samples_per_request: int = 2048, forward_concurrency: int = 1,
+) -> FastAPI:
+    request_model = reward_request_model(max_samples_per_request)
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        app.state.router = RewardRouter(worker_urls)
+        app.state.router = RewardRouter(
+            worker_urls, max_samples_per_request=max_samples_per_request,
+            forward_concurrency=forward_concurrency,
+        )
         try:
             yield
         finally:
@@ -213,12 +261,14 @@ def create_app(worker_urls: tuple[str, ...]) -> FastAPI:
         except (httpx.HTTPError, RuntimeError, ValueError) as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
 
-    @app.post("/score")
     def score(request: RewardRequest) -> dict[str, Any]:
         try:
             return app.state.router.score(request)
         except (httpx.HTTPError, RuntimeError, ValueError) as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
+
+    score.__annotations__["request"] = request_model
+    app.post("/score")(score)
 
     @app.post("/prepare")
     def prepare(request: BaselinePrepareRequest) -> dict[str, Any]:
@@ -238,12 +288,17 @@ def main() -> None:
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=30489)
+    parser.add_argument("--max-samples-per-request", type=int, default=2048)
+    parser.add_argument("--forward-concurrency", type=int, default=1)
     args = parser.parse_args()
     worker_urls = tuple(args.worker_urls.split(","))
     if not worker_urls:
         raise ValueError("--worker-urls must contain at least one URL")
     uvicorn.run(
-        create_app(worker_urls),
+        create_app(
+            worker_urls, max_samples_per_request=args.max_samples_per_request,
+            forward_concurrency=args.forward_concurrency,
+        ),
         host=args.host,
         port=args.port,
         workers=1,
