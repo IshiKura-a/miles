@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, cast
 from weakref import WeakKeyDictionary
+
+import httpx
 
 from miles.rollout.base_types import GenerateFnInput, GenerateFnOutput
 from miles.utils.http_utils import GeneralHttpClientProvider
@@ -22,6 +25,10 @@ _DOCID_SIZE = 4
 _DOCID_DIM = 256
 _MAX_PREPARE_QUERIES = 512
 _PREPARE_BATCH_WAIT_SECONDS = 0.01
+_TRANSPORT_ATTEMPTS = 3
+_RETRY_DELAY_SECONDS = 0.5
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -84,11 +91,30 @@ class _BaselinePrepareBatcher:
 
     async def _post(self, requests: list[_PendingPrepare]) -> dict[str, float]:
         queries = list(dict.fromkeys(request.query for request in requests))
-        response = await GeneralHttpClientProvider.client().post(
-            self._url,
-            json={"queries": queries},
+        # Avoid reusing idle sockets for the idempotent prepare request.
+        async with httpx.AsyncClient(
             timeout=self._timeout_seconds,
-        )
+            limits=httpx.Limits(max_keepalive_connections=0),
+            trust_env=False,
+        ) as client:
+            attempt = 1
+            while True:
+                try:
+                    response = await client.post(self._url, json={"queries": queries})
+                    break
+                except (httpx.ReadError, httpx.RemoteProtocolError, httpx.ConnectError, httpx.ConnectTimeout) as error:
+                    if attempt == _TRANSPORT_ATTEMPTS:
+                        logger.error(
+                            "Baseline prepare transport %s failed after %d attempts for %d queries",
+                            type(error).__name__, attempt, len(queries),
+                        )
+                        raise
+                    logger.warning(
+                        "Baseline prepare transport %s for %d queries (attempt %d/%d); retrying the same batch",
+                        type(error).__name__, len(queries), attempt, _TRANSPORT_ATTEMPTS,
+                    )
+                    await asyncio.sleep(_RETRY_DELAY_SECONDS * 2 ** (attempt - 1))
+                    attempt += 1
         response.raise_for_status()
         payload = response.json()
         if not isinstance(payload, dict):
@@ -203,13 +229,26 @@ async def _resolve_engine_url(args: Any, sample: Sample) -> str:
 
 
 async def _request_embedding(args: Any, router_url: str, prompt_ids: list[int]) -> dict[str, Any]:
-    response = await GeneralHttpClientProvider.client().post(
-        f"{router_url}/v1/embeddings",
-        json={
-            "model": args.hf_checkpoint,
-            "input": prompt_ids,
-        },
-    )
+    attempt = 1
+    while True:
+        try:
+            response = await GeneralHttpClientProvider.client().post(
+                f"{router_url}/v1/embeddings",
+                json={
+                    "model": args.hf_checkpoint,
+                    "input": prompt_ids,
+                },
+            )
+            break
+        except (httpx.ConnectError, httpx.ConnectTimeout) as error:
+            if attempt == _TRANSPORT_ATTEMPTS:
+                raise
+            logger.warning(
+                "Embedding connection %s (attempt %d/%d); retrying before generation",
+                type(error).__name__, attempt, _TRANSPORT_ATTEMPTS,
+            )
+            await asyncio.sleep(_RETRY_DELAY_SECONDS * 2 ** (attempt - 1))
+            attempt += 1
     response.raise_for_status()
     payload = response.json()
     data = payload.get("data")

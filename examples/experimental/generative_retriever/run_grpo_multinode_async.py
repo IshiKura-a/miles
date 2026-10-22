@@ -470,18 +470,25 @@ def _wait_health(
     raise TimeoutError(f"{name} did not become ready at {url}; see {processes.log_dir}")
 
 
-def _service(
+def _start_service(
     processes: _Processes, name: str, module: str, host: str, port: int,
-    argv: list[str], *, gpus: str | None = None, expected: dict[str, object],
-    persistent: bool = False,
-) -> None:
-    process = processes.start(
+    argv: list[str], *, gpus: str | None = None, persistent: bool = False,
+) -> subprocess.Popen[str]:
+    return processes.start(
         name,
         [sys.executable, "-u", "-m",
          f"examples.experimental.generative_retriever.{module}",
          *argv, "--host", host, "--port", str(port)],
         gpus=gpus, persistent=persistent,
     )
+
+
+def _service(
+    processes: _Processes, name: str, module: str, host: str, port: int,
+    argv: list[str], *, gpus: str | None = None, expected: dict[str, object],
+    persistent: bool = False,
+) -> None:
+    process = _start_service(processes, name, module, host, port, argv, gpus=gpus, persistent=persistent)
     try:
         _wait_health(processes, host, name, port, expected)
     except BaseException:
@@ -543,9 +550,11 @@ def _service_node(manifest: Manifest, index: int) -> None:
     previous_handler = signal.signal(signal.SIGTERM, _exit_on_sigterm)
     try:
         _ensure_baseline(processes, manifest, host)
+        reward_health = []
         for gpu, port in enumerate(_REWARD_PORTS):
-            _service(
-                processes, f"reward-{gpu}", "reward_service", host, port,
+            name = f"reward-{gpu}"
+            _start_service(
+                processes, name, "reward_service", host, port,
                 [
                     "--baseline-url", f"http://{host}:{_BASELINE_PORT}/generate",
                     "--mapping-url", manifest["mapping_url"],
@@ -556,16 +565,18 @@ def _service_node(manifest: Manifest, index: int) -> None:
                     "--keyword-cache-size", "8192", "--score-cache-size", "131072",
                 ],
                 gpus=str(gpu),
-                expected={
-                    "worker_count": 1, "mapping_version": Path(mapping).name,
-                    "service_config": {
-                        "baseline_url": f"http://{host}:{_BASELINE_PORT}/generate",
-                        "mapping_url": manifest["mapping_url"],
-                        "relevance_model": manifest["relevance_model"],
-                        "max_samples_per_request": 2048,
-                    },
-                },
             )
+            reward_health.append((name, port, {
+                "worker_count": 1, "mapping_version": Path(mapping).name,
+                "service_config": {
+                    "baseline_url": f"http://{host}:{_BASELINE_PORT}/generate",
+                    "mapping_url": manifest["mapping_url"],
+                    "relevance_model": manifest["relevance_model"],
+                    "max_samples_per_request": 2048,
+                },
+            }))
+        for name, port, expected in reward_health:
+            _wait_health(processes, host, name, port, expected)
         print(f"service node {index} ready", flush=True)
         while True:
             processes.check()
