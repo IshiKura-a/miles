@@ -1,6 +1,6 @@
 # Generative Retriever RL
 
-当前训练 recipe 为单机八卡（每卡至少 80GB）、`2e-6` constant LR，
+以下单机历史 recipe 为八卡（每卡至少 80GB）、`2e-6` constant LR，
 总计 1,000 个 rollout，每个 rollout 对应一次 optimizer step、处理 1,024 query × 64 sample。
 存档 run `261015-104046-gr-lr2e6`
 以每 query 16 sample 完成训练，最终 checkpoint 为 `iter_0001000`。
@@ -55,6 +55,27 @@ git -C "$SLMGR_ROOT" apply "$PATCH"
 ```
 
 Miles 的 `--slm-root` 仍指向该 checkout 下的 `SLMv3` 目录。
+
+### SGLang embedding 取消补丁
+
+训练完成目标 query 数后会中止多余的推理请求。锁定的 SGLang commit
+`7f79d11d948aa37b49821475e075369bb0e801f3` 对取消的 embedding
+请求返回无 `embedding` 字段的结果，但 OpenAI 层仍按成功结果读取该字段，
+产生 `KeyError` 和误导性的内部 500。
+[sglang-embedding-abort.patch](../../examples/experimental/generative_retriever/patches/sglang-embedding-abort.patch)
+仅在返回结果的 `finish_reason` 是 `abort` 时给出明确的 503，不改变正常的
+embedding 输出或模型行为。每台训练节点上的锁定 SGLang checkout 均须应用；
+launcher 会在启动前验证，不会自动修改外部源码：
+
+```bash
+MILES_ROOT=/home/aiscuser/miles
+SGLANG_ROOT="$MILES_ROOT/.venv/src/sglang"
+PATCH="$MILES_ROOT/examples/experimental/generative_retriever/patches/sglang-embedding-abort.patch"
+git -C "$SGLANG_ROOT" apply --check "$PATCH"
+git -C "$SGLANG_ROOT" apply "$PATCH"
+```
+
+此补丁仅影响后续新启动的 SGLang 服务，已在运行的旧服务需先退出。
 
 ## 模型与数据
 
@@ -188,6 +209,10 @@ HTTP reward hook 对每个 sample 返回一个 doc ID 的平均 keyword reward�
   在 run 目录通过 `.jsonl` 符号链接接入，按固定 seed shuffle。
 - 1,000 个 rollout 各消费 1,024 条记录，合计 1,024,000 条记录
   （约 0.068 epoch）；源数据中的 query 文本可重复。
+- 已完成的 batch 清理多余推理请求时，取消响应不会使训练中断；
+  SGLang 对被取消的 embedding 请求返回明确的 503。
+  在 batch 尚未完成时，现有 rollout 仍会记录失败 group 并另取 query
+  补足；这不等同于对原始数据精确遍历，须单独处理，不能宣称已修复。
 - `global_batch_size=65536`，每次 rollout 恰好形成一个 training step。
 - Learner 使用动态 token batching，每卡每 microbatch 上限 33,024 tokens；
   冻结 Qwen encoder 使用 backbone 的 last hidden state。
@@ -330,11 +355,95 @@ uv run python -m examples.experimental.generative_retriever.reward_router_servic
 
 两机 16×MI300X 使用
 8 learner、4 rollout、4 frozen baseline、8 reward worker（其中 4 个与
-rollout 同卡），每步 4,096 query × 64 sample。Reward 配置为
+rollout 同卡）。先前的两机吞吐测试每步使用 4,096 query × 64 sample；以下
+正式全量训练为精确遍历 15,000,000 条数据，改用 4,000 query × 64 sample。
+Reward 配置为
 每个 `/score` 请求最多 2,048 sample、客户端并发 8、router 每 worker
 转发并发 1、prepare 并发 1；baseline 模型和 reward 定义不变。
 首轮完整 rollout 中，最后一个 `/prepare` 到最后一个 `/score` 的间隔
 从客户端并发 1 时约 58–59 秒降至并发 8 时的 2.2 秒。
+
+### 多机异步 GRPO：2n × 8 GPU
+
+[run_grpo_multinode_async.py](../../examples/experimental/generative_retriever/run_grpo_multinode_async.py)
+是 Git 仓库内的多机入口，底层执行 **`train_async.py`**（Train N 与 Rollout N+1
+重叠），而非 `train.py`。不依赖 `local/` 中的实验脚本或复制的模型/数据：
+Stage5、Qwen、relevance、训练集和当前 TAListing 映射均取上表固定原始路径；
+reward 定义、64 次随机采样、`2e-6` constant LR 和每步权重同步保持不变。
+
+`--hosts` 按「服务/rollout 节点、learner 节点」依次成对排列；每个节点 8 卡，
+总计 `2n` 台。每对分配 8 learner、4 rollout、4 frozen baseline 和
+8 reward worker；rollout 与对应服务节点的 4 个 reward worker 共用 GPU 4–7。
+learner/rollout 的 Ray bundle 分别固定到对应节点 IP，避免 Ray 按 IP 排序
+误分配训练卡；角色 IP 由入口从 `--hosts` 推导并在内部传递，无需额外
+CLI 参数。每步 `4000n` query × 64 sample，`global_batch_size=256000n`，
+learner token budget 每卡 `524288`。完整遍历的 optimizer step 数为
+`3750/n`；当 `3750` 不能被 `n` 整除时拒绝启动，不隐式复用或丢弃数据。
+支持 `--num-rollout` 指定不超过该上限的短验收步骤；正式训练省略此参数。
+此精确遍历前提是每轮无请求或 group 失败；否则现有 rollout 会
+跳过失败 group 并补取 query，不能将运行结果视为精确遍历。
+旧 run `261021-114423-121` 在早期 rollout 已跳过失败 group，即使其
+`iter_0000040` checkpoint 完整，也不能用它证明精确遍历 1500 万条。
+
+先在首个服务节点检查各节点共享的 Cosmos 路径、相同的运行源码
+（即使 Git HEAD 不同，参与训练的文件也必须一致）、ROCm 环境及免密 SSH。
+入口按文件校验远端的 launcher、GPU 放置逻辑、参数解析、SLMv3 模型源码和
+Stage5/Qwen 索引；不一致就拒绝启动，不会覆盖其他节点的工作树。
+入口优先检测首个服务节点的 `31480` 常驻 mapping；仅当 `/health` 的版本、
+238,836,331 行、文件大小和底层文件的逐字节内容均与上表固定映射一致时才复用，
+并且不会在本次任务退出时停止该服务。没有常驻服务时才在 `31580` 启动任务专属
+mapping；有服务但映射不符则明确报错，不使用错误数据。
+冻结 baseline 同样在每个服务节点的 `31581` 验证健康状态和完整配置
+（Stage5、Qwen、SLMv3、当前映射、4 GPU、constrained top-64）；一致则复用，
+端口被不匹配服务占用时拒绝启动。首次启动的 baseline 在本次训练结束后仍常驻
+服务节点 GPU 0–3，供下一次相同配置的 run 复用，不由训练任务清理。确认没有
+训练任务依赖它之后，可根据 `31581` 的监听 PID 单独停止；不要按进程名批量清理。
+AzureML FUSE 挂载的符号链接不会自动出现在其他节点；入口会在各节点就地创建
+训练数据的 `.jsonl` 别名及 SGLang bundle 的模型/Tokenizer 链接，并验证可读，
+不会复制或替换原始数据、权重。
+W&B 必须提供 `WANDB_API_KEY`；入口与单机 launcher
+使用相同的 `miles-run_grpo` project 和 run-id group，密钥不写入 run manifest。
+`.env` 只用于导入运行环境，不传给服务进程；建议仅允许文件所有者读取：
+
+Ray 的自动 `uv run` 环境继承在 worker 的打包目录中会再次寻找 `.env`；
+该文件不随源码打包。多机入口在本进程内关闭此自动重放，使用节点上已有
+`.venv`。W&B 密钥只随训练 driver 的进程环境和 SSH 标准输入到达各节点的
+Ray 进程，不写入共享文件、命令行或 Ray 会记录的 runtime-env 配置；不需要
+将 `.env` 或密钥文件复制到其他节点。
+
+```bash
+cd /home/aiscuser/miles
+chmod 600 .env
+source .venv/activate-rocm.sh
+
+# 不启动服务或 GPU 任务：核对固定输入、1500 万行、训练参数与 W&B 开关。
+uv run --no-sync --env-file .env python -m \
+  examples.experimental.generative_retriever.run_grpo_multinode_async \
+  --hosts node-0,node-1 --run-id <run_id> --dry-run
+
+# 两机 16 卡：4000 query/step × 3750 step = 1500 万条。
+uv run --no-sync --env-file .env python -m \
+  examples.experimental.generative_retriever.run_grpo_multinode_async \
+  --hosts node-0,node-1 --run-id <run_id>
+
+# 同一配置的断点续跑，--num-rollout 始终表示总步骤数。
+uv run --no-sync --env-file .env python -m \
+  examples.experimental.generative_retriever.run_grpo_multinode_async \
+  --hosts node-0,node-1 --run-id <run_id> --resume
+
+# 四机 32 卡举例：8000 query/step × 1875 step = 1500 万条。
+uv run --no-sync --env-file .env python -m \
+  examples.experimental.generative_retriever.run_grpo_multinode_async \
+  --hosts node-0,node-1,node-2,node-3 --run-id <another_run_id>
+```
+
+全局 reward score 请求并发为 `8n`、prepare 并发为 `n`，每个 worker
+的转发并发仍为 1。入口只在端口未占用时建立本次运行所需的 reward/router 服务
+及 Ray 集群，不终止别的任务；run manifest、服务/训练日志、checkpoint
+位于 `$cosmos_data_path/local/User/zihao/online_rl/gr_offline_syn/<run_id>/`。
+成功条件为 `latest_checkpointed_iteration.txt` 等于目标 step 数。
+新多机入口需先以 `--num-rollout 2` 单独 run-id 验收 W&B、GPU 归属和 checkpoint，
+再执行全量训练；短跑并不能证明全量运行已完成。
 
 ## 离线 good-count eval 与训练资源隔离
 

@@ -10,8 +10,24 @@ import argparse
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 
 from .model_loading import require_directory
+
+
+def require_sglang_abort_patch() -> None:
+    patch = Path(__file__).resolve().parent / "patches/sglang-embedding-abort.patch"
+    sglang_root = Path(sys.prefix) / "src/sglang"
+    result = subprocess.run(
+        ["git", "-C", str(sglang_root), "apply", "--reverse", "--check", str(patch)],
+        capture_output=True, text=True,
+    )
+    if result.returncode:
+        raise RuntimeError(
+            f"SGLang embedding abort patch is missing from {sglang_root}; "
+            f"apply {patch} before launching training: {result.stderr.strip()}"
+        )
 
 
 _QWEN_ASSETS = (

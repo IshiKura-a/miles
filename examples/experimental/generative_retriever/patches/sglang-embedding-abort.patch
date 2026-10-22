@@ -1,0 +1,22 @@
+diff --git a/python/sglang/srt/entrypoints/openai/serving_embedding.py b/python/sglang/srt/entrypoints/openai/serving_embedding.py
+index ed52ef8323..a6036d8930 100644
+--- a/python/sglang/srt/entrypoints/openai/serving_embedding.py
++++ b/python/sglang/srt/entrypoints/openai/serving_embedding.py
+@@ -262,4 +262,16 @@ class OpenAIServingEmbedding(OpenAIServingBase):
+         if not isinstance(ret, list):
+             ret = [ret]
+-
++        for ret_item in ret:
++            if "embedding" not in ret_item:
++                finish_reason = ret_item.get("meta_info", {}).get("finish_reason")
++                if (
++                    isinstance(finish_reason, dict)
++                    and finish_reason.get("type") == "abort"
++                ):
++                    return self.create_error_response(
++                        finish_reason.get("message", "Embedding request aborted"),
++                        err_type="ServiceUnavailable",
++                        status_code=503,
++                    )
++
+         response = self._build_embedding_response(ret, request.encoding_format)

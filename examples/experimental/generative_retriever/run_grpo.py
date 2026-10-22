@@ -22,6 +22,7 @@ if str(_MILES_REPO_ROOT) not in sys.path:
 
 import miles.utils.external_utils.command_utils as U
 from miles.utils.misc import get_current_node_ip
+from examples.experimental.generative_retriever.prepare_sglang_bundle import require_sglang_abort_patch
 from examples.experimental.generative_retriever.relevance_reward import REWARD_MODES, RewardMode
 from examples.experimental.generative_retriever.relevance_model import resolve_relevance_source
 
@@ -472,6 +473,7 @@ def execute(args: ScriptArgs) -> None:
             "WANDB_API_KEY must be provided through the process environment "
             "for generative retriever training"
         )
+    require_sglang_abort_patch()
     wandb_args = (
         "--use-wandb "
         "--wandb-project miles-run_grpo "

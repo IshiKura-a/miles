@@ -48,12 +48,17 @@ class PlacementGroupInfo(NamedTuple):
     pg_reordered_gpu_ids: list[int]
 
 
-def _create_placement_group(num_gpus) -> PlacementGroupInfo:
+def _create_placement_group(
+    num_gpus, *, bundle_node_ips: list[str] | None = None, actor_bundles: int = 0,
+) -> PlacementGroupInfo:
     """Create a placement group with the specified number of GPUs."""
     if num_gpus == 0:
         return None, [], []
 
-    bundles = [{"GPU": 1, "CPU": 1} for _ in range(num_gpus)]
+    bundles = [
+        {"GPU": 1, "CPU": 1, **({f"node:{ip}": 0.001} if bundle_node_ips else {})}
+        for ip in (bundle_node_ips or [""] * num_gpus)
+    ]
     pg = placement_group(bundles, strategy="PACK")
     num_bundles = len(bundles)
 
@@ -74,7 +79,19 @@ def _create_placement_group(num_gpus) -> PlacementGroupInfo:
         ray.kill(actor)
 
     bundle_infos = [(i, gpu_ids[i][0], gpu_ids[i][1]) for i in range(num_bundles)]
-    sorted_bundle_infos = sorted(bundle_infos, key=sort_key)
+    if bundle_node_ips:
+        for index, node_ip, _ in bundle_infos:
+            if node_ip != bundle_node_ips[index]:
+                raise RuntimeError(
+                    f"Pinned GPU bundle {index} landed on {node_ip}, expected {bundle_node_ips[index]}"
+                )
+    sorted_bundle_infos = sorted(
+        bundle_infos,
+        key=lambda info: (
+            0 if not bundle_node_ips or info[0] < actor_bundles else 1,
+            sort_key(info),
+        ),
+    )
     pg_reordered_bundle_indices = [info[0] for info in sorted_bundle_infos]
     # Map from logical index -> physical GPU ID
     pg_reordered_gpu_ids = [gpu_ids[info[0]][1] for info in sorted_bundle_infos]
@@ -109,9 +126,38 @@ def create_placement_groups(args) -> dict[str, PlacementGroupInfo]:
     """Create placement groups for actor and rollout engines."""
 
     num_gpus, rollout_offset = _get_placement_group_layout(args)
+    actor_nodes = getattr(args, "actor_node_ips", None)
+    rollout_nodes = getattr(args, "rollout_node_ips", None)
+    bundle_node_ips = None
+    if actor_nodes is not None or rollout_nodes is not None:
+        if not actor_nodes or not rollout_nodes or args.colocate or args.eval_num_gpus:
+            raise ValueError("Node pinning requires both node lists, no colocation, and no eval GPUs")
+        if (
+            len(actor_nodes) != args.actor_num_nodes
+            or len(set(actor_nodes)) != len(actor_nodes)
+            or len(set(rollout_nodes)) != len(rollout_nodes)
+            or set(actor_nodes) & set(rollout_nodes)
+        ):
+            raise ValueError("Actor/rollout node lists must be disjoint and match actor-num-nodes")
+        if rollout_offset != len(actor_nodes) * args.actor_num_gpus_per_node:
+            raise ValueError("Pinned actor GPU count does not match the placement layout")
+        if args.rollout_num_gpus % len(rollout_nodes):
+            raise ValueError("Rollout GPUs must divide evenly across pinned rollout nodes")
+        rollout_per_node = args.rollout_num_gpus // len(rollout_nodes)
+        bundle_node_ips = (
+            [ip for ip in actor_nodes for _ in range(args.actor_num_gpus_per_node)]
+            + [ip for ip in rollout_nodes for _ in range(rollout_per_node)]
+        )
+        if len(bundle_node_ips) != num_gpus:
+            raise ValueError("Pinned GPU count does not match the placement layout")
 
     logger.info(f"Creating placement group with {num_gpus} GPUs...")
-    pg, actor_pg_reordered_bundle_indices, actor_pg_reordered_gpu_ids = _create_placement_group(num_gpus)
+    if bundle_node_ips is None:
+        pg, actor_pg_reordered_bundle_indices, actor_pg_reordered_gpu_ids = _create_placement_group(num_gpus)
+    else:
+        pg, actor_pg_reordered_bundle_indices, actor_pg_reordered_gpu_ids = _create_placement_group(
+            num_gpus, bundle_node_ips=bundle_node_ips, actor_bundles=rollout_offset,
+        )
 
     rollout_pg_reordered_bundle_indices = actor_pg_reordered_bundle_indices[rollout_offset:]
     rollout_pg_reordered_gpu_ids = actor_pg_reordered_gpu_ids[rollout_offset:]

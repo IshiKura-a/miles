@@ -17,7 +17,7 @@ from miles.rollout.submission_scheduler import make_submission_scheduler
 from miles.utils import dumper_utils
 from miles.utils.function_registry import load_function
 from miles.utils.http_utils import get, post, router_worker_base_urls
-from miles.utils.misc import as_completed_async, call_agent_abort_hook
+from miles.utils.misc import call_agent_abort_hook
 from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
@@ -29,9 +29,10 @@ async def abort(state: GenerateState, pendings: set, rollout_id: int) -> list[li
     assert not state.aborted
     state.aborted = True
 
-    urls = await get_worker_urls(args)
-    logger.info(f"Abort request for {urls}")
-    await asyncio.gather(*[post(f"{url}/abort_request", {"abort_all": True}) for url in urls])
+    if pendings:
+        urls = await get_worker_urls(args)
+        logger.info(f"Abort request for {urls}")
+        await asyncio.gather(*[post(f"{url}/abort_request", {"abort_all": True}) for url in urls])
 
     # Let the agent integration tear down its in-flight trials so they stop hitting
     # SGLang, instead of running on until their own max_seq_len / timeout.
@@ -39,7 +40,11 @@ async def abort(state: GenerateState, pendings: set, rollout_id: int) -> list[li
 
     # make sure all the pending tasks are finished
     aborted_samples = []
-    async for group in as_completed_async(pendings):
+    discarded_errors = []
+    for group in await asyncio.gather(*pendings, return_exceptions=True):
+        if isinstance(group, BaseException):
+            discarded_errors.append(group)
+            continue
         if not args.partial_rollout:
             continue
 
@@ -49,6 +54,12 @@ async def abort(state: GenerateState, pendings: set, rollout_id: int) -> list[li
                 sample.metadata["start_rollout_id"] = rollout_id
         aborted_samples.append(group)
 
+    if discarded_errors:
+        logger.warning(
+            "Discarded %d in-flight rollout groups after abort; first error: %r",
+            len(discarded_errors),
+            discarded_errors[0],
+        )
     if args.partial_rollout:
         logger.info(f"Collected {sum(len(x) for x in aborted_samples)} partial samples into the data buffer")
 
