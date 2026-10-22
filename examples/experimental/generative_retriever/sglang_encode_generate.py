@@ -16,6 +16,7 @@ from miles.rollout.base_types import GenerateFnInput, GenerateFnOutput
 from miles.utils.http_utils import GeneralHttpClientProvider
 from miles.utils.types import Sample
 from examples.experimental.generative_retriever.relevance_reward import REWARD_MODES
+from examples.experimental.generative_retriever.reward_http import post_json_async
 
 _REQUESTS_BY_STATE: WeakKeyDictionary[Any, dict[Any, Any]] = WeakKeyDictionary()
 _PREPARE_BATCHERS: WeakKeyDictionary[
@@ -91,34 +92,9 @@ class _BaselinePrepareBatcher:
 
     async def _post(self, requests: list[_PendingPrepare]) -> dict[str, float]:
         queries = list(dict.fromkeys(request.query for request in requests))
-        # Avoid reusing idle sockets for the idempotent prepare request.
-        async with httpx.AsyncClient(
-            timeout=self._timeout_seconds,
-            limits=httpx.Limits(max_keepalive_connections=0),
-            trust_env=False,
-        ) as client:
-            attempt = 1
-            while True:
-                try:
-                    response = await client.post(self._url, json={"queries": queries})
-                    break
-                except (httpx.ReadError, httpx.RemoteProtocolError, httpx.ConnectError, httpx.ConnectTimeout) as error:
-                    if attempt == _TRANSPORT_ATTEMPTS:
-                        logger.error(
-                            "Baseline prepare transport %s failed after %d attempts for %d queries",
-                            type(error).__name__, attempt, len(queries),
-                        )
-                        raise
-                    logger.warning(
-                        "Baseline prepare transport %s for %d queries (attempt %d/%d); retrying the same batch",
-                        type(error).__name__, len(queries), attempt, _TRANSPORT_ATTEMPTS,
-                    )
-                    await asyncio.sleep(_RETRY_DELAY_SECONDS * 2 ** (attempt - 1))
-                    attempt += 1
-        response.raise_for_status()
-        payload = response.json()
-        if not isinstance(payload, dict):
-            raise ValueError("Reward prepare endpoint must return a JSON object")
+        payload = await post_json_async(
+            self._url, {"queries": queries}, timeout=self._timeout_seconds,
+        )
         if payload.get("prepared_queries") != len(queries):
             raise ValueError("Reward prepare endpoint returned an unexpected query count")
         return _prepare_metrics(payload)

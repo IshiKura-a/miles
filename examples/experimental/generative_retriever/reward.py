@@ -16,9 +16,9 @@ from dataclasses import dataclass
 from typing import Any
 from weakref import WeakKeyDictionary
 
-from miles.utils.http_utils import GeneralHttpClientProvider
 from miles.utils.types import Sample
 from examples.experimental.generative_retriever.relevance_reward import REWARD_MODES
+from examples.experimental.generative_retriever.reward_http import post_json_async
 
 _MAX_REWARD_SAMPLES_PER_REQUEST = 2048
 _REWARD_BATCH_WAIT_SECONDS = 0.01
@@ -108,14 +108,12 @@ class _RewardBatcher:
     async def _post(self, requests: list[_PendingRequest]) -> _BatchResult:
         payloads = [payload for request in requests for payload in request.payloads]
         async with asyncio.timeout(self._timeout_seconds):
-            response = await GeneralHttpClientProvider.client().post(
-                self._url,
-                json={"samples": payloads, "reward_mode": self._mode},
+            response = await post_json_async(
+                self._url, {"samples": payloads, "reward_mode": self._mode},
                 timeout=self._timeout_seconds,
             )
-            response.raise_for_status()
             rewards, details, cache, request_metrics = _parse_rewards(
-                response.json(),
+                response,
                 expected_count=len(payloads),
             )
         return _BatchResult(rewards, details, cache, request_metrics)

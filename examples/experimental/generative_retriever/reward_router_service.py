@@ -21,6 +21,7 @@ from examples.experimental.generative_retriever.reward_service import (
     RewardRequest,
     reward_request_model,
 )
+from examples.experimental.generative_retriever.reward_http import post_json_sync
 
 _SERVICE_API_VERSION = 6
 logger = logging.getLogger(__name__)
@@ -44,8 +45,9 @@ class RewardRouter:
         self._client = httpx.Client(
             timeout=900.0,
             limits=httpx.Limits(
-                max_connections=connections, max_keepalive_connections=connections,
+                max_connections=connections, max_keepalive_connections=0,
             ),
+            trust_env=False,
         )
         self._routing_lock = Lock()
         self._routed_samples = [0] * len(worker_urls)
@@ -59,15 +61,7 @@ class RewardRouter:
         return max(range(len(scores)), key=scores.__getitem__)
 
     def _post(self, url: str, request: RewardRequest | BaselinePrepareRequest) -> dict[str, Any]:
-        response = self._client.post(
-            url,
-            json=request.model_dump(mode="json"),
-        )
-        response.raise_for_status()
-        payload = response.json()
-        if not isinstance(payload, dict):
-            raise ValueError("Reward worker response must be a JSON object")
-        return payload
+        return post_json_sync(self._client, url, request.model_dump(mode="json"))
 
     def score(self, request: RewardRequest) -> dict[str, Any]:
         started = time.perf_counter()

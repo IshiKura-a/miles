@@ -639,19 +639,39 @@ def _prepare_node_assets(manifest: Manifest) -> None:
             raise FileNotFoundError(f"Model bundle asset is not readable on this node: {bundle / name}")
 
 
+def _check_miles_checkouts(hosts: list[str]) -> None:
+    local_commit = subprocess.check_output(
+        ["git", "-C", str(_REPO), "rev-parse", "HEAD"], text=True,
+    ).strip()
+    local_changes = subprocess.check_output(
+        ["git", "-C", str(_REPO), "status", "--porcelain", "--untracked-files=all"], text=True,
+    )
+    if local_changes:
+        raise RuntimeError("Miles checkout on the launch node is dirty; deploy a committed version before training")
+    for host in hosts[1:]:
+        remote_checkout = f"git -C {shlex.quote(str(_REPO))}"
+        checkout = subprocess.run(
+            [
+                "ssh", "-o", "BatchMode=yes", host,
+                f"{remote_checkout} rev-parse HEAD && "
+                f"{remote_checkout} status --porcelain --untracked-files=all",
+            ],
+            check=True, capture_output=True, text=True,
+        )
+        lines = checkout.stdout.splitlines()
+        if not lines or lines[0] != local_commit:
+            raise RuntimeError(f"Miles checkout on {host} must be at commit {local_commit}")
+        if len(lines) != 1:
+            raise RuntimeError(f"Miles checkout on {host} is dirty; deploy a clean checkout before training")
+
+
 def _check_remote_sources(manifest: Manifest) -> None:
+    _check_miles_checkouts(manifest["hosts"])
     run_dir = Path(manifest["run_dir"])
     require_sglang_abort_patch()
     sglang_patch = Path(__file__).resolve().parent / "patches/sglang-embedding-abort.patch"
     sglang_root = Path(sys.prefix) / "src/sglang"
     files = (
-        Path(__file__),
-        Path(run_grpo.__file__),
-        _REPO / "examples/experimental/generative_retriever/prepare_sglang_bundle.py",
-        sglang_patch,
-        _REPO / "miles/ray/placement_group.py",
-        _REPO / "miles/utils/arguments.py",
-        _REPO / "miles/rollout/inference_rollout/inference_rollout_train.py",
         sglang_root / "python/sglang/srt/entrypoints/openai/serving_embedding.py",
         Path(manifest["slm_root"]) / "model.py",
         Path(manifest["checkpoint"]) / "pytorch_model.bin.index.json",
