@@ -609,6 +609,10 @@ def _remote(host: str, role: str, path: Path, index: int) -> list[str]:
     return ["ssh", "-o", "BatchMode=yes", host, "bash", "-c", shlex.quote(remote)]
 
 
+def _ray_temp(run_id: str) -> str:
+    return f"/tmp/gr_{hashlib.sha256(run_id.encode()).hexdigest()[:12]}"
+
+
 def _prepare_node_assets(manifest: Manifest) -> None:
     os.environ.update(manifest["runtime_env"])
     run_dir = Path(manifest["run_dir"])
@@ -732,7 +736,7 @@ def _worker(manifest: Manifest, index: int) -> None:
             gcs_address=manifest["ray_address"],
             node_ip_address=manifest["addresses"][index],
             num_cpus=64, num_gpus=8, object_store_memory=32 * 2**30,
-            temp_dir=manifest["ray_temp"], include_dashboard=False,
+            temp_dir=_ray_temp(manifest["run_id"]), include_dashboard=False,
         ),
         head=False, shutdown_at_exit=True, spawn_reaper=True,
     )
@@ -820,7 +824,7 @@ def _run(manifest: Manifest) -> None:
             RayParams(
                 node_ip_address=manifest["head_ip"], gcs_server_port=_RAY_PORT,
                 num_cpus=32, num_gpus=8, object_store_memory=32 * 2**30,
-                temp_dir=manifest["ray_temp"], include_dashboard=False,
+                temp_dir=_ray_temp(manifest["run_id"]), include_dashboard=False,
             ),
             head=True, shutdown_at_exit=True, spawn_reaper=True,
         )
