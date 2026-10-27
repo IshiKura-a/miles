@@ -32,11 +32,11 @@ SGLang 锁定 commit `7f79d11d948aa37b49821475e075369bb0e801f3`；
 - GR 输出为四段 RQ semantic doc ID。
 - Baseline 使用原始 Stage5 checkpoint，训练期间不更新。
 - 训练默认学习率为 `2e-6`，使用 constant schedule。
-- 训练 rollout 每 query 随机采样 64 个 doc ID；冻结 baseline 和离线评测
-  每 query 各使用 constrained top-64。
+- 训练 rollout 每 query 使用 constrained stochastic beam search 无放回采样 64 个不同 doc ID；
+  冻结 baseline 和离线评测每 query 各使用 constrained top-64 beam。
 - 使用 SLMGR_dev 的 constrained decoder（`infer_mode=2`）与固定版本官方 ID 映射。
-- Baseline 比较集合由这 64 个 ID 对应的 keyword 中，PM ≥ 0.58 且
-  SM ≥ 0.82 的不同文本构成；unique 是候选文本不属于该集合。
+- Baseline 比较集合按 PM（≥ 0.58）与 SM（≥ 0.82）分别构建 $B_{\text{PM}}(q)$ 和
+  $B_{\text{SM}}(q)$；两侧 unique 分别按候选文本是否属于对应集合判定。
 
 ### SLMv3 外部源码 patch
 
@@ -115,12 +115,13 @@ Baseline 比较集合：
 
 ```text
 I_64(q) = frozen_original_GR_constrained_top64_doc_ids(q)
-B(q) = {k | k 对应 I_64(q) 中的某个 ID，
-             s_PM(q,k) >= 0.58 且 s_SM(q,k) >= 0.82}
-U(q,k) = 1[k not in B(q)]
+B_PM(q) = {k | k 对应 I_64(q) 中的某个 ID，s_PM(q,k) >= 0.58}
+B_SM(q) = {k | k 对应 I_64(q) 中的某个 ID，s_SM(q,k) >= 0.82}
+U_PM(q,k) = 1[k not in B_PM(q)]
+U_SM(q,k) = 1[k not in B_SM(q)]
 ```
 
-### 统一 relevance 和 unique 权重
+### 统一 relevance 和分头 unique 权重
 
 ```text
 P = 1[s_PM >= 0.58]
@@ -128,12 +129,14 @@ S = 1[s_SM >= 0.82]
 W_PM = clip(s_PM / 0.58, 0, 1)
 W_SM = clip(s_SM / 0.82, 0, 1)
 Q = (W_PM + W_SM) / 2
-G = max(P, S)
-unique_bonus = U * G * Q
+pm_unique_bonus = 0.5 * U_PM * P * Q
+sm_unique_bonus = 0.5 * U_SM * S * Q
+unique_bonus = pm_unique_bonus + sm_unique_bonus
 ```
 
-- Unique bonus 仅在 keyword 不属于 baseline 集合、且 PM 或 SM 至少一个过阈值
-  时生效；bonus 最大为 1，两种 reward mode 的范围均为 `[0,3]`。
+- PM / SM unique bonus 分别在该头过阈值且 keyword 不属于对应 baseline 集合时生效，
+  并乘跨头连续质量因子 `Q`（对单过 SM 的新词提供把 PM 推向 `0.58` 的连续梯度）；
+  单头 bonus 最大为 `0.5`，总 `unique_bonus` 最大为 `1`，两种 reward mode 的范围均为 `[0,3]`。
 - 实现在 [relevance_reward.py](../../examples/experimental/generative_retriever/relevance_reward.py)。
 
 ### `discrete_relevance_unique`
@@ -175,8 +178,8 @@ query
   → 归一化 PM/SM + unique bonus
 ```
 
-Baseline 与候选均对 ID 映射出的不同 keyword 逐项评分；训练按 `B(q)` 判断
-unique。Baseline 由 [model_loading.py](../../examples/experimental/generative_retriever/model_loading.py)
+Baseline 与候选均对 ID 映射出的不同 keyword 逐项评分；训练按 `B_PM(q)`、`B_SM(q)`
+分别判断两侧 unique。Baseline 由 [model_loading.py](../../examples/experimental/generative_retriever/model_loading.py)
 加载原始 checkpoint，按当前映射的 ID 前缀约束执行 top-64 beam search。
 
 Relevance 使用原源码快照中的 `MultiCupGraphenePipeline`：
@@ -191,8 +194,9 @@ HTTP reward hook 对每个 sample 返回一个 doc ID 的平均 keyword reward�
 ### Rollout 配置
 
 - [constrained_decode.py](../../examples/experimental/generative_retriever/constrained_decode.py)
-  使用当前映射的 ID 前缀约束。Baseline 为 top-64 beam，训练 rollout 为每 query
-  64 次随机采样；doc ID 含 4 个 decoder token，训练样本允许重复 ID。
+  使用当前映射的 ID 前缀约束。Baseline 为确定性 top-64 beam，训练 rollout 为每 query
+  64-beam constrained stochastic beam search（Kool et al., 2019 Gumbel-Top-k 无放回采样，
+  返回 64 个互不重复的有效 doc ID 及未缩放的真实策略 token logprob）。
 - Rollout 经 SGLang router 的 `/v1/embeddings` 返回 token 和 logprob；
   同一 query group 只分词一次并共享生成请求，并行准备 reward baseline。Prepare 请求
   每 10ms 合并，最多 512 个 query；learner 使用同一前缀约束计算 logprob。
@@ -369,7 +373,7 @@ Reward 配置为
 是 Git 仓库内的多机入口，底层执行 **`train_async.py`**（Train N 与 Rollout N+1
 重叠），而非 `train.py`。不依赖 `local/` 中的实验脚本或复制的模型/数据：
 Stage5、Qwen、relevance、训练集和当前 TAListing 映射均取上表固定原始路径；
-reward 定义、64 次随机采样、`2e-6` constant LR 和每步权重同步保持不变。
+reward 定义、64-beam stochastic beam rollout、`2e-6` constant LR 和每步权重同步保持不变。
 
 `--hosts` 按「服务/rollout 节点、learner 节点」依次成对排列；每个节点 8 卡，
 总计 `2n` 台。每对分配 8 learner、4 rollout、4 frozen baseline 和

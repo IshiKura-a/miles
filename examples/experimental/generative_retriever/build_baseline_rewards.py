@@ -64,12 +64,16 @@ def _build_query(
         for keyword, score in zip(keywords, scores, strict=True)
     }
     baseline = build_baseline_set(keyword_scores)
+    baseline_union = baseline.pm | baseline.sm
     rewards = calculate_keyword_rewards(keyword_scores, baseline, mode=reward_mode)
     rows = []
     for keyword in keywords:
         rows.append({
             "query": query, "keyword": keyword, "docids": keyword_ids[keyword],
-            "in_baseline_set": keyword in baseline, **asdict(rewards[keyword]),
+            "in_baseline_pm_set": keyword in baseline.pm,
+            "in_baseline_sm_set": keyword in baseline.sm,
+            "in_baseline_set": keyword in baseline_union,
+            **asdict(rewards[keyword]),
         })
     destination.mkdir(parents=True, exist_ok=True)
     with (destination / "keyword_rewards.jsonl").open("w", encoding="utf-8") as output:
@@ -85,17 +89,25 @@ def _build_query(
                 ),
             }, ensure_ascii=False) + "\n")
     (destination / "baseline_keywords.json").write_text(
-        json.dumps(sorted(baseline), ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+        json.dumps(
+            {"pm": sorted(baseline.pm), "sm": sorted(baseline.sm)},
+            ensure_ascii=False,
+            indent=2,
+        ) + "\n",
+        encoding="utf-8",
     )
     summary = {
         "query": query, "baseline_docids": len(ids),
         "reward_mode": reward_mode, "docid_aggregation": "mean",
         "mapped_docids": len(mapping), "id_keyword_pairs": sum(map(len, mapping.values())),
-        "distinct_scored_keywords": len(keywords), "baseline_keyword_count": len(baseline),
+        "distinct_scored_keywords": len(keywords),
+        "baseline_pm_keyword_count": len(baseline.pm),
+        "baseline_sm_keyword_count": len(baseline.sm),
+        "baseline_keyword_count": len(baseline_union),
         "mapping_version": mapping_version, "pm_threshold": PM_THRESHOLD, "sm_threshold": SM_THRESHOLD,
         "pm_meeting_threshold": sum(pm >= PM_THRESHOLD for pm, _ in keyword_scores.values()),
         "sm_meeting_threshold": sum(sm >= SM_THRESHOLD for _, sm in keyword_scores.values()),
-        "unique_positive_reward_keywords": sum(row["is_unique"] and row["reward"] > 0 for row in rows),
+        "unique_positive_reward_keywords": sum(row["unique_eligible"] and row["reward"] > 0 for row in rows),
         "top_baseline": sorted((row for row in rows if row["in_baseline_set"]),
                                key=lambda row: row["reward"], reverse=True)[:5],
         "top_outside_baseline": sorted((row for row in rows if not row["in_baseline_set"]),
@@ -104,7 +116,11 @@ def _build_query(
     (destination / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
     )
-    logger.info("Baseline set ready: %d qualifying keywords", len(baseline))
+    logger.info(
+        "Baseline sets ready: %d PM keywords, %d SM keywords",
+        len(baseline.pm),
+        len(baseline.sm),
+    )
     return summary
 
 

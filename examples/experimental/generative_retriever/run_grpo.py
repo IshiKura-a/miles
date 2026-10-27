@@ -564,11 +564,11 @@ def execute(args: ScriptArgs) -> None:
                 f"--qwen-model {quote(qwen_model)}",
                 f"--slm-root {quote(slm_root)}",
                 f"--id-mapping {quote(str(mapping))}",
-                "--num-beams 1",
+                f"--num-beams {args.n_samples_per_prompt}",
                 f"--num-return-sequences {args.n_samples_per_prompt}",
                 f"--output {quote(os.fspath(bundle))}",
                 f"--temperature {args.temperature}",
-                "--decoding-mode sample",
+                "--decoding-mode stochastic_beam",
             )
         )
     )

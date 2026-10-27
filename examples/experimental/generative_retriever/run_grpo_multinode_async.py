@@ -394,8 +394,8 @@ def _manifest(
         run_grpo._prepare_prompt_data(prompt, alias)
         prepare_bundle(
             checkpoint=checkpoint, qwen_model=qwen, slm_root=slm_root,
-            id_mapping=mapping, output=bundle, num_beams=1,
-            num_return_sequences=64, temperature=1.0, decoding_mode="sample",
+            id_mapping=mapping, output=bundle, num_beams=64,
+            num_return_sequences=64, temperature=1.0, decoding_mode="stochastic_beam",
         )
     return {
         "run_id": args.run_id,
@@ -631,8 +631,8 @@ def _prepare_node_assets(manifest: Manifest) -> None:
         slm_root=manifest["slm_root"],
         id_mapping=manifest["mapping"],
         output=run_dir / "sglang_bundle",
-        num_beams=1, num_return_sequences=64, temperature=1.0,
-        decoding_mode="sample",
+        num_beams=64, num_return_sequences=64, temperature=1.0,
+        decoding_mode="stochastic_beam",
     )
     for name in ("config.json", "tokenizer.json", "pytorch_model.bin.index.json"):
         if not (bundle / name).is_file():

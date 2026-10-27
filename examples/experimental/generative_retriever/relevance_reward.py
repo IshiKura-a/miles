@@ -17,6 +17,12 @@ UNIQUE_WEIGHT = 1.0
 
 
 @dataclass(frozen=True)
+class BaselineSets:
+    pm: frozenset[str] = frozenset()
+    sm: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
 class RewardBreakdown:
     pm_score: float
     sm_score: float
@@ -28,9 +34,15 @@ class RewardBreakdown:
     sm_relevance: float
     relevance: float
     relevance_quality: float
+    is_pm_unique: bool
+    is_sm_unique: bool
     is_unique: bool
     relevance_eligible: bool
+    pm_unique_eligible: bool
+    sm_unique_eligible: bool
     unique_eligible: bool
+    pm_unique_bonus: float
+    sm_unique_bonus: float
     unique_bonus: float
     discrete_base: float
     continuous_base: float
@@ -49,12 +61,16 @@ def _normalize_score(score: float, threshold: float, name: str) -> float:
 
 
 def calculate_reward(
-    *, pm_score: float, sm_score: float, is_unique: bool,
+    *,
+    pm_score: float,
+    sm_score: float,
+    is_pm_unique: bool,
+    is_sm_unique: bool,
     mode: RewardMode = "discrete_relevance_unique",
 ) -> RewardBreakdown:
-    """Combine PM/SM with keyword novelty against the filtered baseline keyword set."""
-    if not isinstance(is_unique, bool):
-        raise TypeError("is_unique must be a boolean")
+    """Combine PM/SM with per-head keyword novelty against the baseline sets."""
+    if not isinstance(is_pm_unique, bool) or not isinstance(is_sm_unique, bool):
+        raise TypeError("is_pm_unique and is_sm_unique must be booleans")
     if mode not in REWARD_MODES:
         raise ValueError(f"Unknown reward mode: {mode!r}")
     normalized_pm = _normalize_score(pm_score, PM_THRESHOLD, "PM score")
@@ -65,8 +81,13 @@ def calculate_reward(
     continuous_base = normalized_pm + normalized_sm
     relevance_quality = continuous_base / 2.0
     relevance_eligible = bool(pm_pass or sm_pass)
-    unique_eligible = is_unique and relevance_eligible
-    unique_bonus = UNIQUE_WEIGHT * relevance_quality if unique_eligible else 0.0
+    pm_unique_eligible = is_pm_unique and bool(pm_pass)
+    sm_unique_eligible = is_sm_unique and bool(sm_pass)
+    unique_eligible = pm_unique_eligible or sm_unique_eligible
+    combined_unique = is_pm_unique and is_sm_unique
+    pm_unique_bonus = 0.5 * UNIQUE_WEIGHT * relevance_quality if pm_unique_eligible else 0.0
+    sm_unique_bonus = 0.5 * UNIQUE_WEIGHT * relevance_quality if sm_unique_eligible else 0.0
+    unique_bonus = pm_unique_bonus + sm_unique_bonus
     discrete_total = discrete_base + unique_bonus
     continuous_total = continuous_base + unique_bonus
     if mode == "continuous_relevance_unique":
@@ -90,9 +111,15 @@ def calculate_reward(
         sm_relevance=sm_relevance,
         relevance=relevance,
         relevance_quality=relevance_quality,
-        is_unique=is_unique,
+        is_pm_unique=is_pm_unique,
+        is_sm_unique=is_sm_unique,
+        is_unique=combined_unique,
         relevance_eligible=relevance_eligible,
+        pm_unique_eligible=pm_unique_eligible,
+        sm_unique_eligible=sm_unique_eligible,
         unique_eligible=unique_eligible,
+        pm_unique_bonus=pm_unique_bonus,
+        sm_unique_bonus=sm_unique_bonus,
         unique_bonus=unique_bonus,
         discrete_base=discrete_base,
         continuous_base=continuous_base,
@@ -103,21 +130,31 @@ def calculate_reward(
     )
 
 
-def build_baseline_set(keyword_scores: Mapping[str, tuple[float, float]]) -> frozenset[str]:
-    """Keep keywords meeting both PM and SM thresholds."""
-    qualified = set()
+def build_baseline_set(keyword_scores: Mapping[str, tuple[float, float]]) -> BaselineSets:
+    """Keep per-head baseline keyword sets meeting PM and SM thresholds."""
+    pm_qualified = set()
+    sm_qualified = set()
     for keyword, (pm_score, sm_score) in keyword_scores.items():
         if not isinstance(keyword, str) or not keyword.strip():
             raise ValueError("Baseline keyword must be a non-empty string")
-        calculate_reward(pm_score=pm_score, sm_score=sm_score, is_unique=False)
-        if pm_score >= PM_THRESHOLD and sm_score >= SM_THRESHOLD:
-            qualified.add(keyword)
-    return frozenset(qualified)
+        calculate_reward(
+            pm_score=pm_score,
+            sm_score=sm_score,
+            is_pm_unique=False,
+            is_sm_unique=False,
+        )
+        if pm_score >= PM_THRESHOLD:
+            pm_qualified.add(keyword)
+        if sm_score >= SM_THRESHOLD:
+            sm_qualified.add(keyword)
+    return BaselineSets(pm=frozenset(pm_qualified), sm=frozenset(sm_qualified))
 
 
 def calculate_keyword_rewards(
-    keyword_scores: Mapping[str, tuple[float, float]], baseline: frozenset[str],
-    *, mode: RewardMode = "discrete_relevance_unique",
+    keyword_scores: Mapping[str, tuple[float, float]],
+    baseline: BaselineSets,
+    *,
+    mode: RewardMode = "discrete_relevance_unique",
 ) -> dict[str, RewardBreakdown]:
     if mode not in REWARD_MODES:
         raise ValueError(f"Unknown reward mode: {mode!r}")
@@ -126,15 +163,20 @@ def calculate_keyword_rewards(
         if not isinstance(keyword, str) or not keyword.strip():
             raise ValueError("Candidate keyword must be a non-empty string")
         results[keyword] = calculate_reward(
-            pm_score=pm_score, sm_score=sm_score, is_unique=keyword not in baseline,
+            pm_score=pm_score,
+            sm_score=sm_score,
+            is_pm_unique=keyword not in baseline.pm,
+            is_sm_unique=keyword not in baseline.sm,
             mode=mode,
         )
     return results
 
 
 def calculate_docid_reward(
-    keyword_scores: Mapping[str, tuple[float, float]], baseline: frozenset[str],
-    *, mode: RewardMode = "discrete_relevance_unique",
+    keyword_scores: Mapping[str, tuple[float, float]],
+    baseline: BaselineSets,
+    *,
+    mode: RewardMode = "discrete_relevance_unique",
 ) -> float:
     """Average rewards over distinct keyword texts belonging to one doc ID."""
     if not keyword_scores:

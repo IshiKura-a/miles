@@ -244,6 +244,8 @@ def _store_breakdown(
         "pm_relevance",
         "sm_relevance",
         "relevance_quality",
+        "pm_unique_bonus",
+        "sm_unique_bonus",
         "unique_bonus",
         "discrete_base",
         "continuous_base",
@@ -258,8 +260,12 @@ def _store_breakdown(
             raise ValueError(f"invalid reward component {component!r}")
         metrics[component] = math.fsum(float(value) for value in values) / len(values)
     for metric, component in (
+        ("pm_unique_keyword_rate", "is_pm_unique"),
+        ("sm_unique_keyword_rate", "is_sm_unique"),
         ("unique_keyword_rate", "is_unique"),
         ("relevance_eligible_rate", "relevance_eligible"),
+        ("pm_unique_eligible_rate", "pm_unique_eligible"),
+        ("sm_unique_eligible_rate", "sm_unique_eligible"),
         ("unique_eligible_rate", "unique_eligible"),
     ):
         values = [keyword.get(component) for keyword in keywords]
@@ -269,7 +275,7 @@ def _store_breakdown(
     unique_quality = [
         float(keyword["relevance_quality"])
         for keyword in keywords
-        if keyword["is_unique"]
+        if keyword["is_pm_unique"] or keyword["is_sm_unique"]
     ]
     metrics["unique_quality"] = (
         math.fsum(unique_quality) / len(unique_quality)

@@ -34,7 +34,9 @@ from examples.experimental.generative_retriever.relevance_model import (
     resolve_relevance_source,
 )
 from examples.experimental.generative_retriever.relevance_reward import (
-    RewardMode, build_baseline_set,
+    BaselineSets,
+    RewardMode,
+    build_baseline_set,
     calculate_keyword_rewards,
 )
 
@@ -109,7 +111,7 @@ class KeywordRewardEngine:
         self.baseline_url = baseline_url
         self.baseline_top_k = baseline_top_k
         self._baseline_queries: set[str] = set()
-        self.baselines: LRUCache[str, frozenset[str]] = LRUCache(query_cache_size)
+        self.baselines: LRUCache[str, BaselineSets] = LRUCache(query_cache_size)
         relevance_source = resolve_relevance_source(relevance_model)
         pipeline_factory = load_relevance_pipeline_factory(relevance_source)
         pipeline = pipeline_factory(
@@ -121,7 +123,7 @@ class KeywordRewardEngine:
             pair_batch_size=pair_batch_size, keyword_cache_size=keyword_cache_size,
         )
         self._lock = Lock()
-        self._baseline_inflight: dict[str, Future[frozenset[str]]] = {}
+        self._baseline_inflight: dict[str, Future[BaselineSets]] = {}
         self._client = httpx.Client(timeout=300.0)
 
     def _cache_stats(self) -> dict[str, Any]:
@@ -202,11 +204,11 @@ class KeywordRewardEngine:
 
     def _prepare_baselines(
         self, queries: list[str],
-    ) -> tuple[dict[str, frozenset[str]], dict[str, dict[str, int]]]:
+    ) -> tuple[dict[str, BaselineSets], dict[str, dict[str, int]]]:
         started = time.perf_counter()
-        baselines: dict[str, frozenset[str]] = {}
-        owned: dict[str, Future[frozenset[str]]] = {}
-        waiting: dict[str, Future[frozenset[str]]] = {}
+        baselines: dict[str, BaselineSets] = {}
+        owned: dict[str, Future[BaselineSets]] = {}
+        waiting: dict[str, Future[BaselineSets]] = {}
         with self._lock:
             before = self._cache_stats()
             for query in dict.fromkeys(queries):
@@ -216,7 +218,7 @@ class KeywordRewardEngine:
                 elif query in self._baseline_inflight:
                     waiting[query] = self._baseline_inflight[query]
                 else:
-                    future: Future[frozenset[str]] = Future()
+                    future: Future[BaselineSets] = Future()
                     self._baseline_inflight[query] = future
                     owned[query] = future
             initial_delta = self._cache_delta(before, self._cache_stats())
