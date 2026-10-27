@@ -22,7 +22,19 @@ uv run pyright examples/experimental/generative_retriever/{baseline_service,cons
 
 Megatron-LM 锁定 commit `fd15ee20a4f03b03680529baf4b8f7eeed64df1d`，
 SGLang 锁定 commit `7f79d11d948aa37b49821475e075369bb0e801f3`；
-使用 Torch 2.13.0+cu130、Transformers 5.12.1。
+CUDA 环境使用 Torch 2.13.0+cu130、Transformers 5.12.1。
+
+MI300X 双机（ROCm 10.0.0、Torch `2.11.0+rocm10.0.0`、AITER `acf8fdf93`）使用仓库内的
+[prepare_rocm_env.py](../../examples/experimental/generative_retriever/prepare_rocm_env.py)
+与锁定依赖清单
+[requirements-rocm.freeze.txt](../../examples/experimental/generative_retriever/requirements-rocm.freeze.txt)
+一键构建 `.venv`、生成 `.venv/activate-rocm.sh` 并同步到所有节点：
+
+```bash
+cd /home/aiscuser/miles
+python3 -m examples.experimental.generative_retriever.prepare_rocm_env \
+  --hosts node-0,node-1 --slm-root /home/aiscuser/SLMGR_dev/SLMv3
+```
 
 ## 实验定义
 
