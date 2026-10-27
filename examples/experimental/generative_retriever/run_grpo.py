@@ -568,7 +568,7 @@ def execute(args: ScriptArgs) -> None:
                 f"--num-return-sequences {args.n_samples_per_prompt}",
                 f"--output {quote(os.fspath(bundle))}",
                 f"--temperature {args.temperature}",
-                "--decoding-mode beam",
+                "--decoding-mode beam_sample",
             )
         )
     )

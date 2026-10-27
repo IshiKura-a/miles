@@ -395,7 +395,7 @@ def _manifest(
         prepare_bundle(
             checkpoint=checkpoint, qwen_model=qwen, slm_root=slm_root,
             id_mapping=mapping, output=bundle, num_beams=64,
-            num_return_sequences=64, temperature=1.0, decoding_mode="beam",
+            num_return_sequences=64, temperature=1.0, decoding_mode="beam_sample",
         )
     return {
         "run_id": args.run_id,
@@ -633,7 +633,7 @@ def _prepare_node_assets(manifest: Manifest) -> None:
         id_mapping=manifest["mapping"],
         output=run_dir / "sglang_bundle",
         num_beams=64, num_return_sequences=64, temperature=1.0,
-        decoding_mode="beam",
+        decoding_mode="beam_sample",
     )
     for name in ("config.json", "tokenizer.json", "pytorch_model.bin.index.json"):
         if not (bundle / name).is_file():

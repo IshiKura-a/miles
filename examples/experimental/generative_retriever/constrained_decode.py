@@ -84,9 +84,18 @@ def generate_beams(
     code_num: int,
     num_beams: int,
     num_return_sequences: int,
+    do_sample: bool = False,
+    temperature: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if not 1 <= num_return_sequences <= num_beams:
         raise ValueError("Require 1 <= num_return_sequences <= num_beams")
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+    sample_kwargs: dict[str, Any] = (
+        {"do_sample": True, "temperature": temperature, "top_p": 1.0, "top_k": 0}
+        if do_sample
+        else {}
+    )
     output = model.generate(
         encoder_outputs=BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=cast(Any, hidden_states),
@@ -105,6 +114,7 @@ def generate_beams(
         decoder_start_token_id=0,
         return_dict_in_generate=True,
         output_scores=True,
+        **sample_kwargs,
     )
     tokens = output.sequences[:, 1:]
     scores = model.compute_transition_scores(
