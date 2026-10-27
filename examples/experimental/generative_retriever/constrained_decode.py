@@ -90,6 +90,8 @@ def generate_beams(
     output = model.generate(
         encoder_outputs=BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=cast(Any, hidden_states),
+            hidden_states=cast(Any, hidden_states),
+            attentions=cast(Any, attention_mask),
         ),
         attention_mask=attention_mask,
         max_length=code_num + 1,
@@ -139,6 +141,8 @@ def generate_samples(
     output = model.generate(
         encoder_outputs=BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=cast(Any, hidden_states),
+            hidden_states=cast(Any, hidden_states),
+            attentions=cast(Any, attention_mask),
         ),
         attention_mask=attention_mask,
         max_length=code_num + 1,
