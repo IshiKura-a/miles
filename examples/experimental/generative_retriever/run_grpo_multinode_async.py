@@ -403,7 +403,7 @@ def _manifest(
         "addresses": addresses,
         "head_ip": addresses[0],
         "ray_address": f"{addresses[0]}:{_RAY_PORT}",
-        "ray_temp": f"/tmp/miles_grpo_{args.run_id}",
+        "ray_temp": f"/tmp/gr_{hashlib.sha256(args.run_id.encode()).hexdigest()[:12]}",
         "run_dir": str(run_dir),
         "checkpoint": checkpoint,
         "qwen_model": qwen,
