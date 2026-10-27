@@ -44,8 +44,7 @@ python3 -m examples.experimental.generative_retriever.prepare_rocm_env \
 - GR 输出为四段 RQ semantic doc ID。
 - Baseline 使用原始 Stage5 checkpoint，训练期间不更新。
 - 训练默认学习率为 `2e-6`，使用 constant schedule。
-- 训练 rollout 每 query 使用 constrained stochastic beam search 无放回采样 64 个不同 doc ID；
-  冻结 baseline 和离线评测每 query 各使用 constrained top-64 beam。
+- 训练 rollout、冻结 baseline 和离线评测每 query 均使用 constrained top-64 beam。
 - 使用 SLMGR_dev 的 constrained decoder（`infer_mode=2`）与固定版本官方 ID 映射。
 - Baseline 比较集合按 PM（≥ 0.58）与 SM（≥ 0.82）分别构建 $B_{\text{PM}}(q)$ 和
   $B_{\text{SM}}(q)$；两侧 unique 分别按候选文本是否属于对应集合判定。
@@ -206,9 +205,8 @@ HTTP reward hook 对每个 sample 返回一个 doc ID 的平均 keyword reward�
 ### Rollout 配置
 
 - [constrained_decode.py](../../examples/experimental/generative_retriever/constrained_decode.py)
-  使用当前映射的 ID 前缀约束。Baseline 为确定性 top-64 beam，训练 rollout 为每 query
-  64-beam constrained stochastic beam search（Kool et al., 2019 Gumbel-Top-k 无放回采样，
-  返回 64 个互不重复的有效 doc ID 及未缩放的真实策略 token logprob）。
+  使用当前映射的 ID 前缀约束。Baseline 与训练 rollout 均为 constrained top-64 beam
+  （每 query 返回 64 个互不重复的有效 doc ID 及 4 个 decoder token logprob）。
 - Rollout 经 SGLang router 的 `/v1/embeddings` 返回 token 和 logprob；
   同一 query group 只分词一次并共享生成请求，并行准备 reward baseline。Prepare 请求
   每 10ms 合并，最多 512 个 query；learner 使用同一前缀约束计算 logprob。
@@ -385,7 +383,7 @@ Reward 配置为
 是 Git 仓库内的多机入口，底层执行 **`train_async.py`**（Train N 与 Rollout N+1
 重叠），而非 `train.py`。不依赖 `local/` 中的实验脚本或复制的模型/数据：
 Stage5、Qwen、relevance、训练集和当前 TAListing 映射均取上表固定原始路径；
-reward 定义、64-beam stochastic beam rollout、`2e-6` constant LR 和每步权重同步保持不变。
+reward 定义、64-beam constrained rollout、`2e-6` constant LR 和每步权重同步保持不变。
 
 `--hosts` 按「服务/rollout 节点、learner 节点」依次成对排列；每个节点 8 卡，
 总计 `2n` 台。每对分配 8 learner、4 rollout、4 frozen baseline 和

@@ -13,7 +13,6 @@ from examples.experimental.generative_retriever.constrained_decode import (
     build_generation_model,
     generate_beams,
     generate_samples,
-    generate_stochastic_beams,
     load_constraint,
 )
 
@@ -45,9 +44,9 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
         self.num_return_sequences = int(raw_gr_config["num_return_sequences"])
         self.decoding_mode = raw_gr_config.get("decoding_mode", "beam")
         self.temperature = float(raw_gr_config.get("temperature", 1.0))
-        if self.decoding_mode not in {"beam", "sample", "stochastic_beam"}:
-            raise ValueError("GR decoding_mode must be 'beam', 'sample', or 'stochastic_beam'")
-        if self.decoding_mode in {"beam", "stochastic_beam"} and not 1 <= self.num_return_sequences <= self.num_beams:
+        if self.decoding_mode not in {"beam", "sample"}:
+            raise ValueError("GR decoding_mode must be 'beam' or 'sample'")
+        if self.decoding_mode == "beam" and not 1 <= self.num_return_sequences <= self.num_beams:
             raise ValueError("Require 1 <= num_return_sequences <= num_beams")
         self.constraint = load_constraint(
             raw_gr_config["slm_root"], raw_gr_config["id_mapping"], self.docid_size, self.docid_dim,
@@ -121,13 +120,6 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
                 self._generation_model, hidden_states, attention_mask, self.constraint,
                 code_num=self.docid_size, num_beams=self.num_beams,
                 num_return_sequences=self.num_return_sequences,
-            )
-        elif self.decoding_mode == "stochastic_beam":
-            token_ids, token_logprobs = generate_stochastic_beams(
-                self._generation_model, hidden_states, attention_mask, self.constraint,
-                code_num=self.docid_size, num_beams=self.num_beams,
-                num_return_sequences=self.num_return_sequences,
-                temperature=self.temperature,
             )
         else:
             token_ids, token_logprobs = generate_samples(
