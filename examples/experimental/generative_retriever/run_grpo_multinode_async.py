@@ -389,8 +389,10 @@ def _manifest(
                 checkpoint_dir / "rollout" / f"global_dataset_state_dict_{iteration - 1}.pt"
             ).is_file():
                 raise FileNotFoundError("Resume requires the matching rollout dataset state")
+        elif (checkpoint_dir / "latest_checkpointed_iteration.txt").is_file():
+            raise FileExistsError(f"Run directory already contains checkpoints; pass --resume: {run_dir}")
         else:
-            run_dir.mkdir(parents=True, exist_ok=False)
+            run_dir.mkdir(parents=True, exist_ok=True)
         run_grpo._prepare_prompt_data(prompt, alias)
         prepare_bundle(
             checkpoint=checkpoint, qwen_model=qwen, slm_root=slm_root,
