@@ -483,28 +483,11 @@ def _start_service(
     )
 
 
-def _service(
-    processes: _Processes, name: str, module: str, host: str, port: int,
-    argv: list[str], *, gpus: str | None = None, expected: dict[str, object],
-    persistent: bool = False,
-) -> None:
-    process = _start_service(processes, name, module, host, port, argv, gpus=gpus, persistent=persistent)
-    try:
-        _wait_health(processes, host, name, port, expected)
-    except BaseException:
-        if persistent and process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=30)
-        raise
-
-
-def _ensure_baseline(processes: _Processes, manifest: Manifest, host: str) -> None:
+def _start_baseline(
+    processes: _Processes, manifest: Manifest, host: str,
+) -> tuple[subprocess.Popen[str], dict[str, object]] | None:
     mapping = manifest["mapping"]
-    expected = {
+    expected: dict[str, object] = {
         "status": "ready",
         "worker_count": 4,
         "docids_per_query": 64,
@@ -522,9 +505,9 @@ def _ensure_baseline(processes: _Processes, manifest: Manifest, host: str) -> No
     url = f"http://{host}:{_BASELINE_PORT}/health"
     if run_grpo._health_matches(url, expected):
         print(f"Reusing verified frozen baseline: {url}", flush=True)
-        return
+        return None
     _available_ports(host, (_BASELINE_PORT,))
-    _service(
+    process = _start_service(
         processes, "baseline", "baseline_service", host, _BASELINE_PORT,
         [
             "--checkpoint", manifest["checkpoint"],
@@ -533,9 +516,9 @@ def _ensure_baseline(processes: _Processes, manifest: Manifest, host: str) -> No
             "--id-mapping", mapping, "--docids-per-query", "64",
             "--devices", "cuda:0,cuda:1,cuda:2,cuda:3",
         ],
-        gpus="0,1,2,3", expected=expected, persistent=True,
+        gpus="0,1,2,3", persistent=True,
     )
-    print(f"Frozen baseline will remain on GPU 0-3 after this run: {url}", flush=True)
+    return process, expected
 
 
 def _exit_on_sigterm(signum: int, _frame: object) -> None:
@@ -548,8 +531,9 @@ def _service_node(manifest: Manifest, index: int) -> None:
     mapping = manifest["mapping"]
     processes = _Processes(Path(manifest["run_dir"]) / f"services-{index}")
     previous_handler = signal.signal(signal.SIGTERM, _exit_on_sigterm)
+    baseline: tuple[subprocess.Popen[str], dict[str, object]] | None = None
     try:
-        _ensure_baseline(processes, manifest, host)
+        baseline = _start_baseline(processes, manifest, host)
         reward_health = []
         for gpu, port in enumerate(_REWARD_PORTS):
             name = f"reward-{gpu}"
@@ -575,6 +559,14 @@ def _service_node(manifest: Manifest, index: int) -> None:
                     "max_samples_per_request": 2048,
                 },
             }))
+        if baseline is not None:
+            _wait_health(processes, host, "baseline", _BASELINE_PORT, baseline[1])
+            print(
+                f"Frozen baseline will remain on GPU 0-3 after this run: "
+                f"http://{host}:{_BASELINE_PORT}/health",
+                flush=True,
+            )
+            baseline = None
         for name, port, expected in reward_health:
             _wait_health(processes, host, name, port, expected)
         print(f"service node {index} ready", flush=True)
@@ -585,6 +577,15 @@ def _service_node(manifest: Manifest, index: int) -> None:
                 if sys.stdin.readline().strip() == "STOP":
                     break
                 raise RuntimeError("Service manager input closed without STOP")
+    except BaseException:
+        if baseline is not None and baseline[0].poll() is None:
+            baseline[0].terminate()
+            try:
+                baseline[0].wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                baseline[0].kill()
+                baseline[0].wait(timeout=30)
+        raise
     finally:
         signal.signal(signal.SIGTERM, previous_handler)
         processes.close()
@@ -797,12 +798,6 @@ def _run(manifest: Manifest) -> None:
                  "--mapping", manifest["mapping"], "--host", manifest["head_ip"],
                  "--port", str(_MAPPING_PORT)],
             )
-            _wait_health(
-                processes, manifest["head_ip"], "mapping", _MAPPING_PORT,
-                {"mapping_version": Path(manifest["mapping"]).name,
-                 "bytes": Path(manifest["mapping"]).stat().st_size,
-                 "service_config": {"mapping": manifest["mapping"]}},
-            )
         for index, host in enumerate(manifest["hosts"][::2]):
             node = index * 2
             argv = (
@@ -810,28 +805,15 @@ def _run(manifest: Manifest) -> None:
                 if node == 0 else _remote(host, "_service_node", path, node)
             )
             processes.start(f"services-{node}", argv, stdin=True)
-        for index, host in enumerate(manifest["addresses"][::2]):
-            _wait_health(
-                processes, host, f"baseline-{index}", _BASELINE_PORT,
-                {"worker_count": 4, "docids_per_query": 64},
-            )
-            for port in _REWARD_PORTS:
-                _wait_health(
-                    processes, host, f"reward-{index}-{port}", port,
-                    {"worker_count": 1, "mapping_version": Path(manifest["mapping"]).name},
-                )
         worker_urls = [
             f"http://{host}:{port}/score"
             for host in manifest["addresses"][::2] for port in _REWARD_PORTS
         ]
-        _service(
+        _start_service(
             processes, "reward-router", "reward_router_service",
             manifest["head_ip"], _ROUTER_PORT,
             ["--worker-urls", ",".join(worker_urls),
              "--max-samples-per-request", "2048", "--forward-concurrency", "1"],
-            expected={"worker_count": 8 * (len(manifest["hosts"]) // 2),
-                      "mapping_version": Path(manifest["mapping"]).name,
-                      "service_config": {"worker_urls": worker_urls}},
         )
         os.environ.update(manifest["runtime_env"])
         head = Node(
@@ -873,6 +855,29 @@ def _run(manifest: Manifest) -> None:
             assigned = sorted(ray.get(actor.gpu_ids.remote()))  # pyright: ignore[reportFunctionMemberAccess]
             if assigned != [0, 1, 2, 3]:
                 raise RuntimeError(f"Service node {host} GPU reservation was {assigned}, not 0-3")
+        if manifest["mapping_owned"]:
+            _wait_health(
+                processes, manifest["head_ip"], "mapping", _MAPPING_PORT,
+                {"mapping_version": Path(manifest["mapping"]).name,
+                 "bytes": Path(manifest["mapping"]).stat().st_size,
+                 "service_config": {"mapping": manifest["mapping"]}},
+            )
+        for index, host in enumerate(manifest["addresses"][::2]):
+            _wait_health(
+                processes, host, f"baseline-{index}", _BASELINE_PORT,
+                {"worker_count": 4, "docids_per_query": 64},
+            )
+            for port in _REWARD_PORTS:
+                _wait_health(
+                    processes, host, f"reward-{index}-{port}", port,
+                    {"worker_count": 1, "mapping_version": Path(manifest["mapping"]).name},
+                )
+        _wait_health(
+            processes, manifest["head_ip"], "reward-router", _ROUTER_PORT,
+            {"worker_count": 8 * (len(manifest["hosts"]) // 2),
+             "mapping_version": Path(manifest["mapping"]).name,
+             "service_config": {"worker_urls": worker_urls}},
+        )
         training = processes.start(
             "training",
             [sys.executable, "-u", "-m", _MODULE, "_train", str(path)],
