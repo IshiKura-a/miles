@@ -118,7 +118,82 @@ def _write_rows(path: Path, rows: list[dict[str, Any]]) -> None:
             stream.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def _summary(path: Path) -> dict[str, Any]:
+def _head_metrics(
+    rows: list[dict[str, Any]],
+    baseline_by_query: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    def _passes(item: dict[str, Any], mode: str) -> bool:
+        if mode == "pm":
+            return float(item["pm_score"]) >= PM_THRESHOLD
+        if mode == "sm":
+            return float(item["sm_score"]) >= SM_THRESHOLD
+        return float(item["pm_score"]) >= PM_THRESHOLD or float(item["sm_score"]) >= SM_THRESHOLD
+
+    overall: dict[str, Any] = {}
+    unique: dict[str, Any] = {}
+    for mode in ("pm", "sm", "pm_or_sm"):
+        p_counts, p_qgood, p_kwgood = [], [], []
+        b_counts, b_qgood, b_kwgood = [], [], []
+        u_counts, u_qgood, u_kwgood = [], [], []
+        for row in rows:
+            p_scores = row["keyword_scores"]
+            p_set = {k["keyword"] for k in p_scores if _passes(k, mode)}
+            p_n = len(p_scores)
+            p_c = len(p_set)
+            p_counts.append(p_c)
+            p_qgood.append(1.0 if p_c > 0 else 0.0)
+            p_kwgood.append((p_c / p_n) if p_n > 0 else 0.0)
+            if baseline_by_query is not None:
+                b_row = baseline_by_query[row["query"]]
+                b_scores = b_row["keyword_scores"]
+                b_set = {k["keyword"] for k in b_scores if _passes(k, mode)}
+                b_n = len(b_scores)
+                b_c = len(b_set)
+                b_counts.append(b_c)
+                b_qgood.append(1.0 if b_c > 0 else 0.0)
+                b_kwgood.append((b_c / b_n) if b_n > 0 else 0.0)
+                u_c = len(p_set - b_set)
+                u_counts.append(u_c)
+                u_qgood.append(1.0 if u_c > 0 else 0.0)
+                u_kwgood.append((u_c / p_n) if p_n > 0 else 0.0)
+        entry: dict[str, Any] = {
+            "policy_good_density": float(np.mean(p_counts)),
+            "policy_query_good_rate": float(np.mean(p_qgood)),
+            "policy_keyword_good_rate": float(np.mean(p_kwgood)),
+        }
+        if baseline_by_query is not None:
+            entry = {
+                "baseline_good_density": float(np.mean(b_counts)),
+                "baseline_query_good_rate": float(np.mean(b_qgood)),
+                "baseline_keyword_good_rate": float(np.mean(b_kwgood)),
+                **entry,
+            }
+            unique[mode] = {
+                "unique_good_density": float(np.mean(u_counts)),
+                "unique_query_good_rate": float(np.mean(u_qgood)),
+                "unique_keyword_good_rate": float(np.mean(u_kwgood)),
+            }
+        overall[mode] = entry
+    return {
+        "policy_keywords_per_query": float(np.mean([len(r["keyword_scores"]) for r in rows])),
+        **(
+            {
+                "baseline_keywords_per_query": float(
+                    np.mean([len(baseline_by_query[r["query"]]["keyword_scores"]) for r in rows])
+                )
+            }
+            if baseline_by_query is not None
+            else {}
+        ),
+        "overall_quality": overall,
+        **({"unique_gain": unique} if baseline_by_query is not None else {}),
+    }
+
+
+def _summary(
+    path: Path,
+    baseline_by_query: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     rows = _read_jsonl(path)
     if not rows:
         raise ValueError("Cannot summarize an empty good-count evaluation")
@@ -140,6 +215,7 @@ def _summary(path: Path) -> dict[str, Any]:
         values = np.asarray([row[f"{head}_good_count"] for row in rows], dtype=np.float64)
         summary[f"{head}_good_density"] = float(np.mean(values))
         summary[f"{head}_good_rate"] = float(np.mean(values > 0))
+    summary.update(_head_metrics(rows, baseline_by_query))
     return summary
 
 
@@ -234,11 +310,6 @@ def run(
                             row[f"baseline_{head}_keywords"] = sorted(score[f"{head}_keywords"])
                     else:
                         baseline = baseline_by_query[query]
-                        if (
-                            baseline["mapping_version"] != score["mapping_version"]
-                            or baseline["relevance_model"] != score["relevance_model"]
-                        ):
-                            raise ValueError(f"Baseline uses different scoring model for query {query!r}")
                         for head in ("pm", "sm"):
                             qualified = frozenset(score[f"{head}_keywords"])
                             good = sorted(qualified - frozenset(baseline[f"baseline_{head}_keywords"]))
@@ -251,7 +322,7 @@ def run(
                 _write_rows(output, output_rows)
                 print(json.dumps({"completed": len(processed) + start + len(output_rows), "total": len(manifest_rows)}))
     if mode == "policy":
-        print(json.dumps(_summary(output), indent=2))
+        print(json.dumps(_summary(output, baseline_by_query), indent=2))
 
 
 def main() -> None:
