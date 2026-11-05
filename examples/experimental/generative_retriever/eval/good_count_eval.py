@@ -12,7 +12,7 @@ from typing import Any, Literal
 import httpx
 import numpy as np
 
-from examples.experimental.generative_retriever.relevance_reward import PM_THRESHOLD, SM_THRESHOLD
+from examples.experimental.generative_retriever.reward.relevance_reward import PM_THRESHOLD, SM_THRESHOLD
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -219,6 +219,55 @@ def _summary(
     return summary
 
 
+def format_summary_table(summary: dict[str, Any]) -> str:
+    lines = [
+        (
+            f"Queries: {summary['queries']} | "
+            f"Baseline #KW/Q: {summary.get('baseline_keywords_per_query', 0.0):.2f} | "
+            f"Policy #KW/Q: {summary.get('policy_keywords_per_query', 0.0):.2f}"
+        ),
+        "",
+        "=== (a) Overall Generation Quality (Baseline -> Policy) ===",
+    ]
+    overall = summary.get("overall_quality", {})
+    for label, mode in (
+        ("PM >= 0.58", "pm"),
+        ("SM >= 0.82", "sm"),
+        ("PM >= 0.58 or SM >= 0.82", "pm_or_sm"),
+    ):
+        entry = overall.get(mode, {})
+        bgd = float(entry.get("baseline_good_density", 0.0))
+        pgd = float(entry.get("policy_good_density", 0.0))
+        bqg = float(entry.get("baseline_query_good_rate", 0.0)) * 100.0
+        pqg = float(entry.get("policy_query_good_rate", 0.0)) * 100.0
+        bkg = float(entry.get("baseline_keyword_good_rate", 0.0)) * 100.0
+        pkg = float(entry.get("policy_keyword_good_rate", 0.0)) * 100.0
+        lines.append(
+            f"{label:26s} | "
+            f"Good Density: {bgd:.2f} -> {pgd:.2f} ({pgd - bgd:+.2f}) | "
+            f"Query Good Rate: {bqg:.2f}% -> {pqg:.2f}% ({pqg - bqg:+.2f}%) | "
+            f"Keyword Good Rate: {bkg:.2f}% -> {pkg:.2f}% ({pkg - bkg:+.2f}%)"
+        )
+    lines.extend(["", "=== (b) Policy Unique Gain (Good & Not in Baseline Set) ==="])
+    unique = summary.get("unique_gain", {})
+    for label, mode in (
+        ("PM >= 0.58", "pm"),
+        ("SM >= 0.82", "sm"),
+        ("PM >= 0.58 or SM >= 0.82", "pm_or_sm"),
+    ):
+        entry = unique.get(mode, {})
+        ugd = float(entry.get("unique_good_density", 0.0))
+        uqg = float(entry.get("unique_query_good_rate", 0.0)) * 100.0
+        ukg = float(entry.get("unique_keyword_good_rate", 0.0)) * 100.0
+        lines.append(
+            f"{label:26s} | "
+            f"Unique Good Density: {ugd:.2f} | "
+            f"Unique Query Good Rate: {uqg:.2f}% | "
+            f"Unique Keyword Good Rate: {ukg:.2f}%"
+        )
+    return "\n".join(lines)
+
+
 def run(
     *,
     mode: str,
@@ -227,10 +276,11 @@ def run(
     generate_url: str,
     score_url: str,
     baseline_results: Path | None,
-    batch_size: int,
+    batch_size: int = 64,
     docids_per_query: int = 64,
     score_head: Literal["sm", "pm"] = "sm",
-) -> None:
+    summary_output: Path | None = None,
+) -> dict[str, Any] | None:
     if mode not in ("baseline", "policy"):
         raise ValueError(f"Unknown evaluation mode: {mode!r}")
     if not 1 <= batch_size <= 512:
@@ -322,7 +372,17 @@ def run(
                 _write_rows(output, output_rows)
                 print(json.dumps({"completed": len(processed) + start + len(output_rows), "total": len(manifest_rows)}))
     if mode == "policy":
-        print(json.dumps(_summary(output, baseline_by_query), indent=2))
+        summary = _summary(output, baseline_by_query)
+        if summary_output is not None:
+            summary_output.parent.mkdir(parents=True, exist_ok=True)
+            summary_output.write_text(
+                json.dumps(summary, indent=2, allow_nan=False) + "\n",
+                encoding="utf-8",
+            )
+        print(json.dumps(summary, indent=2))
+        print(format_summary_table(summary))
+        return summary
+    return None
 
 
 def main() -> None:
@@ -333,9 +393,10 @@ def main() -> None:
     parser.add_argument("--generate-url", required=True)
     parser.add_argument("--score-url", required=True)
     parser.add_argument("--baseline-results", type=Path)
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--docids-per-query", type=int, default=64)
     parser.add_argument("--score-head", choices=("sm", "pm"), default="sm")
+    parser.add_argument("--summary-output", type=Path)
     args = parser.parse_args()
     run(
         mode=args.mode,
@@ -347,6 +408,7 @@ def main() -> None:
         batch_size=args.batch_size,
         docids_per_query=args.docids_per_query,
         score_head=args.score_head,
+        summary_output=args.summary_output,
     )
 
 

@@ -15,8 +15,8 @@ from typing import Any
 
 import numpy as np
 
-from .id_text_mapping import _validate_id
-from .model_loading import (
+from examples.experimental.generative_retriever.index.id_text_mapping import _validate_id
+from examples.experimental.generative_retriever.model.model_loading import (
     build_run_arguments,
     checkpoint_tensor_shape,
     import_slmv3,

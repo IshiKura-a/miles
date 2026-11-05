@@ -30,6 +30,33 @@ def _validate_id(docid: PositionalID) -> None:
             raise ValueError(f"GR ID component {code} is outside position {position}'s codebook")
 
 
+def pack_docid_u32(docid: PositionalID) -> int:
+    _validate_id(docid)
+    return (
+        (docid[0] << 24)
+        | ((docid[1] - 256) << 16)
+        | ((docid[2] - 512) << 8)
+        | (docid[3] - 768)
+    )
+
+
+def unpack_docid_u32(value: int) -> PositionalID:
+    c0 = (value >> 24) & 0xFF
+    c1 = ((value >> 16) & 0xFF) + 256
+    c2 = ((value >> 8) & 0xFF) + 512
+    c3 = (value & 0xFF) + 768
+    return (c0, c1, c2, c3)
+
+
+def is_columnar_index_dir(path: str | Path) -> bool:
+    resolved = Path(path).expanduser().resolve()
+    return (
+        resolved.is_dir()
+        and (resolved / "keywords.parquet").is_file()
+        and (resolved / "docid_keywords.parquet").is_file()
+    )
+
+
 def lookup_texts(mapping: str | Path, docids: Iterable[PositionalID]) -> MappingLookup:
     """Scan the official TSV once, preserving every distinct matching text per ID."""
     path = Path(mapping).expanduser().resolve()
@@ -79,6 +106,7 @@ def lookup_texts(mapping: str | Path, docids: Iterable[PositionalID]) -> Mapping
 def lookup_service(
     service_url: str, docids: Iterable[PositionalID], *, timeout: float = 30.0,
     expected_mapping_version: str | None = None,
+    market: str | None = None,
     client: httpx.Client | None = None,
 ) -> dict[PositionalID, tuple[str, ...]]:
     requested = list(dict.fromkeys(docids))
@@ -91,7 +119,10 @@ def lookup_service(
     with httpx.Client(timeout=timeout) if client is None else nullcontext(client) as session:
         for start in range(0, len(requested), 4096):
             chunk = requested[start:start + 4096]
-            response = session.post(url, json={"docids": chunk}, timeout=timeout)
+            req_body: dict[str, object] = {"docids": chunk}
+            if market is not None:
+                req_body["market"] = market
+            response = session.post(url, json=req_body, timeout=timeout)
             response.raise_for_status()
             payload = response.json()
             if not isinstance(payload, dict):

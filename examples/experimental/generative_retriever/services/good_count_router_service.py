@@ -12,7 +12,7 @@ import uvicorn
 import xxhash
 from fastapi import FastAPI, HTTPException
 
-from examples.experimental.generative_retriever.good_count_service import GoodCountRequest
+from examples.experimental.generative_retriever.services.good_count_service import GoodCountRequest
 
 
 class GoodCountRouter:

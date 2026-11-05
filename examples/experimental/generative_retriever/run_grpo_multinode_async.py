@@ -38,7 +38,7 @@ from ray._private.node import Node
 from ray._private.parameter import RayParams
 
 from examples.experimental.generative_retriever import run_grpo
-from examples.experimental.generative_retriever.prepare_sglang_bundle import (
+from examples.experimental.generative_retriever.runtime.prepare_sglang_bundle import (
     prepare_bundle,
     require_sglang_abort_patch,
 )
@@ -209,9 +209,9 @@ def _train_arguments(
             "--hf-checkpoint", str(bundle),
             "--train-backend", "fsdp",
             "--custom-fsdp-model-factory-path",
-            "examples.experimental.generative_retriever.fsdp_policy.build_gr_stage5_policy",
+            "examples.experimental.generative_retriever.model.fsdp_policy.build_gr_stage5_policy",
             "--data-source-path",
-            "examples.experimental.generative_retriever.data_source.GRRolloutDataSource",
+            "examples.experimental.generative_retriever.index.data_source.GRRolloutDataSource",
             "--weight-sync-include-prefixes", "docEnc2decoder.", "decoder.", "lm_head.",
             "--update-weight-buffer-size", "536870912",
             "--use-dynamic-batch-size",
@@ -222,10 +222,10 @@ def _train_arguments(
             "--input-key", "query",
             "--rollout-shuffle",
             "--custom-generate-function-path",
-            "examples.experimental.generative_retriever.sglang_encode_generate.generate",
-            "--custom-rm-path", "examples.experimental.generative_retriever.reward.reward",
+            "examples.experimental.generative_retriever.model.sglang_encode_generate.generate",
+            "--custom-rm-path", "examples.experimental.generative_retriever.reward.reward.reward",
             "--custom-rollout-log-function-path",
-            "examples.experimental.generative_retriever.rollout_metrics.log_rollout",
+            "examples.experimental.generative_retriever.reward.rollout_metrics.log_rollout",
             "--generative-retriever-reward-url", reward_url + "/score",
             "--generative-retriever-reward-prepare-url", reward_url + "/prepare",
             "--generative-retriever-reward-mode", args.reward_mode,
@@ -479,7 +479,7 @@ def _start_service(
     return processes.start(
         name,
         [sys.executable, "-u", "-m",
-         f"examples.experimental.generative_retriever.{module}",
+         f"examples.experimental.generative_retriever.services.{module}",
          *argv, "--host", host, "--port", str(port)],
         gpus=gpus, persistent=persistent,
     )
@@ -676,7 +676,7 @@ def _check_remote_sources(manifest: Manifest) -> None:
     _check_miles_checkouts(manifest["hosts"])
     run_dir = Path(manifest["run_dir"])
     require_sglang_abort_patch()
-    sglang_patch = Path(__file__).resolve().parent / "patches/sglang-embedding-abort.patch"
+    sglang_patch = Path(__file__).resolve().parent / "runtime/patches/sglang-embedding-abort.patch"
     sglang_root = Path(sys.prefix) / "src/sglang"
     files = (
         sglang_root / "python/sglang/srt/entrypoints/openai/serving_embedding.py",
@@ -800,7 +800,7 @@ def _run(manifest: Manifest) -> None:
             processes.start(
                 "mapping",
                 [sys.executable, "-u", "-m",
-                 "examples.experimental.generative_retriever.mapping_service",
+                 "examples.experimental.generative_retriever.services.mapping_service",
                  "--mapping", manifest["mapping"], "--host", manifest["head_ip"],
                  "--port", str(_MAPPING_PORT)],
             )

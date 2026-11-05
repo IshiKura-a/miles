@@ -13,7 +13,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-from .model_loading import require_directory
+from examples.experimental.generative_retriever.model.model_loading import require_directory
 
 
 def require_sglang_abort_patch() -> None:

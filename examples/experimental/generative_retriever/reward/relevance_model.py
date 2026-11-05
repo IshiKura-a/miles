@@ -12,7 +12,7 @@ from typing import Protocol, cast
 
 import numpy as np
 
-from examples.experimental.generative_retriever.lru_cache import LRUCache
+from examples.experimental.generative_retriever.services.lru_cache import LRUCache
 
 EXPECTED_GRAPHENE_COMMIT = "a57cb597de0891c1e0a2612d12366188b96aa0cc"
 _PIPELINE_PATH = Path("graphene/multi_cup/multi_cup_graphene_pipeline.py")

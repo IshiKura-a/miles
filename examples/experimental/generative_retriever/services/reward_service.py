@@ -1,7 +1,7 @@
 """Serve keyword-averaged rewards using official relevance and prepared baselines.
 
 Run:
-    python -m examples.experimental.generative_retriever.reward_service \
+    python -m examples.experimental.generative_retriever.services.reward_service \
         --baseline-url http://127.0.0.1:30487/generate \
         --mapping-url http://127.0.0.1:30488 \
         --mapping-version mapping.tsv --relevance-model /path/to/relevance-model \
@@ -26,14 +26,14 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, StrictInt, create_model, field_validator
 
-from examples.experimental.generative_retriever.id_text_mapping import _validate_id, lookup_service
-from examples.experimental.generative_retriever.lru_cache import LRUCache
-from examples.experimental.generative_retriever.relevance_model import (
+from examples.experimental.generative_retriever.index.id_text_mapping import _validate_id, lookup_service
+from examples.experimental.generative_retriever.services.lru_cache import LRUCache
+from examples.experimental.generative_retriever.reward.relevance_model import (
     RelevanceScorer,
     load_relevance_pipeline_factory,
     resolve_relevance_source,
 )
-from examples.experimental.generative_retriever.relevance_reward import (
+from examples.experimental.generative_retriever.reward.relevance_reward import (
     BaselineSets,
     RewardMode,
     build_baseline_set,

@@ -13,11 +13,11 @@ Miles、Megatron-LM 和 SGLang 均从锁定源码安装：
 ```bash
 cd /home/aiscuser/miles
 SGLANG_BUILD_RUST_EXTS=none uv sync --extra generative-retriever
-uv run python -m examples.experimental.generative_retriever.prepare_uv_cuda
+uv run python -m examples.experimental.generative_retriever.runtime.prepare_uv_cuda
 uv lock --check
 uv sync --extra generative-retriever --check
 uv run ruff check examples/experimental/generative_retriever
-uv run pyright examples/experimental/generative_retriever/{baseline_service,constrained_decode,data_source,fsdp_policy,good_count_eval,good_count_router_service,good_count_service,id_text_mapping,model_loading,relevance_model,relevance_reward,reward,reward_router_service,reward_service,rollout_metrics,run_grpo,sglang_encode_generate,transformers_infer}.py
+uv run pyright examples/experimental/generative_retriever/{eval,index,model,reward,runtime,services} examples/experimental/generative_retriever/{run_eval,run_grpo}.py
 ```
 
 Megatron-LM 锁定 commit `fd15ee20a4f03b03680529baf4b8f7eeed64df1d`，
@@ -25,14 +25,14 @@ SGLang 锁定 commit `7f79d11d948aa37b49821475e075369bb0e801f3`；
 CUDA 环境使用 Torch 2.13.0+cu130、Transformers 5.12.1。
 
 MI300X 双机（ROCm 10.0.0、Torch `2.11.0+rocm10.0.0`、AITER `acf8fdf93`）使用仓库内的
-[prepare_rocm_env.py](../../examples/experimental/generative_retriever/prepare_rocm_env.py)
+[prepare_rocm_env.py](../../examples/experimental/generative_retriever/runtime/prepare_rocm_env.py)
 与锁定依赖清单
-[requirements-rocm.freeze.txt](../../examples/experimental/generative_retriever/requirements-rocm.freeze.txt)
+[requirements-rocm.freeze.txt](../../examples/experimental/generative_retriever/runtime/requirements-rocm.freeze.txt)
 一键构建 `.venv`、生成 `.venv/activate-rocm.sh` 并同步到所有节点：
 
 ```bash
 cd /home/aiscuser/miles
-python3 -m examples.experimental.generative_retriever.prepare_rocm_env \
+python3 -m examples.experimental.generative_retriever.runtime.prepare_rocm_env \
   --hosts node-0,node-1 --slm-root /home/aiscuser/SLMGR_dev/SLMv3
 ```
 
@@ -53,7 +53,7 @@ python3 -m examples.experimental.generative_retriever.prepare_rocm_env \
 ### SLMv3 外部源码 patch
 
 `SLMv3/model.py` 所需兼容补丁保存在 Miles 的
-[slmv3-transformers-cache.patch](../../examples/experimental/generative_retriever/patches/slmv3-transformers-cache.patch)，
+[slmv3-transformers-cache.patch](../../examples/experimental/generative_retriever/runtime/patches/slmv3-transformers-cache.patch)，
 基于 SLMGR_dev commit `afb5096219af0b64a72feb09b009726fcb513dea`。
 
 在未修改的 SLMGR_dev checkout 上应用（路径按实际 checkout 设置）：
@@ -61,7 +61,7 @@ python3 -m examples.experimental.generative_retriever.prepare_rocm_env \
 ```bash
 MILES_ROOT=/path/to/miles
 SLMGR_ROOT=/path/to/SLMGR_dev
-PATCH="$MILES_ROOT/examples/experimental/generative_retriever/patches/slmv3-transformers-cache.patch"
+PATCH="$MILES_ROOT/examples/experimental/generative_retriever/runtime/patches/slmv3-transformers-cache.patch"
 git -C "$SLMGR_ROOT" apply --check "$PATCH"
 git -C "$SLMGR_ROOT" apply "$PATCH"
 ```
@@ -74,7 +74,7 @@ Miles 的 `--slm-root` 仍指向该 checkout 下的 `SLMv3` 目录。
 `7f79d11d948aa37b49821475e075369bb0e801f3` 对取消的 embedding
 请求返回无 `embedding` 字段的结果，但 OpenAI 层仍按成功结果读取该字段，
 产生 `KeyError` 和误导性的内部 500。
-[sglang-embedding-abort.patch](../../examples/experimental/generative_retriever/patches/sglang-embedding-abort.patch)
+[sglang-embedding-abort.patch](../../examples/experimental/generative_retriever/runtime/patches/sglang-embedding-abort.patch)
 仅在返回结果的 `finish_reason` 是 `abort` 时给出明确的 503，不改变正常的
 embedding 输出或模型行为。每台训练节点上的锁定 SGLang checkout 均须应用；
 launcher 会在启动前验证，不会自动修改外部源码：
@@ -82,7 +82,7 @@ launcher 会在启动前验证，不会自动修改外部源码：
 ```bash
 MILES_ROOT=/home/aiscuser/miles
 SGLANG_ROOT="$MILES_ROOT/.venv/src/sglang"
-PATCH="$MILES_ROOT/examples/experimental/generative_retriever/patches/sglang-embedding-abort.patch"
+PATCH="$MILES_ROOT/examples/experimental/generative_retriever/runtime/patches/sglang-embedding-abort.patch"
 git -C "$SGLANG_ROOT" apply --check "$PATCH"
 git -C "$SGLANG_ROOT" apply "$PATCH"
 ```
@@ -99,6 +99,9 @@ Cosmos 路径以运行时环境变量 `$cosmos_data_path` 为前缀。
 | Relevance source snapshot | `$cosmos_data_path/local/User/yugao/share/qualitymodel/GCQC/GV2.1/Student/GPT5_0806/PF_E3.5-2/Multi_Cup/code/` |
 | 原始 GR checkpoint | `$cosmos_data_path/local/Users/tianchiyang/Checkpoints/ASI_RQ/SLMv3-202511-4x256-stage5/epoch1-part24/checkpoint-30553/` |
 | Qwen encoder | `$cosmos_data_path/local/Users/tianchiyang/LLM/Qwen/Qwen3-4B/` |
+| NA + INTL 统一列式索引（SLMGRv3Part25） | `$cosmos_data_path/local/User/zihao/online_rl/gr_offline_syn/index/slmgrv3_part25_na_intl_20261028_20261029/` |
+| NA SStream 源表（2026-10-28） | `$cosmos_data_path/shares/bingads.data.selection/data/User/tianchiyang/OnlineServing/SLMGR/FlightTable/SLMGRv3Part25/Keyword_NATAPart.2026-10-28.ss` |
+| INTL SStream 源表（2026-10-29） | `$cosmos_data_path/shares/bingads.data.selection/data/User/tianchiyang/OnlineServing/SLMGR/FlightTable/SLMGRv3Part25/Keyword_INTLTAPart.2026-10-29.ss` |
 | 当前训练/推理 ID-text 映射（Global index 1 TAListing） | `$cosmos_data_path/local/User/zihao/online_rl/gr_offline_syn/index/globalindex1_latest_ta_listing_20261019/asiindex_mapping.ta_listing.tsv` |
 | 旧 run / 存档评测使用的 NA 映射 | `$cosmos_data_path/shares/bingads.data.selection/data/User/tianchiyang/OnlineServing/UniASI/PublishTables/asiv3index5selmarketna/RawData/asiindex_mapping20261005022223.tsv` |
 | 训练数据 | `$cosmos_data_path/local/Users/tianchiyang/Data/MZLog/TA_PA_UnifiedData_202604to202605_Weekly/TAKeyword/train_15M.queryfeat.2026-04-01/Part0.json` |
@@ -115,6 +118,44 @@ Global index 1 的 `asiindex_mapping.latest.tsv` 按第 9 列
 `SALLTAListing` 过滤，保留原 9 列中的 238,836,331 / 267,009,981 行；
 子集文件的行数与 SHA-256 已验证，是当前训练、baseline constrained 解码、
 reward 映射和后续离线评测共同使用的 ID-text 映射。
+
+### 统一 `(market, docid, keyword)` 列式索引与动态映射协议
+
+由 [build_sstream_index.py](../../examples/experimental/generative_retriever/index/build_sstream_index.py)
+直接解析 `SLMGRv3Part25` 下同周期对齐的
+`Keyword_NATAPart.2026-10-28.ss`（`353,163,790` 行，2 列 `docid, Keyword`）与
+`Keyword_INTLTAPart.2026-10-29.ss`（`132,601,263` 行，3 列 `Market, docid, Keyword`），
+合计 `485,765,053` 原始行：
+
+1. **Keyword 原文精确匹配与 Market 并集**：
+   - 对 `keyword` 按原始字节严格 exact match 去重（不做 `strip()` 或大小写折叠），
+     共得到 `265,127,714` 个唯一 `keyword`（仅 NA `175,014,980` 个、仅 INTL
+     `86,594,168` 个、NA 与 INTL 共有 `3,518,566` 个）。
+   - 因为 keyword 编码器（`TA-Keyword`）输入仅含 `keyword` 文本、不含 `market`，
+     后续更新 `docid2keyword` 时同一 `keyword` 映射到唯一 `docid`；因此将可投放
+     market 集合定义为 `keyword` 自身的静态属性（汇总该 `keyword` 在 NA 与 INTL
+     所有出现行中的 market 并集），避免同一 `keyword` 因不同召回 `docid` 而只允许部分 market。
+2. **静态词表与动态映射解耦存储**：
+   - **静态词表 `keywords.parquet`**（`6.83 GB`，训练期间保持不变）：
+     `(keyword_id: uint32, keyword: large_binary, in_na: bool, markets: large_string)`，
+     其中 `keyword_id` 为连续整数 `0 .. N_kw - 1`，`markets` 为去重排序后的逗号分隔
+     market 集合（如 `"NA,DE-AT,DE-CH,DE-DE"`）。
+   - **动态映射表 `docid_keywords.parquet` 与 CSR 数组**（`2.63 GB` Parquet +
+     `docid_unique.u32.npy`、`docid_offsets.i64.npy`、`docid_kw_ids.u32.npy`）：
+     将四段 positional ID `(c0, c1, c2, c3)` 无损打包为单个 `uint32`：
+     `docid_u32 = (c0 << 24) | ((c1 - 256) << 16) | ((c2 - 512) << 8) | (c3 - 768)`，
+     按 `(docid_u32, keyword_id)` 排序去重后保存全部 `483,649,422` 对映射
+     （覆盖 `88,527,153` 个唯一 `docid`）。
+   - 训练期若 `docid2keyword` 发生变化，直接在 `mapping_service` 内存中更新
+     `docid_u32 <-> keyword_id` 的 CSR 数组，无需从磁盘重读；需要持久化快照时只需写出
+     `docid_keywords.parquet` 与 CSR `.npy` 文件，静态 `keywords.parquet` 通过符号链接复用。
+
+```bash
+uv run --env-file .env python -m examples.experimental.generative_retriever.index.build_sstream_index \
+  --na-ss "$cosmos_data_path/shares/bingads.data.selection/data/User/tianchiyang/OnlineServing/SLMGR/FlightTable/SLMGRv3Part25/Keyword_NATAPart.2026-10-28.ss" \
+  --intl-ss "$cosmos_data_path/shares/bingads.data.selection/data/User/tianchiyang/OnlineServing/SLMGR/FlightTable/SLMGRv3Part25/Keyword_INTLTAPart.2026-10-29.ss" \
+  --output "$cosmos_data_path/local/User/zihao/online_rl/gr_offline_syn/index/slmgrv3_part25_na_intl_20261028_20261029"
+```
 
 ## Reward
 
@@ -149,7 +190,7 @@ unique_bonus = pm_unique_bonus + sm_unique_bonus
 - PM / SM unique bonus 分别在该头过阈值且 keyword 不属于对应 baseline 集合时生效，
   并乘跨头连续质量因子 `Q`（对单过 SM 的新词提供把 PM 推向 `0.58` 的连续梯度）；
   单头 bonus 最大为 `0.5`，总 `unique_bonus` 最大为 `1`，两种 reward mode 的范围均为 `[0,3]`。
-- 实现在 [relevance_reward.py](../../examples/experimental/generative_retriever/relevance_reward.py)。
+- 实现在 [relevance_reward.py](../../examples/experimental/generative_retriever/reward/relevance_reward.py)。
 
 ### `discrete_relevance_unique`
 
@@ -191,7 +232,7 @@ query
 ```
 
 Baseline 与候选均对 ID 映射出的不同 keyword 逐项评分；训练按 `B_PM(q)`、`B_SM(q)`
-分别判断两侧 unique。Baseline 由 [model_loading.py](../../examples/experimental/generative_retriever/model_loading.py)
+分别判断两侧 unique。Baseline 由 [model_loading.py](../../examples/experimental/generative_retriever/model/model_loading.py)
 加载原始 checkpoint，按当前映射的 ID 前缀约束执行 top-64 beam search。
 
 Relevance 使用原源码快照中的 `MultiCupGraphenePipeline`：
@@ -205,7 +246,7 @@ HTTP reward hook 对每个 sample 返回一个 doc ID 的平均 keyword reward�
 
 ### Rollout 配置
 
-- [constrained_decode.py](../../examples/experimental/generative_retriever/constrained_decode.py)
+- [constrained_decode.py](../../examples/experimental/generative_retriever/model/constrained_decode.py)
   使用当前映射的 ID 前缀约束。Baseline 为确定性 top-64 beam，训练 rollout 为
   constrained 64-beam 无放回采样（`decoding_mode="beam_sample"`，每 query 返回 64 个
   互不重复的有效 doc ID 及 4 个 decoder token logprob）。
@@ -291,27 +332,33 @@ Launcher 设置各服务的 GPU visibility；离线评测与训练使用不同�
 
 ### 常驻 ID-text 服务
 
-[mapping_service.py](../../examples/experimental/generative_retriever/mapping_service.py)
-启动时加载一次当前 Global TAListing 映射，后续查询读取内存。
+[mapping_service.py](../../examples/experimental/generative_retriever/services/mapping_service.py)
+支持加载上述统一列式索引目录（`keywords.parquet` + `docid_keywords.parquet` / CSR `.npy`）
+或传统 `.tsv` 映射文件，启动后常驻内存提供服务：
 
 ```bash
-uv run python -m examples.experimental.generative_retriever.mapping_service \
-  --mapping "$cosmos_data_path/local/User/zihao/online_rl/gr_offline_syn/index/globalindex1_latest_ta_listing_20261019/asiindex_mapping.ta_listing.tsv" \
+# 加载统一列式索引目录（约 30s 启动）或 .tsv 映射文件
+uv run python -m examples.experimental.generative_retriever.services.mapping_service \
+  --mapping "$cosmos_data_path/local/User/zihao/online_rl/gr_offline_syn/index/slmgrv3_part25_na_intl_20261028_20261029" \
   --host 127.0.0.1 --port 30488
 ```
 
-- `POST /lookup` 返回 ID 对应的 keyword 列表；同一 ID 内相同文本去重。
-- 客户端 [lookup_service](../../examples/experimental/generative_retriever/id_text_mapping.py)
-  按最多 4,096 个不同 ID 分批请求；服务地址 `http://127.0.0.1:30488`。
+- `POST /lookup` 返回 ID 对应的去重 keyword 列表；支持可选 `market` 参数
+  （如 `"en-us"`、`"ja-jp"`、`"NA"`），在返回前按 `keyword_id` 的允许 market 集合过滤。
+- `POST /update` 支持在内存中直接增量更新或全量替换 `docid -> keyword_ids` 的 CSR 映射，
+  训练期间无需从磁盘重新读取；`POST /save` 将内存中的最新动态映射写出为新的
+  `docid_keywords.parquet` 与 CSR `.npy` 快照。
+- 客户端 [lookup_service](../../examples/experimental/generative_retriever/index/id_text_mapping.py)
+  按最多 4,096 个不同 ID 分批请求（可传入 `market`）；服务地址 `http://127.0.0.1:30488`。
 
 ### 常驻 baseline 服务
 
-[baseline_service.py](../../examples/experimental/generative_retriever/baseline_service.py)
+[baseline_service.py](../../examples/experimental/generative_retriever/services/baseline_service.py)
 在 GPU 4-5 各加载一份冻结原始 GR，使用当前映射前缀树执行 64-beam。
 
 ```bash
 CUDA_VISIBLE_DEVICES=4,5 uv run python -m \
-  examples.experimental.generative_retriever.baseline_service \
+  examples.experimental.generative_retriever.services.baseline_service \
   --checkpoint /path/to/stage5 \
   --qwen-model /path/to/qwen \
   --slm-root /path/to/SLMv3 \
@@ -324,16 +371,16 @@ CUDA_VISIBLE_DEVICES=4,5 uv run python -m \
 
 ### 常驻 reward 服务
 
-[reward_service.py](../../examples/experimental/generative_retriever/reward_service.py)
+[reward_service.py](../../examples/experimental/generative_retriever/services/reward_service.py)
 是单 GPU worker。GPU 6 和 7 各运行一个隔离进程，分别缓存 baseline set、
-query/keyword feature 和 query-keyword 分数；[reward_router_service.py](../../examples/experimental/generative_retriever/reward_router_service.py)
+query/keyword feature 和 query-keyword 分数；[reward_router_service.py](../../examples/experimental/generative_retriever/services/reward_router_service.py)
 在 CPU 上按 query 做 rendezvous hashing，并恢复输入 sample 顺序。
 Baseline cache miss 时 worker 调用常驻 baseline 服务生成同样数量的 ID，
 经 mapping 服务展开并评分后在线构建 `B(q)`。
 
 ```bash
 CUDA_VISIBLE_DEVICES=6 uv run python -m \
-  examples.experimental.generative_retriever.reward_service \
+  examples.experimental.generative_retriever.services.reward_service \
   --baseline-url http://127.0.0.1:30487/generate \
   --mapping-url http://127.0.0.1:30488 \
   --mapping-version asiindex_mapping.ta_listing.tsv \
@@ -341,10 +388,10 @@ CUDA_VISIBLE_DEVICES=6 uv run python -m \
   --port 30490
 
 CUDA_VISIBLE_DEVICES=7 uv run python -m \
-  examples.experimental.generative_retriever.reward_service \
+  examples.experimental.generative_retriever.services.reward_service \
   <同一模型和服务参数> --port 30491
 
-uv run python -m examples.experimental.generative_retriever.reward_router_service \
+uv run python -m examples.experimental.generative_retriever.services.reward_router_service \
   --worker-urls http://127.0.0.1:30490/score,http://127.0.0.1:30491/score \
   --port 30489
 ```
@@ -463,79 +510,105 @@ uv run --no-sync --env-file .env python -m \
 
 ## 离线 good-count eval 与训练资源隔离
 
-### 固定评测集与最终 checkpoint
+### 固定评测集
 
 - 数据源：`$cosmos_data_path/local/Users/tianchiyang/Data/MZLog/`
   `TA_PA_UnifiedData_202411to202511/TAKeyword/valid_100K.queryfeat/Part0`。
-  从非空 `query` 字段中的 99,812 个 distinct 文本用固定 seed `20261019`
-  抽取 1,000 个 query。
-- Frozen baseline 和 run `261015-104046-gr-lr2e6` 的最终 `iter_0001000`
-  的存档评测使用上表旧版 NA 映射及同一 Qwen 模型、constrained 64-beam / top-64。
-- 结果持久化在训练 run 的
-  `$cosmos_data_path/local/User/zihao/online_rl/gr_offline_syn/261015-104046-gr-lr2e6/eval/valid_100k_1k_top64_20261019/`。
-  `queries.jsonl` 保存固定样本，`evaluation.json` 保存来源和 manifest SHA-256，
-  `baseline.jsonl`、`policy.jsonl` 保存逐 query SM 结果，`pm/results.jsonl`
-  保存 PM 结果；两头汇总分别为 `summary.json`、`pm/summary.json`。
+- 从非空 `query` 字段中的 99,812 个 distinct 文本按 RecordIO 源顺序与固定 seed
+  `20261019` 做 reservoir 抽样，抽取 **10,000** 个 query 作为固定评测集
+  （`queries.jsonl` SHA-256 为 `d36822a89c715a73281af87118bfde972516f3183f99ef6646a82585cf1ce732`；
+  早期单机存档评测曾使用同一 seed 抽取的 1,000-query 子集，SHA-256 为
+  `ebfb9943bfb58ab0e354dafbfd00fc17729c500d4810231e90d680697185dc1a`）。
+- Frozen baseline 与 policy checkpoint 均使用当前 Global TAListing 映射
+  `asiindex_mapping.ta_listing.tsv`、同一 Qwen3-4B 编码器与确定性 constrained
+  top-64 beam（每 query 返回 64 个不同有效 ID）；映射展开后按 keyword 原文精确匹配、
+  大小写敏感去重。
+- 评测目录结构为
+  `$cosmos_data_path/local/User/zihao/online_rl/gr_offline_syn/<run_id>/eval/valid_100k_10k_top64_step<step>/`，
+  包含 `queries.jsonl`、`evaluation.json`、`baseline.jsonl`、`policy-head-step<step>.pt`、
+  `policy.jsonl` 与 `summary.json`。
 
-Baseline 和 policy 均返回每 query 64 个不同 ID；映射后按 keyword 原文精确匹配、
-大小写敏感去重，平均分别为 298.785 和 314.400 个不同 keyword / query。
+### 评测公式与指标协议
 
-| 评分头 | Baseline 合格 keyword / query | Policy 合格 keyword / query | Good density | Good rate |
-| --- | ---: | ---: | ---: | ---: |
-| SM ≥ 0.82 | 183.812 | 192.518 | 40.324 | 88.5% |
-| PM ≥ 0.58 | 63.406 | 69.743 | 15.361 | 77.4% |
+仓库内提供一键式八卡离线评测入口
+[run_eval.py](../../examples/experimental/generative_retriever/run_eval.py)
+与底层评测模块
+[good_count_eval.py](../../examples/experimental/generative_retriever/eval/good_count_eval.py)，
+复用 [good_count_service.py](../../examples/experimental/generative_retriever/services/good_count_service.py)
+和训练 reward 相同的 [RelevanceScorer](../../examples/experimental/generative_retriever/reward/relevance_model.py)。
 
-Good density 为 `mean(good_count)`；good rate 为 `good_count > 0` 的 query 占比。
-
-### 评测接口
-
-[good_count_eval.py](../../examples/experimental/generative_retriever/good_count_eval.py)
-提供 `baseline` / `policy` 两种离线模式，复用
-[good_count_service.py](../../examples/experimental/generative_retriever/good_count_service.py)
-和训练 reward 相同的 [RelevanceScorer](../../examples/experimental/generative_retriever/relevance_model.py)。
-训练 baseline 要同时通过 PM/SM；离线 good-count eval 对 PM 和 SM 分别计算：
+给定 query $q$，记 baseline 与 policy 的 top-64 ID 映射去重后的 keyword 集合分别为
+$K_B(q)$ 与 $K_P(q)$，对任意集合 $K \in \{K_B(q), K_P(q)\}$ 及口径
+$m \in \{\text{PM}, \text{SM}, \text{PM}\cup\text{SM}\}$ 定义过阈值合格子集：
 
 ```text
-B_SM(q) = {k in baseline keywords | SM(q,k) >= 0.82}
-P_SM(q) = {k in policy keywords | SM(q,k) >= 0.82}
-B_PM(q) = {k in baseline keywords | PM(q,k) >= 0.58}
-P_PM(q) = {k in policy keywords | PM(q,k) >= 0.58}
-good_count_SM(q) = |P_SM(q) - B_SM(q)|
-good_count_PM(q) = |P_PM(q) - B_PM(q)|
+G_PM(K, q) = {k in K | s_PM(q,k) >= 0.58}
+G_SM(K, q) = {k in K | s_SM(q,k) >= 0.82}
+G_PM_or_SM(K, q) = G_PM(K, q) U G_SM(K, q)
+
+B_m(q) = G_m(K_B(q), q)
+P_m(q) = G_m(K_P(q), q)
+U_m(q) = P_m(q) - B_m(q)
+good_count_m(q) = |U_m(q)|
 ```
+
+对每个口径 $m \in \{\text{PM}, \text{SM}, \text{PM}\cup\text{SM}\}$ 分别统计两类指标：
+
+1. **Overall Generation Quality（`overall_quality`）**（分别对 $S \in \{B, P\}$ 计算）：
+   - `good_density`：$\mathbb{E}_q[|S_m(q)|]$
+   - `query_good_rate`：$\mathbb{P}_q(|S_m(q)| > 0)$
+   - `keyword_good_rate`：$\mathbb{E}_q[|S_m(q)| / |K_S(q)|]$
+2. **Policy Unique Gain（`unique_gain`）**（相对于对应 baseline 合格集合 $B_m(q)$ 的增量）：
+   - `unique_good_density`：$\mathbb{E}_q[|U_m(q)|]$（即 $\text{mean}(\text{good\_count}_m)$）
+   - `unique_query_good_rate`：$\mathbb{P}_q(|U_m(q)| > 0)$
+   - `unique_keyword_good_rate`：$\mathbb{E}_q[|U_m(q)| / |K_P(q)|]$
+
+### 评测接口
 
 评分服务每次同时返回两侧过阈值集合及逐 `(query, keyword)` 的 PM/SM 原始分数。
 Baseline 和 policy JSONL 各保存一次该 query 下去重 keyword 的分数、
 mapping 版本和 relevance 模型路径；policy 同时保存 PM/SM 的 good count。
-评测输出保存两头的原始分数与各自 good count；`--score-head` 只选择
-`good_count` 和 CLI 汇总的主口径，默认 `sm`。分数可用于离线阈值重算。
+评测输出保存两头的原始分数与各自 good count；`--score-head` 选择顶层
+`good_count` 分位统计的主口径。`summary.json`（可通过 `--summary-output` 直接写出）
+同时汇报：
 
-汇报 total、zero fraction、mean、median、p10、p90、p95、p99、max；
-baseline 结果按同一 manifest 和模型配置跨 policy checkpoint 复用。
+- 顶层 `good_count` 统计：total、zero fraction、mean、median、p10、p90、p95、p99、max，
+  以及 `pm_good_density`、`pm_good_rate`、`sm_good_density`、`sm_good_rate`、
+  `baseline_keywords_per_query`、`policy_keywords_per_query`；
+- `overall_quality` 与 `unique_gain`（含 `pm`、`sm`、`pm_or_sm` 三种口径）。
 
 Mapping 查询按最多 4,096 个不同 ID 分批；baseline 服务缓存 query 生成结果。
 
-- 离线 generator 使用 `--docids-per-query 64`，评测 CLI 同样指定 64；
-  训练 reward 的 baseline 也是 top-64。映射得到的不同 keyword 均参与评分。
-- 评测按 manifest 顺序写入结果，可从已完成 query 续跑；当前批评分与下一批
-  生成并行。
-- 离线 worker 可用 `--devices` 指定 GPU，或用
-  [good_count_router_service.py](../../examples/experimental/generative_retriever/good_count_router_service.py)
-  将同一 query 固定路由到单 GPU 进程。离线评测与八卡训练分时运行。
+- [model_loading.py](../../examples/experimental/generative_retriever/model/model_loading.py)
+  中的 `export_policy_head_checkpoint` 仅读取 FSDP DCP checkpoint（`checkpoints/iter_XXXXXXX/model`）
+  中训练更新的 44 个解码头张量（`docEnc2decoder.`、`decoder.`、`lm_head.`）所在分片前缀，
+  快速导出 `policy-head-step<step>.pt` 供 `baseline_service.py --policy-checkpoint` 加载。
+- 离线 generator 使用 `--docids-per-query 64`（默认在 GPU 0–3 上并行），
+  评分服务默认在 GPU 4–7 上以 `--batch-size 256` 运行，评测客户端默认
+  `--batch-size 64`；当前批评分与下一批生成流水线并行，且支持从已完成 query 断点续跑。
+- 也可通过 [good_count_router_service.py](../../examples/experimental/generative_retriever/services/good_count_router_service.py)
+  将同一 query 固定路由到多个隔离单 GPU 进程。离线评测与八卡训练分时运行。
 
 ```bash
+# 一键运行单机八卡 10,000-query top-64 离线评测（未指定 --step 时自动读取 latest_checkpointed_iteration.txt）
+uv run --env-file .env python -m examples.experimental.generative_retriever.run_eval \
+  --run-id <run_id> --step <step>
+
+# 或在已启动本地服务（30488 / 30587 / 30588 / 30689）时单独调用底层评测 CLI：
 EVAL_ROOT="$cosmos_data_path/local/User/zihao/online_rl/gr_offline_syn/<run_id>/eval/<eval_id>"
 
-uv run python -m examples.experimental.generative_retriever.good_count_eval \
-  --mode baseline --docids-per-query 64 --batch-size 8 \
+uv run python -m examples.experimental.generative_retriever.eval.good_count_eval \
+  --mode baseline --docids-per-query 64 --batch-size 64 \
   --manifest "$EVAL_ROOT/queries.jsonl" --output "$EVAL_ROOT/baseline.jsonl" \
   --generate-url http://127.0.0.1:30587/generate \
   --score-url http://127.0.0.1:30689/score
 
-uv run python -m examples.experimental.generative_retriever.good_count_eval \
-  --mode policy --docids-per-query 64 --batch-size 8 \
+uv run python -m examples.experimental.generative_retriever.eval.good_count_eval \
+  --mode policy --docids-per-query 64 --batch-size 64 --score-head pm \
   --manifest "$EVAL_ROOT/queries.jsonl" \
-  --baseline-results "$EVAL_ROOT/baseline.jsonl" --output "$EVAL_ROOT/policy.jsonl" \
+  --baseline-results "$EVAL_ROOT/baseline.jsonl" \
+  --output "$EVAL_ROOT/policy.jsonl" \
+  --summary-output "$EVAL_ROOT/summary.json" \
   --generate-url http://127.0.0.1:30588/generate \
   --score-url http://127.0.0.1:30689/score
 ```

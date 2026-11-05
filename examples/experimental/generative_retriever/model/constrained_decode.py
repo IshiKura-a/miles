@@ -12,15 +12,38 @@ from torch import nn
 from transformers import T5Config, T5PreTrainedModel
 from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
 
-from examples.experimental.generative_retriever.model_loading import import_slmv3, require_directory
+from examples.experimental.generative_retriever.model.model_loading import import_slmv3, require_directory
 
 PrefixConstraint = Callable[[int, torch.Tensor], list[int]]
 
 
 @lru_cache(maxsize=1)
 def load_constraint(slm_root: str, mapping_path: str, code_num: int, code_dim: int) -> PrefixConstraint:
+    from examples.experimental.generative_retriever.index.id_text_mapping import (
+        is_columnar_index_dir,
+        unpack_docid_u32,
+    )
+    import numpy as np
+    import pyarrow.parquet as pq
+
     slmv3 = import_slmv3(require_directory(slm_root, "SLMv3 source"))
     mapping = Path(mapping_path).expanduser().resolve()
+    if is_columnar_index_dir(mapping):
+        if code_num != 4 or code_dim != 256:
+            raise ValueError("Columnar u32 docid index requires code_num=4 and code_dim=256")
+        u_path = mapping / "docid_unique.u32.npy"
+        if u_path.is_file():
+            unique_u32 = np.load(u_path)
+        else:
+            table = pq.read_table(mapping / "docid_keywords.parquet", columns=["docid_u32"])
+            unique_u32 = np.unique(table.column("docid_u32").to_numpy(zero_copy_only=False))
+        roots = {int(val) >> 24 for val in unique_u32[:1] | np.unique(unique_u32 >> np.uint32(24))}
+        if roots != set(range(code_dim)):
+            raise ValueError("Official mapping must cover the initial codebook used by SLMGR")
+        docids = [" ".join(map(str, unpack_docid_u32(int(val)))) for val in unique_u32]
+        args = slmv3["RunArguments"](infer_mode=2, code_num=code_num, code_dim=code_dim, uniqueid=1)
+        return slmv3["get_restrict_decode_vocab"](args, docid_list=docids, id_bias=2)
+
     initial = mapping.stat()
     raw_ids: set[bytes] = set()
     scanned_bytes = 0

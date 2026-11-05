@@ -15,8 +15,8 @@ import httpx
 from miles.rollout.base_types import GenerateFnInput, GenerateFnOutput
 from miles.utils.http_utils import GeneralHttpClientProvider
 from miles.utils.types import Sample
-from examples.experimental.generative_retriever.relevance_reward import REWARD_MODES
-from examples.experimental.generative_retriever.reward_http import post_json_async
+from examples.experimental.generative_retriever.reward.relevance_reward import REWARD_MODES
+from examples.experimental.generative_retriever.reward.reward_http import post_json_async
 
 _REQUESTS_BY_STATE: WeakKeyDictionary[Any, dict[Any, Any]] = WeakKeyDictionary()
 _PREPARE_BATCHERS: WeakKeyDictionary[

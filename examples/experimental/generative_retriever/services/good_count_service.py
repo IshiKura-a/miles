@@ -16,17 +16,17 @@ import xxhash
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
-from examples.experimental.generative_retriever.id_text_mapping import (
+from examples.experimental.generative_retriever.index.id_text_mapping import (
     PositionalID,
     _validate_id,
     lookup_service,
 )
-from examples.experimental.generative_retriever.relevance_model import (
+from examples.experimental.generative_retriever.reward.relevance_model import (
     RelevanceScorer,
     load_relevance_pipeline_factory,
     resolve_relevance_source,
 )
-from examples.experimental.generative_retriever.relevance_reward import PM_THRESHOLD, SM_THRESHOLD
+from examples.experimental.generative_retriever.reward.relevance_reward import PM_THRESHOLD, SM_THRESHOLD
 
 class GoodCountSample(BaseModel):
     query: str

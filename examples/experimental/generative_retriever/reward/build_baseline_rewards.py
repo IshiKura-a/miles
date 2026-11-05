@@ -1,7 +1,7 @@
 """Build filtered baseline keyword sets from official constrained GR outputs.
 
 Example:
-    python -m examples.experimental.generative_retriever.build_baseline_rewards \
+    python -m examples.experimental.generative_retriever.reward.build_baseline_rewards \
         --baseline-results /path/to/official-gr-constrained-reward-inputs.json \
         --mapping-url http://127.0.0.1:30488 \
         --relevance-source /path/to/checkpoint/code \
@@ -19,13 +19,13 @@ from pathlib import Path
 
 import numpy as np
 
-from examples.experimental.generative_retriever.id_text_mapping import lookup_service
-from examples.experimental.generative_retriever.model_loading import require_directory
-from examples.experimental.generative_retriever.relevance_model import (
+from examples.experimental.generative_retriever.index.id_text_mapping import lookup_service
+from examples.experimental.generative_retriever.model.model_loading import require_directory
+from examples.experimental.generative_retriever.reward.relevance_model import (
     load_relevance_pipeline_factory,
     resolve_relevance_source,
 )
-from examples.experimental.generative_retriever.relevance_reward import (
+from examples.experimental.generative_retriever.reward.relevance_reward import (
     BASELINE_TOP_K, PM_THRESHOLD, SM_THRESHOLD, REWARD_MODES, RewardMode,
     build_baseline_set, calculate_docid_reward, calculate_keyword_rewards,
 )

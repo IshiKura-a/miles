@@ -11,9 +11,9 @@ from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 from transformers.modeling_outputs import CausalLMOutput
 from transformers.models.t5.modeling_t5 import T5Attention
-from examples.experimental.generative_retriever.constrained_decode import PrefixConstraint, load_constraint
+from examples.experimental.generative_retriever.model.constrained_decode import PrefixConstraint, load_constraint
 
-from .model_loading import (
+from examples.experimental.generative_retriever.model.model_loading import (
     build_run_arguments,
     checkpoint_tensor_shape,
     import_slmv3,

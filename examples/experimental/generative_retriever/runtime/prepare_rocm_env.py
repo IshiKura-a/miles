@@ -2,7 +2,7 @@
 
 Run on the first host before launching multi-node GRPO training:
 
-    python3 -m examples.experimental.generative_retriever.prepare_rocm_env \
+    python3 -m examples.experimental.generative_retriever.runtime.prepare_rocm_env \
         --hosts node-0,node-1 --slm-root /home/aiscuser/SLMGR_dev/SLMv3
 """
 
@@ -15,7 +15,7 @@ import shlex
 import shutil
 import subprocess
 
-_REPO = Path(__file__).resolve().parents[3]
+_REPO = Path(__file__).resolve().parents[4]
 _DIR = Path(__file__).resolve().parent
 _FREEZE = _DIR / "requirements-rocm.freeze.txt"
 _SLMV3_PATCH = _DIR / "patches/slmv3-transformers-cache.patch"

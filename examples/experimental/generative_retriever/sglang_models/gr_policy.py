@@ -9,7 +9,7 @@ import torch
 from torch import nn
 from transformers import T5Config
 from transformers.models.t5.modeling_t5 import T5Stack
-from examples.experimental.generative_retriever.constrained_decode import (
+from examples.experimental.generative_retriever.model.constrained_decode import (
     build_generation_model,
     generate_beams,
     generate_samples,

@@ -16,12 +16,12 @@ import uvicorn
 import xxhash
 from fastapi import FastAPI, HTTPException
 
-from examples.experimental.generative_retriever.reward_service import (
+from examples.experimental.generative_retriever.services.reward_service import (
     BaselinePrepareRequest,
     RewardRequest,
     reward_request_model,
 )
-from examples.experimental.generative_retriever.reward_http import post_json_sync
+from examples.experimental.generative_retriever.reward.reward_http import post_json_sync
 
 _SERVICE_API_VERSION = 6
 logger = logging.getLogger(__name__)

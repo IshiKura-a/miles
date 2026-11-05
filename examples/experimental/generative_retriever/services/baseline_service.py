@@ -16,9 +16,9 @@ import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel, Field, field_validator
 
-from examples.experimental.generative_retriever.lru_cache import LRUCache
-from examples.experimental.generative_retriever.model_loading import load_policy_head_checkpoint
-from examples.experimental.generative_retriever.transformers_infer import GenerationResult, SLMv3Retriever
+from examples.experimental.generative_retriever.services.lru_cache import LRUCache
+from examples.experimental.generative_retriever.model.model_loading import load_policy_head_checkpoint
+from examples.experimental.generative_retriever.model.transformers_infer import GenerationResult, SLMv3Retriever
 
 logger = logging.getLogger(__name__)
 _SERVICE_API_VERSION = 2

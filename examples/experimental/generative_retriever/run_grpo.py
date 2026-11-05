@@ -22,9 +22,9 @@ if str(_MILES_REPO_ROOT) not in sys.path:
 
 import miles.utils.external_utils.command_utils as U
 from miles.utils.misc import get_current_node_ip
-from examples.experimental.generative_retriever.prepare_sglang_bundle import require_sglang_abort_patch
-from examples.experimental.generative_retriever.relevance_reward import REWARD_MODES, RewardMode
-from examples.experimental.generative_retriever.relevance_model import resolve_relevance_source
+from examples.experimental.generative_retriever.runtime.prepare_sglang_bundle import require_sglang_abort_patch
+from examples.experimental.generative_retriever.reward.relevance_reward import REWARD_MODES, RewardMode
+from examples.experimental.generative_retriever.reward.relevance_model import resolve_relevance_source
 
 _TRAIN_GPUS = "0,1"
 _ROLLOUT_GPUS = "2,3"
@@ -184,7 +184,7 @@ def _locked_cuda_env() -> dict[str, str]:
     if not nvcc.is_file():
         raise FileNotFoundError(
             "uv CUDA facade is missing; run "
-            "`uv run python -m examples.experimental.generative_retriever.prepare_uv_cuda`"
+            "`uv run python -m examples.experimental.generative_retriever.runtime.prepare_uv_cuda`"
         )
     lib64 = cuda_home / "lib64"
     if not lib64.is_dir():
@@ -268,7 +268,7 @@ def _ensure_resident_services(
             [
                 sys.executable,
                 "-m",
-                "examples.experimental.generative_retriever.mapping_service",
+                "examples.experimental.generative_retriever.services.mapping_service",
                 "--mapping",
                 os.fspath(mapping),
                 "--port",
@@ -287,7 +287,7 @@ def _ensure_resident_services(
             [
                 sys.executable,
                 "-m",
-                "examples.experimental.generative_retriever.baseline_service",
+                "examples.experimental.generative_retriever.services.baseline_service",
                 "--checkpoint",
                 checkpoint,
                 "--qwen-model",
@@ -329,7 +329,7 @@ def _ensure_resident_services(
                 [
                     sys.executable,
                     "-m",
-                    "examples.experimental.generative_retriever.reward_service",
+                    "examples.experimental.generative_retriever.services.reward_service",
                     "--baseline-url",
                     baseline_url,
                     "--mapping-url",
@@ -384,7 +384,7 @@ def _ensure_resident_services(
             [
                 sys.executable,
                 "-m",
-                "examples.experimental.generative_retriever.reward_router_service",
+                "examples.experimental.generative_retriever.services.reward_router_service",
                 "--worker-urls",
                 ",".join(
                     f"http://127.0.0.1:{port}/score" for port in _REWARD_WORKER_PORTS
@@ -559,7 +559,7 @@ def execute(args: ScriptArgs) -> None:
     U.exec_command_cpu(
         " ".join(
             (
-                "python -m examples.experimental.generative_retriever.prepare_sglang_bundle",
+                "python -m examples.experimental.generative_retriever.runtime.prepare_sglang_bundle",
                 f"--checkpoint {quote(checkpoint)}",
                 f"--qwen-model {quote(qwen_model)}",
                 f"--slm-root {quote(slm_root)}",
@@ -606,9 +606,9 @@ def execute(args: ScriptArgs) -> None:
     learner_args = (
         "--train-backend fsdp "
         "--data-source-path "
-        "examples.experimental.generative_retriever.data_source.GRRolloutDataSource "
+        "examples.experimental.generative_retriever.index.data_source.GRRolloutDataSource "
         "--custom-fsdp-model-factory-path "
-        "examples.experimental.generative_retriever.fsdp_policy.build_gr_stage5_policy "
+        "examples.experimental.generative_retriever.model.fsdp_policy.build_gr_stage5_policy "
         "--weight-sync-include-prefixes "
         "docEnc2decoder. decoder. lm_head. "
         "--update-weight-buffer-size 536870912 "
@@ -640,10 +640,10 @@ def execute(args: ScriptArgs) -> None:
             f"{f'--metadata-key {quote(prompt_data.metadata_key)} ' if prompt_data.metadata_key else ''}"
             "--rollout-shuffle "
             "--custom-generate-function-path "
-            "examples.experimental.generative_retriever.sglang_encode_generate.generate "
-            "--custom-rm-path examples.experimental.generative_retriever.reward.reward "
+            "examples.experimental.generative_retriever.model.sglang_encode_generate.generate "
+            "--custom-rm-path examples.experimental.generative_retriever.reward.reward.reward "
             "--custom-rollout-log-function-path "
-            "examples.experimental.generative_retriever.rollout_metrics.log_rollout "
+            "examples.experimental.generative_retriever.reward.rollout_metrics.log_rollout "
             f"--generative-retriever-reward-url {quote(reward_url)} "
             f"--generative-retriever-reward-prepare-url {quote(reward_prepare_url)} "
             f"--generative-retriever-reward-mode {args.reward_mode} "

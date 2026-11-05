@@ -169,3 +169,67 @@ def load_policy_head_checkpoint(model: Any, checkpoint: str | Path) -> int:
         )
     model.load_state_dict(selected, strict=False)
     return len(selected)
+
+
+def export_policy_head_checkpoint(
+    dcp_model_dir: str | Path,
+    output_path: str | Path,
+) -> int:
+    from concurrent.futures import ThreadPoolExecutor
+    import shutil
+    import tempfile
+    import torch
+    from torch.distributed.checkpoint.filesystem import FileSystemReader
+    from torch.distributed.checkpoint.metadata import TensorStorageMetadata
+    from torch.distributed.checkpoint.state_dict_loader import load
+
+    ckpt_dir = require_directory(dcp_model_dir, "DCP model checkpoint")
+    metadata_file = ckpt_dir / ".metadata"
+    if not metadata_file.is_file():
+        raise FileNotFoundError(f"DCP checkpoint metadata is missing: {metadata_file}")
+    out_pt = Path(output_path).expanduser().resolve()
+    out_pt.parent.mkdir(parents=True, exist_ok=True)
+
+    dcp_prefix = "model_state.model."
+    prefixes = tuple(dcp_prefix + head for head in _POLICY_HEAD_PREFIXES)
+    with tempfile.TemporaryDirectory(prefix="gr_dcp_head_") as tmp_dir_str:
+        tmp_dir = Path(tmp_dir_str)
+        shutil.copyfile(metadata_file, tmp_dir / ".metadata")
+        reader = FileSystemReader(tmp_dir)
+        meta = reader.read_metadata()
+        max_end: dict[str, int] = {}
+        for key, item in meta.storage_data.items():
+            if key.fqn.startswith(prefixes):
+                max_end[item.relative_path] = max(
+                    max_end.get(item.relative_path, 0),
+                    item.offset + item.length,
+                )
+
+        def _copy_shard_prefix(rel_and_end: tuple[str, int]) -> None:
+            rel_path, end_offset = rel_and_end
+            with (ckpt_dir / rel_path).open("rb") as src, (tmp_dir / rel_path).open("wb") as dst:
+                dst.write(src.read(end_offset))
+
+        with ThreadPoolExecutor(max_workers=min(8, max(1, len(max_end)))) as executor:
+            list(executor.map(_copy_shard_prefix, sorted(max_end.items())))
+
+        entries = {
+            name[len(dcp_prefix):]: spec
+            for name, spec in meta.state_dict_metadata.items()
+            if name.startswith(prefixes) and isinstance(spec, TensorStorageMetadata)
+        }
+        if not entries:
+            raise ValueError(f"No policy head tensors found in {ckpt_dir}")
+        tensors = {
+            name: torch.empty(tuple(spec.size), dtype=spec.properties.dtype)
+            for name, spec in entries.items()
+        }
+        payload = {"model_state": {"model": tensors}}
+        load(payload, storage_reader=reader)
+        if not all(torch.isfinite(tensor).all().item() for tensor in tensors.values()):
+            raise RuntimeError(f"Exported policy head contains non-finite weights: {ckpt_dir}")
+        tmp_pt = tmp_dir / "policy_head.pt"
+        torch.save(payload, tmp_pt)
+        shutil.copy2(tmp_pt, out_pt)
+    return len(tensors)
+

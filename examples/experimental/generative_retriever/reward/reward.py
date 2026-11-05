@@ -1,7 +1,7 @@
 """HTTP reward hook for generative-retriever rollouts.
 
 Configure this module with ``--custom-rm-path
-examples.experimental.generative_retriever.reward.reward``.  The configured
+examples.experimental.generative_retriever.reward.reward.reward``.  The configured
 endpoint receives ``{"samples": [...]}`` and must return
 ``{"rewards": [float, ...]}`` with exactly one finite reward per input sample.
 """
@@ -17,8 +17,8 @@ from typing import Any
 from weakref import WeakKeyDictionary
 
 from miles.utils.types import Sample
-from examples.experimental.generative_retriever.relevance_reward import REWARD_MODES
-from examples.experimental.generative_retriever.reward_http import post_json_async
+from examples.experimental.generative_retriever.reward.relevance_reward import REWARD_MODES
+from examples.experimental.generative_retriever.reward.reward_http import post_json_async
 
 _MAX_REWARD_SAMPLES_PER_REQUEST = 2048
 _REWARD_BATCH_WAIT_SECONDS = 0.01
@@ -314,7 +314,7 @@ async def reward(args: Any, samples: Sample | list[Sample], **kwargs: Any) -> fl
     if not url:
         raise ValueError(
             "--generative-retriever-reward-url is required when using "
-            "examples.experimental.generative_retriever.reward.reward"
+            "examples.experimental.generative_retriever.reward.reward.reward"
         )
 
     batch = samples if isinstance(samples, list) else [samples]

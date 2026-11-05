@@ -5,7 +5,7 @@ module intentionally reuses the original SLMv3 model classes so checkpoint
 loading and generation stay aligned with training.
 
 Example:
-    python -m examples.experimental.generative_retriever.transformers_infer \
+    python -m examples.experimental.generative_retriever.model.transformers_infer \
         --checkpoint /path/to/checkpoint \
         --qwen-model /path/to/Qwen3-4B \
         --slm-root /path/to/SLMv3 \
@@ -21,8 +21,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .constrained_decode import PrefixConstraint, load_constraint
-from .model_loading import (
+from examples.experimental.generative_retriever.model.constrained_decode import PrefixConstraint, load_constraint
+from examples.experimental.generative_retriever.model.model_loading import (
     build_run_arguments,
     checkpoint_tensor_shape,
     import_slmv3,
@@ -73,7 +73,7 @@ class SLMv3Retriever:
         self.qwen_model = require_directory(qwen_model, "Qwen model")
         self.slm_root = require_directory(slm_root, "SLMv3 source")
         mapping = Path(id_mapping).expanduser().resolve()
-        if not mapping.is_file():
+        if not mapping.is_file() and not (mapping.is_dir() and (mapping / "docid_keywords.parquet").is_file()):
             raise FileNotFoundError(f"Official ID mapping is missing: {mapping}")
         _check_transformers_version(self.checkpoint)
 
