@@ -15,7 +15,7 @@ import logging
 import math
 import time
 from collections.abc import Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
@@ -33,8 +33,7 @@ from examples.experimental.generative_retriever.reward.relevance_model import (
     DEFAULT_KEYWORD_CACHE_SIZE,
     DEFAULT_QUERY_CACHE_SIZE,
     DEFAULT_SCORE_CACHE_SIZE,
-    RelevanceScorer,
-    load_relevance_pipeline_factory,
+    MultiGpuRelevanceScorer,
     resolve_relevance_source,
 )
 from examples.experimental.generative_retriever.reward.relevance_reward import (
@@ -184,20 +183,11 @@ class KeywordRewardEngine:
         self.docids_per_query = docids_per_query
         self._baseline_queries: set[str] = set()
         self.baselines: LRUCache[str, BaselineSets] = LRUCache(query_cache_size)
-        relevance_source = resolve_relevance_source(relevance_model)
-        pipeline_factory = load_relevance_pipeline_factory(relevance_source)
-
-        def _load_one(dev: str):
-            return pipeline_factory(
-                relevance_model, cup="large", device=dev, dtype="bf16",
-                batch_size=batch_size, cross_batch_size=_CROSS_BATCH_SIZE, show_progress=False,
-            )
-
-        with ThreadPoolExecutor(max_workers=len(self.devices)) as loader:
-            pipelines = list(loader.map(_load_one, self.devices))
-
-        self.scorer = RelevanceScorer(
-            pipelines,
+        self.scorer = MultiGpuRelevanceScorer(
+            relevance_model,
+            self.devices,
+            batch_size=batch_size,
+            cross_batch_size=_CROSS_BATCH_SIZE,
             feature_cache_size=query_cache_size,
             score_cache_size=score_cache_size,
             pair_batch_size=pair_batch_size,
@@ -207,7 +197,7 @@ class KeywordRewardEngine:
         self._baseline_inflight: dict[str, Future[BaselineSets]] = {}
         self._client = httpx.Client(
             timeout=300.0,
-            limits=httpx.Limits(max_connections=128, max_keepalive_connections=32),
+            limits=httpx.Limits(max_connections=128, max_keepalive_connections=0),
             trust_env=False,
         )
         self._step_additions: dict[tuple[int, int, int, int], list[str]] = {}
@@ -219,12 +209,7 @@ class KeywordRewardEngine:
         self,
         pairs: list[tuple[str, str]],
     ) -> tuple[dict[tuple[str, str], tuple[float, float]], dict[str, dict[str, int]]]:
-        with self._lock:
-            before = self._cache_stats()
-        scored = self.scorer.score(pairs)
-        with self._lock:
-            after = self._cache_stats()
-        return scored, self._cache_delta(before, after)
+        return self.scorer.score_with_deltas(pairs)
 
     def _cache_stats(self) -> dict[str, Any]:
         return {
@@ -575,6 +560,7 @@ class KeywordRewardEngine:
             }
 
     def close(self) -> None:
+        self.scorer.close()
         self._client.close()
 
 

@@ -18,6 +18,7 @@ _RETRYABLE_TRANSPORT = (
     httpx.RemoteProtocolError,
     httpx.ConnectError,
     httpx.ConnectTimeout,
+    httpx.TimeoutException,
 )
 
 

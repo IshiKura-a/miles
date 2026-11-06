@@ -7,6 +7,8 @@ from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 import importlib
 import logging
+import multiprocessing as mp
+from multiprocessing.connection import Connection
 import os
 import sys
 import time
@@ -114,6 +116,21 @@ def make_fast_single_chunk_gated_delta_rule(orig_fn):
     return _fast_rule
 
 
+def make_fast_rms_norm_gated(norm_mod: Any):
+    eps = float(getattr(norm_mod, "eps", getattr(norm_mod, "variance_epsilon", 1e-6)))
+
+    def _fast_norm(hidden_states: torch.Tensor, gate: torch.Tensor | None = None) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        hs_f32 = hidden_states.to(torch.float32)
+        variance = hs_f32.pow(2).mean(-1, keepdim=True)
+        normed = norm_mod.weight * (hs_f32 * torch.rsqrt(variance + eps)).to(input_dtype)
+        if gate is not None:
+            normed = normed * F.silu(gate.to(torch.float32))
+        return normed.to(input_dtype)
+
+    return _fast_norm
+
+
 def optimize_graphene_pipeline(pipeline: object) -> None:
     for attr in ("query_engine", "keyword_engine"):
         engine: Any = getattr(pipeline, attr, None)
@@ -130,6 +147,9 @@ def optimize_graphene_pipeline(pipeline: object) -> None:
                 orig_chunk = getattr(mod, "chunk_gated_delta_rule", None)
                 if callable(orig_chunk) and getattr(orig_chunk, "__name__", "") != "_fast_rule":
                     mod.chunk_gated_delta_rule = make_fast_single_chunk_gated_delta_rule(orig_chunk)
+                norm_mod = getattr(mod, "norm", None)
+                if norm_mod is not None and getattr(norm_mod.forward, "__name__", "") != "_fast_norm":
+                    norm_mod.forward = make_fast_rms_norm_gated(norm_mod)
 
 
 class RelevancePipeline(Protocol):
@@ -252,11 +272,11 @@ class GpuEmbeddingTable:
 
 
 class RelevanceScorer:
-    """Per-node multi-GPU in-VRAM relevance cache: node-wide L1 scores + k-hash sharded GPU tables."""
+    """Two-level in-VRAM GPU relevance cache: L1 (q, k) score cache + L2 (q_emb, k_emb) GPU tables."""
 
     def __init__(
         self,
-        pipeline: RelevancePipeline | Sequence[RelevancePipeline],
+        pipeline: RelevancePipeline,
         *,
         feature_cache_size: int = DEFAULT_QUERY_CACHE_SIZE,
         score_cache_size: int = DEFAULT_SCORE_CACHE_SIZE,
@@ -265,61 +285,34 @@ class RelevanceScorer:
     ) -> None:
         if pair_batch_size <= 0:
             raise ValueError("Relevance pair batch size must be positive")
-        pipelines = list(pipeline) if isinstance(pipeline, Sequence) else [pipeline]
-        if not pipelines:
-            raise ValueError("At least one RelevancePipeline is required")
-        for pipe in pipelines:
-            optimize_graphene_pipeline(pipe)
-        self.pipelines = pipelines
-        self.pipeline = pipelines[0]
-        self.num_gpus = len(pipelines)
+        optimize_graphene_pipeline(pipeline)
+        self.pipeline = pipeline
         self.pair_batch_size = pair_batch_size
-        per_gpu_q_cache = max(1024, feature_cache_size // self.num_gpus)
-        self.query_tables = [
-            GpuEmbeddingTable(per_gpu_q_cache, device=p.device, dtype=p.dtype)
-            for p in pipelines
-        ]
-        self.keyword_tables = [
-            GpuEmbeddingTable(keyword_cache_size, device=p.device, dtype=p.dtype)
-            for p in pipelines
-        ]
-        self._gpu_locks = [Lock() for _ in pipelines]
-        self._cache_lock = Lock()
-        self._executor = ThreadPoolExecutor(max_workers=self.num_gpus)
+        self.query_features = GpuEmbeddingTable(
+            feature_cache_size,
+            device=pipeline.device,
+            dtype=pipeline.dtype,
+        )
+        self.keyword_features = GpuEmbeddingTable(
+            keyword_cache_size,
+            device=pipeline.device,
+            dtype=pipeline.dtype,
+        )
         self.scores: LRUCache[tuple[str, str], tuple[float, float]] = LRUCache(
             score_cache_size
         )
 
-    @staticmethod
-    def _sum_table_stats(tables: list[GpuEmbeddingTable]) -> CacheStats:
-        stats = [t.stats() for t in tables]
-        return CacheStats(
-            capacity=sum(s.capacity for s in stats),
-            size=sum(s.size for s in stats),
-            hits=sum(s.hits for s in stats),
-            misses=sum(s.misses for s in stats),
-            evictions=sum(s.evictions for s in stats),
-        )
-
-    def query_feature_stats(self) -> CacheStats:
-        return self._sum_table_stats(self.query_tables)
-
-    def keyword_feature_stats(self) -> CacheStats:
-        return self._sum_table_stats(self.keyword_tables)
-
     @torch.no_grad()
-    def _encode_on_shard(
+    def _encode_gpu_table(
         self,
-        shard_idx: int,
         texts: list[str],
         *,
         query: bool,
-    ) -> tuple[torch.Tensor, dict[str, int]]:
-        pipe = self.pipelines[shard_idx]
-        table = self.query_tables[shard_idx] if query else self.keyword_tables[shard_idx]
-        slot_map, missing_texts, missing_slots, _ = table.lookup_and_reserve(texts)
+    ) -> tuple[torch.Tensor, dict[str, int], dict[str, int]]:
+        table = self.query_features if query else self.keyword_features
+        slot_map, missing_texts, missing_slots, delta = table.lookup_and_reserve(texts)
         if missing_texts:
-            engine = pipe.query_engine if query else pipe.keyword_engine
+            engine = self.pipeline.query_engine if query else self.pipeline.keyword_engine
             prefix = _QUERY_PREFIX if query else _KEYWORD_PREFIX
             pad_multiple = (
                 _KEYWORD_PAD_MULTIPLE
@@ -344,121 +337,439 @@ class RelevanceScorer:
             slot_tensor = torch.tensor(missing_slots, dtype=torch.long, device=storage.device)
             storage[slot_tensor] = encoded
         storage = table.ensure_storage(table.num_tokens, table.feature_dim)
-        return storage, slot_map
+        return storage, slot_map, delta
 
     @torch.no_grad()
-    def _encode_queries_sharded(self, queries: list[str]) -> dict[str, torch.Tensor]:
+    def encode_queries_cached(
+        self, queries: list[str],
+    ) -> tuple[dict[str, torch.Tensor], dict[str, int]]:
         unique_queries = list(dict.fromkeys(queries))
         if not unique_queries:
-            return {}
+            return {}, {"hits": 0, "misses": 0, "evictions": 0}
+        q_storage, q_map, q_delta = self._encode_gpu_table(unique_queries, query=True)
+        slots = torch.tensor([q_map[q] for q in unique_queries], dtype=torch.long, device=q_storage.device)
+        fetched = q_storage[slots].detach().cpu()
+        return (
+            {query: fetched[idx] for idx, query in enumerate(unique_queries)},
+            q_delta,
+        )
+
+    @torch.no_grad()
+    def _cross_score_gpu(
+        self,
+        q_embeds_gpu: torch.Tensor,
+        k_storage: torch.Tensor,
+        q_indices: list[int],
+        k_slots: list[int],
+    ) -> np.ndarray:
+        device = k_storage.device
+        q_idx = torch.tensor(q_indices, dtype=torch.long, device=device)
+        k_idx = torch.tensor(k_slots, dtype=torch.long, device=device)
+        cross_chunk = max(_CROSS_CHUNK_SIZE, int(self.pipeline.cross_batch_size))
+        scores_gpu: list[torch.Tensor] = []
+        for start in range(0, len(q_indices), cross_chunk):
+            end = start + cross_chunk
+            scores_gpu.append(
+                self.pipeline.cross_model(q_embeds_gpu[q_idx[start:end]], k_storage[k_idx[start:end]]).float()
+            )
+        all_scores = torch.cat(scores_gpu, dim=0)
+        if (
+            all_scores.shape != (len(q_indices), GRAPHENE_NUM_SCORE_HEADS)
+            or not bool(torch.isfinite(all_scores).all())
+            or not bool(((all_scores >= 0) & (all_scores <= 1)).all())
+        ):
+            raise RuntimeError("Official relevance model returned invalid scores")
+        return all_scores[:, 1:3].cpu().numpy()
+
+    @torch.no_grad()
+    def score_with_query_embeddings(
+        self,
+        query_embeddings: torch.Tensor,
+        keywords: list[str],
+        q_indices: list[int],
+        k_indices: list[int],
+    ) -> tuple[list[tuple[float, float]], dict[str, int]]:
+        if len(q_indices) != len(k_indices):
+            raise ValueError("q_indices and k_indices must have equal length")
+        if not q_indices:
+            return [], {"hits": 0, "misses": 0, "evictions": 0}
+        started = time.perf_counter()
+        q_gpu = query_embeddings.to(device=self.pipeline.device, dtype=self.pipeline.dtype)
+        phase = time.perf_counter()
+        k_storage, k_map, k_delta = self._encode_gpu_table(keywords, query=False)
+        keyword_seconds = time.perf_counter() - phase
+        mapped_k_slots = [k_map[kw] for kw in keywords]
+        pair_k_slots = [mapped_k_slots[i] for i in k_indices]
+        phase = time.perf_counter()
+        pm_sm = self._cross_score_gpu(
+            q_gpu,
+            k_storage,
+            q_indices,
+            pair_k_slots,
+        )
+        cross_seconds = time.perf_counter() - phase
+        results = [(float(row[0]), float(row[1])) for row in pm_sm]
+        logger.info(
+            "graphene_score_stage pairs=%d keywords=%d keyword_s=%.3f cross_s=%.3f total_s=%.3f",
+            len(q_indices), len(keywords), keyword_seconds, cross_seconds, time.perf_counter() - started,
+        )
+        return results, k_delta
+
+    def score(self, pairs: list[tuple[str, str]]) -> dict[tuple[str, str], tuple[float, float]]:
+        started = time.perf_counter()
+        resolved = {}
+        missing = []
+        for pair in dict.fromkeys(pairs):
+            score = self.scores.get(pair)
+            if score is None:
+                missing.append(pair)
+            else:
+                resolved[pair] = score
+        lookup_seconds = time.perf_counter() - started
+        query_seconds = keyword_seconds = cross_seconds = store_seconds = 0.0
+        for start in range(0, len(missing), self.pair_batch_size):
+            chunk = missing[start:start + self.pair_batch_size]
+            unique_queries = list(dict.fromkeys(query for query, _ in chunk))
+            unique_keywords = list(dict.fromkeys(keyword for _, keyword in chunk))
+            phase = time.perf_counter()
+            q_storage, q_map, _ = self._encode_gpu_table(unique_queries, query=True)
+            query_seconds += time.perf_counter() - phase
+            phase = time.perf_counter()
+            k_storage, k_map, _ = self._encode_gpu_table(unique_keywords, query=False)
+            keyword_seconds += time.perf_counter() - phase
+            phase = time.perf_counter()
+            pm_sm = self._cross_score_gpu(
+                q_storage,
+                k_storage,
+                [q_map[query] for query, _ in chunk],
+                [k_map[keyword] for _, keyword in chunk],
+            )
+            cross_seconds += time.perf_counter() - phase
+            phase = time.perf_counter()
+            for pair, row in zip(chunk, pm_sm, strict=True):
+                score = (float(row[0]), float(row[1]))
+                self.scores.put(pair, score)
+                resolved[pair] = score
+            store_seconds = time.perf_counter() - phase
+        logger.info(
+            "graphene_score_stage pairs=%d misses=%d lookup_s=%.3f query_s=%.3f "
+            "keyword_s=%.3f cross_s=%.3f store_s=%.3f total_s=%.3f",
+            len(pairs), len(missing), lookup_seconds, query_seconds, keyword_seconds,
+            cross_seconds, store_seconds, time.perf_counter() - started,
+        )
+        return resolved
+
+
+def _gpu_worker_loop(
+    conn: Connection,
+    relevance_model: str,
+    device: str,
+    batch_size: int,
+    cross_batch_size: int,
+    query_cache_size: int,
+    keyword_cache_size: int,
+    pair_batch_size: int,
+) -> None:
+    try:
+        if device.startswith("cuda:"):
+            torch.cuda.set_device(int(device.split(":", 1)[1]))
+        relevance_source = resolve_relevance_source(relevance_model)
+        factory = load_relevance_pipeline_factory(relevance_source)
+        pipeline = factory(
+            relevance_model,
+            cup="large",
+            device=device,
+            dtype="bf16",
+            batch_size=batch_size,
+            cross_batch_size=cross_batch_size,
+            show_progress=False,
+        )
+        scorer = RelevanceScorer(
+            pipeline,
+            feature_cache_size=query_cache_size,
+            score_cache_size=1024,
+            pair_batch_size=pair_batch_size,
+            keyword_cache_size=keyword_cache_size,
+        )
+        conn.send(("ready", None))
+        while True:
+            msg = conn.recv()
+            if msg is None:
+                break
+            cmd, payload = msg
+            if cmd == "encode_queries":
+                q_map, q_delta = scorer.encode_queries_cached(payload)
+                encoded_u16 = {
+                    q: t.contiguous().view(torch.uint16).numpy()
+                    for q, t in q_map.items()
+                }
+                conn.send(("ok", (encoded_u16, q_delta, scorer.query_features.stats())))
+            elif cmd == "score_pairs":
+                q_u16, keywords, q_indices, k_indices = payload
+                q_tensor = torch.from_numpy(q_u16).view(torch.bfloat16)
+                scores, k_delta = scorer.score_with_query_embeddings(
+                    q_tensor, keywords, q_indices, k_indices,
+                )
+                conn.send(("ok", (scores, k_delta, scorer.keyword_features.stats())))
+            elif cmd == "stats":
+                conn.send(("ok", (scorer.query_features.stats(), scorer.keyword_features.stats())))
+            else:
+                conn.send(("error", f"Unknown command: {cmd}"))
+    except BaseException as exc:
+        try:
+            conn.send(("error", f"{type(exc).__name__}: {exc}"))
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+
+
+class MultiGpuRelevanceScorer:
+    """Per-node multi-process GPU relevance scorer: node-wide L1 cache + 8 isolated GPU subprocesses."""
+
+    def __init__(
+        self,
+        relevance_model: str,
+        devices: Sequence[str],
+        *,
+        batch_size: int = 8192,
+        cross_batch_size: int = _CROSS_CHUNK_SIZE,
+        feature_cache_size: int = DEFAULT_QUERY_CACHE_SIZE,
+        score_cache_size: int = DEFAULT_SCORE_CACHE_SIZE,
+        pair_batch_size: int = DEFAULT_PAIR_BATCH_SIZE,
+        keyword_cache_size: int = DEFAULT_KEYWORD_CACHE_SIZE,
+    ) -> None:
+        if not devices:
+            raise ValueError("At least one GPU device is required")
+        self.devices = tuple(devices)
+        self.num_gpus = len(self.devices)
+        self.pair_batch_size = pair_batch_size
+        self.scores: LRUCache[tuple[str, str], tuple[float, float]] = LRUCache(
+            score_cache_size
+        )
+        self._cache_lock = Lock()
+        per_gpu_q_cache = max(2048, feature_cache_size // self.num_gpus)
+        self._q_capacity = per_gpu_q_cache * self.num_gpus
+        self._k_capacity = keyword_cache_size * self.num_gpus
+        self._q_stats = [
+            CacheStats(capacity=per_gpu_q_cache, size=0, hits=0, misses=0, evictions=0)
+            for _ in range(self.num_gpus)
+        ]
+        self._k_stats = [
+            CacheStats(capacity=keyword_cache_size, size=0, hits=0, misses=0, evictions=0)
+            for _ in range(self.num_gpus)
+        ]
+        ctx = mp.get_context("spawn")
+        self._executor = ThreadPoolExecutor(max_workers=self.num_gpus)
+        self._conns: list[Connection] = []
+        self._procs: list[Any] = []
+        self._conn_locks = [Lock() for _ in range(self.num_gpus)]
+        for dev in self.devices:
+            parent_conn, child_conn = ctx.Pipe(duplex=True)
+            proc = ctx.Process(
+                target=_gpu_worker_loop,
+                args=(
+                    child_conn,
+                    relevance_model,
+                    dev,
+                    batch_size,
+                    cross_batch_size,
+                    per_gpu_q_cache,
+                    keyword_cache_size,
+                    pair_batch_size,
+                ),
+                daemon=True,
+            )
+            proc.start()
+            child_conn.close()
+            self._conns.append(parent_conn)
+            self._procs.append(proc)
+        for idx, conn in enumerate(self._conns):
+            status, detail = conn.recv()
+            if status != "ready":
+                self.close()
+                raise RuntimeError(f"GPU subprocess {self.devices[idx]} failed to start: {detail}")
+
+    def _call_worker(self, shard_idx: int, cmd: str, payload: Any) -> Any:
+        with self._conn_locks[shard_idx]:
+            conn = self._conns[shard_idx]
+            conn.send((cmd, payload))
+            status, result = conn.recv()
+        if status != "ok":
+            raise RuntimeError(f"GPU subprocess {self.devices[shard_idx]} error: {result}")
+        return result
+
+    def query_feature_stats(self) -> CacheStats:
+        with self._cache_lock:
+            return CacheStats(
+                capacity=sum(s.capacity for s in self._q_stats),
+                size=sum(s.size for s in self._q_stats),
+                hits=sum(s.hits for s in self._q_stats),
+                misses=sum(s.misses for s in self._q_stats),
+                evictions=sum(s.evictions for s in self._q_stats),
+            )
+
+    def keyword_feature_stats(self) -> CacheStats:
+        with self._cache_lock:
+            return CacheStats(
+                capacity=sum(s.capacity for s in self._k_stats),
+                size=sum(s.size for s in self._k_stats),
+                hits=sum(s.hits for s in self._k_stats),
+                misses=sum(s.misses for s in self._k_stats),
+                evictions=sum(s.evictions for s in self._k_stats),
+            )
+
+    def _encode_queries_sharded(
+        self, queries: list[str],
+    ) -> tuple[dict[str, np.ndarray], dict[str, int]]:
+        unique_queries = list(dict.fromkeys(queries))
+        if not unique_queries:
+            return {}, {"hits": 0, "misses": 0, "evictions": 0}
         buckets: list[list[str]] = [[] for _ in range(self.num_gpus)]
         for q in unique_queries:
             buckets[xxhash.xxh64_intdigest(q) % self.num_gpus].append(q)
-
-        def _run_q_shard(shard_idx: int, shard_qs: list[str]) -> dict[str, torch.Tensor]:
-            with self._gpu_locks[shard_idx]:
-                q_storage, q_map = self._encode_on_shard(shard_idx, shard_qs, query=True)
-                slots = torch.tensor(
-                    [q_map[q] for q in shard_qs], dtype=torch.long, device=q_storage.device,
-                )
-                fetched = q_storage[slots].detach().cpu()
-                return {q: fetched[i] for i, q in enumerate(shard_qs)}
-
         futures = [
-            self._executor.submit(_run_q_shard, idx, bucket)
+            (idx, self._executor.submit(self._call_worker, idx, "encode_queries", bucket))
             for idx, bucket in enumerate(buckets)
             if bucket
         ]
-        result: dict[str, torch.Tensor] = {}
-        for future in futures:
-            result.update(future.result())
-        return result
+        q_embeds: dict[str, np.ndarray] = {}
+        q_delta_total = {"hits": 0, "misses": 0, "evictions": 0}
+        for idx, future in futures:
+            encoded_u16, q_delta, q_stat = future.result()
+            q_embeds.update(encoded_u16)
+            for key in ("hits", "misses", "evictions"):
+                q_delta_total[key] += q_delta[key]
+            with self._cache_lock:
+                self._q_stats[idx] = q_stat
+        return q_embeds, q_delta_total
 
-    @torch.no_grad()
     def _score_k_shard(
         self,
         shard_idx: int,
         shard_pairs: list[tuple[str, str]],
-        query_embeddings: dict[str, torch.Tensor],
-    ) -> dict[tuple[str, str], tuple[float, float]]:
-        pipe = self.pipelines[shard_idx]
-        unique_qs = list(dict.fromkeys(q for q, _ in shard_pairs))
-        q_to_idx = {q: i for i, q in enumerate(unique_qs)}
-        q_cpu = torch.stack([query_embeddings[q] for q in unique_qs], dim=0)
-        unique_ks = list(dict.fromkeys(k for _, k in shard_pairs))
-        with self._gpu_locks[shard_idx]:
-            q_gpu = q_cpu.to(device=pipe.device, dtype=pipe.dtype)
-            k_storage, k_map = self._encode_on_shard(shard_idx, unique_ks, query=False)
-            q_indices = [q_to_idx[q] for q, _ in shard_pairs]
-            k_slots = [k_map[k] for _, k in shard_pairs]
-            device = k_storage.device
-            q_idx = torch.tensor(q_indices, dtype=torch.long, device=device)
-            k_idx = torch.tensor(k_slots, dtype=torch.long, device=device)
-            cross_chunk = max(_CROSS_CHUNK_SIZE, int(pipe.cross_batch_size))
-            scores_gpu: list[torch.Tensor] = []
-            for start in range(0, len(shard_pairs), cross_chunk):
-                end = start + cross_chunk
-                scores_gpu.append(
-                    pipe.cross_model(q_gpu[q_idx[start:end]], k_storage[k_idx[start:end]]).float()
-                )
-            all_scores = torch.cat(scores_gpu, dim=0)
-            if (
-                all_scores.shape != (len(shard_pairs), GRAPHENE_NUM_SCORE_HEADS)
-                or not bool(torch.isfinite(all_scores).all())
-                or not bool(((all_scores >= 0) & (all_scores <= 1)).all())
-            ):
-                raise RuntimeError("Official relevance model returned invalid scores")
-            pm_sm = all_scores[:, 1:3].cpu().numpy()
-        return {
-            pair: (float(row[0]), float(row[1]))
-            for pair, row in zip(shard_pairs, pm_sm, strict=True)
-        }
+        query_embeddings: dict[str, np.ndarray],
+    ) -> tuple[dict[tuple[str, str], tuple[float, float]], dict[str, int]]:
+        q_map: dict[str, int] = {}
+        k_map: dict[str, int] = {}
+        q_arrays: list[np.ndarray] = []
+        keywords: list[str] = []
+        q_indices: list[int] = []
+        k_indices: list[int] = []
+        for q, k in shard_pairs:
+            qi = q_map.get(q)
+            if qi is None:
+                qi = len(q_arrays)
+                q_map[q] = qi
+                q_arrays.append(query_embeddings[q])
+            ki = k_map.get(k)
+            if ki is None:
+                ki = len(keywords)
+                k_map[k] = ki
+                keywords.append(k)
+            q_indices.append(qi)
+            k_indices.append(ki)
+        q_u16 = np.stack(q_arrays, axis=0)
+        scores, k_delta, k_stat = self._call_worker(
+            shard_idx, "score_pairs", (q_u16, keywords, q_indices, k_indices),
+        )
+        with self._cache_lock:
+            self._k_stats[shard_idx] = k_stat
+        return dict(zip(shard_pairs, scores, strict=True)), k_delta
 
-    def score(self, pairs: list[tuple[str, str]]) -> dict[tuple[str, str], tuple[float, float]]:
+    def score_with_deltas(
+        self, pairs: list[tuple[str, str]],
+    ) -> tuple[dict[tuple[str, str], tuple[float, float]], dict[str, dict[str, int]]]:
         started = time.perf_counter()
+        zero_counter = {"hits": 0, "misses": 0, "evictions": 0}
         unique_pairs = list(dict.fromkeys(pairs))
+        if not unique_pairs:
+            return {}, {
+                "baseline": dict(zero_counter),
+                "reward": dict(zero_counter),
+                "query_features": dict(zero_counter),
+                "keyword_features": dict(zero_counter),
+            }
         resolved: dict[tuple[str, str], tuple[float, float]] = {}
         missing: list[tuple[str, str]] = []
+        r_hits = r_misses = 0
         with self._cache_lock:
             for pair in unique_pairs:
                 score = self.scores.get(pair)
                 if score is None:
                     missing.append(pair)
+                    r_misses += 1
                 else:
                     resolved[pair] = score
+                    r_hits += 1
+        if not missing:
+            return resolved, {
+                "baseline": dict(zero_counter),
+                "reward": {"hits": r_hits, "misses": 0, "evictions": 0},
+                "query_features": dict(zero_counter),
+                "keyword_features": dict(zero_counter),
+            }
         lookup_seconds = time.perf_counter() - started
-        query_seconds = keyword_seconds = store_seconds = 0.0
-        if missing:
-            phase = time.perf_counter()
-            q_embeds = self._encode_queries_sharded([q for q, _ in missing])
-            query_seconds = time.perf_counter() - phase
-            phase = time.perf_counter()
-            buckets: list[list[tuple[str, str]]] = [[] for _ in range(self.num_gpus)]
+        phase = time.perf_counter()
+        q_embeds, q_delta = self._encode_queries_sharded([q for q, _ in missing])
+        query_seconds = time.perf_counter() - phase
+        phase = time.perf_counter()
+        buckets: list[list[tuple[str, str]]] = [[] for _ in range(self.num_gpus)]
+        for pair in missing:
+            buckets[xxhash.xxh64_intdigest(pair[1]) % self.num_gpus].append(pair)
+        futures = [
+            self._executor.submit(self._score_k_shard, idx, bucket, q_embeds)
+            for idx, bucket in enumerate(buckets)
+            if bucket
+        ]
+        newly_scored: dict[tuple[str, str], tuple[float, float]] = {}
+        k_delta_total = {"hits": 0, "misses": 0, "evictions": 0}
+        for future in futures:
+            shard_scores, shard_k_delta = future.result()
+            newly_scored.update(shard_scores)
+            for key in ("hits", "misses", "evictions"):
+                k_delta_total[key] += shard_k_delta[key]
+        keyword_seconds = time.perf_counter() - phase
+        phase = time.perf_counter()
+        with self._cache_lock:
+            evictions_before = self.scores.stats().evictions
             for pair in missing:
-                buckets[xxhash.xxh64_intdigest(pair[1]) % self.num_gpus].append(pair)
-            futures = [
-                self._executor.submit(self._score_k_shard, idx, bucket, q_embeds)
-                for idx, bucket in enumerate(buckets)
-                if bucket
-            ]
-            newly_scored: dict[tuple[str, str], tuple[float, float]] = {}
-            for future in futures:
-                newly_scored.update(future.result())
-            keyword_seconds = time.perf_counter() - phase
-            phase = time.perf_counter()
-            with self._cache_lock:
-                for pair in missing:
-                    score = newly_scored[pair]
-                    self.scores.put(pair, score)
-                    resolved[pair] = score
-            store_seconds = time.perf_counter() - phase
+                score = newly_scored[pair]
+                self.scores.put(pair, score)
+                resolved[pair] = score
+            r_evictions = self.scores.stats().evictions - evictions_before
+        store_seconds = time.perf_counter() - phase
         logger.info(
             "graphene_score_stage pairs=%d misses=%d gpus=%d lookup_s=%.3f query_s=%.3f "
             "keyword_cross_s=%.3f store_s=%.3f total_s=%.3f",
             len(pairs), len(missing), self.num_gpus, lookup_seconds, query_seconds,
             keyword_seconds, store_seconds, time.perf_counter() - started,
         )
+        return resolved, {
+            "baseline": dict(zero_counter),
+            "reward": {"hits": r_hits, "misses": r_misses, "evictions": r_evictions},
+            "query_features": q_delta,
+            "keyword_features": k_delta_total,
+        }
+
+    def score(self, pairs: list[tuple[str, str]]) -> dict[tuple[str, str], tuple[float, float]]:
+        resolved, _ = self.score_with_deltas(pairs)
         return resolved
+
+    def close(self) -> None:
+        self._executor.shutdown(wait=True)
+        for conn in self._conns:
+            try:
+                conn.send(None)
+                conn.close()
+            except Exception:
+                pass
+        for proc in self._procs:
+            if proc.is_alive():
+                proc.join(timeout=10)
+            if proc.is_alive():
+                proc.terminate()
 
 
 def _validate_source(path: Path) -> Path:
