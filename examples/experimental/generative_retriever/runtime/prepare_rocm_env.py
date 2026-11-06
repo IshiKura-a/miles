@@ -67,6 +67,18 @@ _AITER_CHERRYPICKS = (
     "7b481fbcaf834ce98b66004ea329c2ca2bba87d7",
     "24a62b1c122f23645a19b9d8b0abd4750c59359b",
 )
+_MI300X_MEMORY_GIB = 191.45
+_MIN_CONCURRENT_QUERIES_PER_GPU = 64
+_MIN_KV_TOKENS = 32768
+_QWEN3_4B_NUM_LAYERS = 36
+_QWEN3_4B_KV_HEADS = 8
+_QWEN3_4B_HEAD_DIM = 128
+_MIN_MEM_FRACTION = 0.15
+_MAX_MEM_FRACTION = 0.70
+MIN_QUERY_CACHE_SIZE = 16384
+MIN_SCORE_CACHE_SIZE = 1048576
+MAX_SCORE_CACHE_SIZE = 8388608
+MAX_KEYWORD_CACHE_SIZE = 8388608
 
 
 def _run(argv: list[str], *, cwd: Path = _REPO, env: dict[str, str] | None = None) -> None:
@@ -90,20 +102,20 @@ def derive_sglang_mem_fraction(
     elif torch.cuda.is_available():
         gpu_gib = float(torch.cuda.get_device_properties(0).total_memory) / float(2**30)
     else:
-        gpu_gib = 191.45
+        gpu_gib = _MI300X_MEMORY_GIB
     concurrent_queries_per_gpu = max(
-        64,
+        _MIN_CONCURRENT_QUERIES_PER_GPU,
         math.ceil(
             (sglang_server_concurrency / max(1, n_samples_per_prompt))
             / max(1, rollout_num_gpus)
         ),
     )
-    kv_tokens = max(32768, 4 * concurrent_queries_per_gpu * max_prompt_tokens)
-    kv_bytes_per_token = 36 * 2 * 8 * 128 * 2
+    kv_tokens = max(_MIN_KV_TOKENS, 4 * concurrent_queries_per_gpu * max_prompt_tokens)
+    kv_bytes_per_token = _QWEN3_4B_NUM_LAYERS * 2 * _QWEN3_4B_KV_HEADS * _QWEN3_4B_HEAD_DIM * 2
     kv_gib = (kv_tokens * kv_bytes_per_token) / (2**30)
     model_and_workspace_gib = 5.5 + 4.0 + (0.01 * n_samples_per_prompt)
     fraction = (model_and_workspace_gib + kv_gib) / max(1.0, gpu_gib)
-    return round(min(0.70, max(0.15, fraction)), 3)
+    return round(min(_MAX_MEM_FRACTION, max(_MIN_MEM_FRACTION, fraction)), 3)
 
 
 def derive_reward_cache_sizes(
@@ -111,16 +123,18 @@ def derive_reward_cache_sizes(
     n_samples_per_prompt: int,
     num_workers: int,
     *,
-    baseline_top_k: int = 64,
     mean_keywords_per_docid: float = 6.7,
 ) -> tuple[int, int, int]:
     queries_per_worker = max(1, math.ceil(rollout_batch_size / max(1, num_workers)))
-    query_cache = max(16384, _next_pow2(4 * queries_per_worker))
+    query_cache = max(MIN_QUERY_CACHE_SIZE, _next_pow2(4 * queries_per_worker))
     pairs_per_worker = int(
-        math.ceil(2.0 * queries_per_worker * (n_samples_per_prompt + baseline_top_k) * mean_keywords_per_docid)
+        math.ceil(4.0 * queries_per_worker * n_samples_per_prompt * mean_keywords_per_docid)
     )
-    score_cache = min(8388608, max(131072, _next_pow2(pairs_per_worker)))
-    keyword_cache = min(4194304, max(16384, _next_pow2(score_cache // 2)))
+    score_cache = min(MAX_SCORE_CACHE_SIZE, max(MIN_SCORE_CACHE_SIZE, _next_pow2(pairs_per_worker)))
+    keyword_cache = min(
+        MAX_KEYWORD_CACHE_SIZE,
+        max(MIN_QUERY_CACHE_SIZE, _next_pow2(pairs_per_worker)),
+    )
     return query_cache, keyword_cache, score_cache
 
 

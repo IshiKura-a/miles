@@ -26,11 +26,15 @@ from examples.experimental.generative_retriever.reward.relevance_model import (
     load_relevance_pipeline_factory,
     resolve_relevance_source,
 )
-from examples.experimental.generative_retriever.reward.relevance_reward import PM_THRESHOLD, SM_THRESHOLD
+from examples.experimental.generative_retriever.reward.relevance_reward import (
+    MAX_DOCIDS_PER_QUERY,
+    PM_THRESHOLD,
+    SM_THRESHOLD,
+)
 
 class GoodCountSample(BaseModel):
     query: str
-    docids: Annotated[list[PositionalID], Field(min_length=1, max_length=64)]
+    docids: Annotated[list[PositionalID], Field(min_length=1, max_length=MAX_DOCIDS_PER_QUERY)]
 
     @field_validator("query")
     @classmethod
@@ -84,7 +88,7 @@ class GoodCountPool:
                     device=device,
                     dtype="bf16",
                     batch_size=batch_size,
-                    cross_batch_size=256,
+                    cross_batch_size=8192,
                     show_progress=False,
                 )),
                 lock=Lock(),

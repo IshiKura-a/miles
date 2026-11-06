@@ -26,6 +26,7 @@ import httpx
 
 from examples.experimental.generative_retriever.eval.good_count_eval import run as run_good_count_eval
 from examples.experimental.generative_retriever.model.model_loading import export_policy_head_checkpoint
+from examples.experimental.generative_retriever.reward.relevance_reward import DEFAULT_EVAL_GROUP_SIZE
 from examples.experimental.generative_retriever.runtime.prepare_rocm_env import build_service_env
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -63,9 +64,9 @@ class EvalConfig:
     )
     generator_devices: str = _DEFAULT_GENERATOR_DEVICES
     scorer_devices: str = _DEFAULT_SCORER_DEVICES
-    batch_size: int = 64
+    batch_size: int = DEFAULT_EVAL_GROUP_SIZE
     scorer_batch_size: int = 256
-    docids_per_query: int = 64
+    docids_per_query: int = DEFAULT_EVAL_GROUP_SIZE
     score_head: Literal["sm", "pm"] = "pm"
     mapping_port: int = _MAPPING_PORT
     generator_port: int = _GENERATOR_PORT
@@ -358,9 +359,9 @@ def main() -> None:
     )
     parser.add_argument("--generator-devices", default=_DEFAULT_GENERATOR_DEVICES)
     parser.add_argument("--scorer-devices", default=_DEFAULT_SCORER_DEVICES)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_EVAL_GROUP_SIZE)
     parser.add_argument("--scorer-batch-size", type=int, default=256)
-    parser.add_argument("--docids-per-query", type=int, default=64)
+    parser.add_argument("--docids-per-query", type=int, default=DEFAULT_EVAL_GROUP_SIZE)
     parser.add_argument("--score-head", choices=("sm", "pm"), default="pm")
     parser.add_argument("--mapping-port", type=int, default=_MAPPING_PORT)
     parser.add_argument("--generator-port", type=int, default=_GENERATOR_PORT)

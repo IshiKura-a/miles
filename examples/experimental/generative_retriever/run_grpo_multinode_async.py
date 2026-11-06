@@ -38,6 +38,13 @@ from ray._private.node import Node
 from ray._private.parameter import RayParams
 
 from examples.experimental.generative_retriever import run_grpo
+from examples.experimental.generative_retriever.reward.relevance_reward import (
+    DEFAULT_REWARD_BATCH_SIZE,
+    DEFAULT_TRAIN_GROUP_SIZE,
+    PROMPT_DATASET_ROWS,
+    REWARD_PAIR_BATCH_SIZE,
+    REWARD_TOWER_BATCH_SIZE,
+)
 from examples.experimental.generative_retriever.runtime.prepare_rocm_env import (
     derive_reward_cache_sizes,
     derive_sglang_mem_fraction,
@@ -45,6 +52,13 @@ from examples.experimental.generative_retriever.runtime.prepare_rocm_env import 
 from examples.experimental.generative_retriever.runtime.prepare_sglang_bundle import (
     prepare_bundle,
     require_sglang_abort_patch,
+)
+from examples.experimental.generative_retriever.services.baseline_service import (
+    BASELINE_CACHE_SIZE,
+    BASELINE_SERVICE_API_VERSION,
+)
+from examples.experimental.generative_retriever.services.mapping_service import (
+    MAPPING_SERVICE_API_VERSION,
 )
 from miles.utils.external_utils.command_utils import create_run_id
 
@@ -58,10 +72,9 @@ _ROUTER_PORT = 31593
 _RAY_PORT = 16380
 _SERVICE_TIMEOUT = 3600
 
-_PROMPT_DATASET_ROWS = 15_000_000
+_PROMPT_DATASET_ROWS = PROMPT_DATASET_ROWS
 _QUERIES_PER_STEP_PER_PAIR = 8000
-_SAMPLES_PER_PROMPT = 512
-_BASELINE_TOP_K = 64
+_SAMPLES_PER_PROMPT = DEFAULT_TRAIN_GROUP_SIZE
 _GLOBAL_BATCH_SIZE_PER_PAIR = _QUERIES_PER_STEP_PER_PAIR * _SAMPLES_PER_PROMPT
 _REWARD_WORKERS_PER_PAIR = len(_REWARD_PORTS)
 _ROLLOUT_GPUS_PER_PAIR = 4
@@ -202,11 +215,10 @@ def _recipe(run_id: str, pairs: int, num_rollout: int) -> run_grpo.ScriptArgs:
     max_rollouts = _MAX_STEPS_PER_PAIR // pairs
     if not 1 <= num_rollout <= max_rollouts:
         raise ValueError(f"num-rollout must be between 1 and {max_rollouts}")
-    _, kw_cache, score_cache = derive_reward_cache_sizes(
+    query_cache, kw_cache, score_cache = derive_reward_cache_sizes(
         _QUERIES_PER_STEP_PER_PAIR * pairs,
         _SAMPLES_PER_PROMPT,
         _REWARD_WORKERS_PER_PAIR * pairs,
-        baseline_top_k=_BASELINE_TOP_K,
     )
     mem_fraction = derive_sglang_mem_fraction(
         _SGLANG_CONCURRENCY_PER_PAIR * pairs,
@@ -228,6 +240,7 @@ def _recipe(run_id: str, pairs: int, num_rollout: int) -> run_grpo.ScriptArgs:
         reward_timeout=1800,
         reward_request_concurrency=_REWARD_WORKERS_PER_PAIR * pairs,
         prepare_concurrency=pairs,
+        reward_query_cache_size=query_cache,
         reward_keyword_cache_size=kw_cache,
         reward_score_cache_size=score_cache,
     )
@@ -365,17 +378,15 @@ def _mapping_service(mapping: Path, head_ip: str) -> tuple[str, bool]:
     if (
         health.get("status") != "ready"
         or health.get("mapping_version") != mapping.name
-        or health.get("rows") != 238_836_331
-        or health.get("bytes") != mapping.stat().st_size
         or not isinstance(config, dict)
-        or config.get("api_version") != 1
+        or config.get("api_version") != MAPPING_SERVICE_API_VERSION
         or not isinstance(config.get("mapping"), str)
     ):
         raise RuntimeError(f"Resident mapping at {resident_url} does not match the documented mapping")
     resident_path = Path(config["mapping"]).resolve()
-    if not resident_path.is_file():
-        raise FileNotFoundError(f"Resident mapping file is missing: {resident_path}")
     if resident_path != mapping:
+        if not resident_path.is_file() or not mapping.is_file():
+            raise RuntimeError(f"Resident mapping path differs from {mapping}: {resident_path}")
         original = (mapping.stat().st_size, mapping.stat().st_mtime_ns)
         resident = (resident_path.stat().st_size, resident_path.stat().st_mtime_ns)
         if not filecmp.cmp(resident_path, mapping, shallow=False):
@@ -528,17 +539,17 @@ def _start_baseline(
     mapping = manifest["mapping"]
     expected: dict[str, object] = {
         "status": "ready",
-        "worker_count": 4,
-        "docids_per_query": 64,
+        "worker_count": _ROLLOUT_GPUS_PER_PAIR,
+        "docids_per_query": _SAMPLES_PER_PROMPT,
         "service_config": {
-            "api_version": 2,
+            "api_version": BASELINE_SERVICE_API_VERSION,
             "checkpoint": manifest["checkpoint"],
             "qwen_model": manifest["qwen_model"],
             "slm_root": manifest["slm_root"],
             "id_mapping": mapping,
-            "devices": [f"cuda:{gpu}" for gpu in range(4)],
-            "cache_size": 8192,
-            "docids_per_query": 64,
+            "devices": [f"cuda:{gpu}" for gpu in range(_ROLLOUT_GPUS_PER_PAIR)],
+            "cache_size": BASELINE_CACHE_SIZE,
+            "docids_per_query": _SAMPLES_PER_PROMPT,
         },
     }
     url = f"http://{host}:{_BASELINE_PORT}/health"
@@ -552,7 +563,7 @@ def _start_baseline(
             "--checkpoint", manifest["checkpoint"],
             "--qwen-model", manifest["qwen_model"],
             "--slm-root", manifest["slm_root"],
-            "--id-mapping", mapping, "--docids-per-query", "64",
+            "--id-mapping", mapping, "--docids-per-query", str(_SAMPLES_PER_PROMPT),
             "--devices", "cuda:0,cuda:1,cuda:2,cuda:3",
         ],
         gpus="0,1,2,3", persistent=True,
@@ -574,14 +585,22 @@ def _service_node(manifest: Manifest, index: int) -> None:
     try:
         baseline = _start_baseline(processes, manifest, host)
         reward_health = []
-        _, kw_cache, score_cache = derive_reward_cache_sizes(
-            _QUERIES_PER_STEP_PER_PAIR * (len(manifest["hosts"]) // 2),
+        pairs = len(manifest["hosts"]) // 2
+        query_cache, kw_cache, score_cache = derive_reward_cache_sizes(
+            _QUERIES_PER_STEP_PER_PAIR * pairs,
             _SAMPLES_PER_PROMPT,
-            _REWARD_WORKERS_PER_PAIR * (len(manifest["hosts"]) // 2),
-            baseline_top_k=_BASELINE_TOP_K,
+            _REWARD_WORKERS_PER_PAIR * pairs,
         )
+        peer_urls = [
+            f"http://{peer_host}:{peer_port}/score"
+            for peer_host in manifest["addresses"][::2]
+            for peer_port in _REWARD_PORTS
+        ]
+        peer_urls_csv = ",".join(peer_urls)
+        pair_index = index // 2
         for gpu, port in enumerate(_REWARD_PORTS):
             name = f"reward-{gpu}"
+            global_worker_idx = pair_index * len(_REWARD_PORTS) + gpu
             _start_service(
                 processes, name, "reward_service", host, port,
                 [
@@ -589,9 +608,15 @@ def _service_node(manifest: Manifest, index: int) -> None:
                     "--mapping-url", manifest["mapping_url"],
                     "--mapping-version", Path(mapping).name,
                     "--relevance-model", manifest["relevance_model"],
-                    "--batch-size", "8192", "--pair-batch-size", "32768",
-                    "--baseline-top-k", "64", "--max-samples-per-request", "2048",
-                    "--keyword-cache-size", str(kw_cache), "--score-cache-size", str(score_cache),
+                    "--batch-size", str(REWARD_TOWER_BATCH_SIZE),
+                    "--pair-batch-size", str(REWARD_PAIR_BATCH_SIZE),
+                    "--docids-per-query", str(_SAMPLES_PER_PROMPT),
+                    "--max-samples-per-request", str(DEFAULT_REWARD_BATCH_SIZE),
+                    "--query-cache-size", str(query_cache),
+                    "--keyword-cache-size", str(kw_cache),
+                    "--score-cache-size", str(score_cache),
+                    "--peer-urls", peer_urls_csv,
+                    "--self-worker-index", str(global_worker_idx),
                 ],
                 gpus=str(gpu),
             )
@@ -601,7 +626,8 @@ def _service_node(manifest: Manifest, index: int) -> None:
                     "baseline_url": f"http://{host}:{_BASELINE_PORT}/generate",
                     "mapping_url": manifest["mapping_url"],
                     "relevance_model": manifest["relevance_model"],
-                    "max_samples_per_request": 2048,
+                    "docids_per_query": _SAMPLES_PER_PROMPT,
+                    "max_samples_per_request": DEFAULT_REWARD_BATCH_SIZE,
                 },
             }))
         if baseline is not None:
@@ -681,7 +707,9 @@ def _prepare_node_assets(manifest: Manifest) -> None:
         slm_root=manifest["slm_root"],
         id_mapping=manifest["mapping"],
         output=run_dir / "sglang_bundle",
-        num_beams=64, num_return_sequences=64, temperature=1.0,
+        num_beams=_SAMPLES_PER_PROMPT,
+        num_return_sequences=_SAMPLES_PER_PROMPT,
+        temperature=1.0,
         decoding_mode="beam_sample",
     )
     for name in ("config.json", "tokenizer.json", "pytorch_model.bin.index.json"):
@@ -747,17 +775,17 @@ def _check_remote_sources(manifest: Manifest) -> None:
         if patch_check.returncode:
             raise RuntimeError(f"SGLang embedding abort patch is missing on {host}: {patch_check.stderr.strip()}")
         required = (
-            (run_dir / "manifest.json", False),
-            (run_dir / "sglang_bundle/config.json", False),
-            (Path(manifest["prompt_source"]), False),
-            (Path(manifest["mapping"]), False),
-            (Path(sys.executable), True),
-            (_REPO / ".venv/activate-rocm.sh", False),
+            (run_dir / "manifest.json", "f"),
+            (run_dir / "sglang_bundle/config.json", "f"),
+            (Path(manifest["prompt_source"]), "f"),
+            (Path(manifest["mapping"]), "e"),
+            (Path(sys.executable), "x"),
+            (_REPO / ".venv/activate-rocm.sh", "f"),
         )
-        for file, executable in required:
+        for file, test_flag in required:
             probe = subprocess.run(
                 ["ssh", "-o", "BatchMode=yes", host,
-                 f"test -{'x' if executable else 'f'} {shlex.quote(str(file))}"],
+                 f"test -{test_flag} {shlex.quote(str(file))}"],
                 capture_output=True, text=True,
             )
             if probe.returncode == 1:
@@ -862,7 +890,8 @@ def _run(manifest: Manifest) -> None:
             processes, "reward-router", "reward_router_service",
             manifest["head_ip"], _ROUTER_PORT,
             ["--worker-urls", ",".join(worker_urls),
-             "--max-samples-per-request", "2048", "--forward-concurrency", "1"],
+             "--max-samples-per-request", str(DEFAULT_REWARD_BATCH_SIZE),
+             "--forward-concurrency", "1"],
         )
         os.environ.update(manifest["runtime_env"])
         head = Node(
@@ -908,13 +937,12 @@ def _run(manifest: Manifest) -> None:
             _wait_health(
                 processes, manifest["head_ip"], "mapping", _MAPPING_PORT,
                 {"mapping_version": Path(manifest["mapping"]).name,
-                 "bytes": Path(manifest["mapping"]).stat().st_size,
                  "service_config": {"mapping": manifest["mapping"]}},
             )
         for index, host in enumerate(manifest["addresses"][::2]):
             _wait_health(
                 processes, host, f"baseline-{index}", _BASELINE_PORT,
-                {"worker_count": 4, "docids_per_query": 64},
+                {"worker_count": 4, "docids_per_query": _SAMPLES_PER_PROMPT},
             )
             for port in _REWARD_PORTS:
                 _wait_health(

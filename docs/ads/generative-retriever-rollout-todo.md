@@ -44,9 +44,10 @@ python3 -m examples.experimental.generative_retriever.runtime.prepare_rocm_env \
 - GR 输出为四段 RQ semantic doc ID。
 - Baseline 使用原始 Stage5 checkpoint，训练期间不更新。
 - 训练默认学习率为 `2e-6`，使用 constant schedule。
-- 训练 rollout 每 query 使用 constrained 64-beam 无放回采样（`beam_sample`）；
-  冻结 baseline 和离线评测每 query 各使用确定性 constrained top-64 beam。
-- 使用 SLMGR_dev 的 constrained decoder（`infer_mode=2`）与固定版本官方 ID 映射。
+- **Group Size 对齐协议**：
+  - **训练阶段**：Rollout（constrained `beam_sample` 无放回采样）与冻结 Baseline（确定性 constrained top-$K$ beam）的 group size **永远保持一致**（默认 `DEFAULT_TRAIN_GROUP_SIZE = 512`）。
+  - **离线评测阶段**：Policy 与冻结 Baseline 的确定性 constrained top-$K$ beam group size **永远保持一致**（默认 `DEFAULT_EVAL_GROUP_SIZE = 64`，支持最高 `512`）。
+- 使用 SLMGR_dev 的 constrained decoder（`infer_mode=2`）与统一列式 ID 映射（或固定版本 TSV 映射）。
 - Baseline 比较集合按 PM（≥ 0.58）与 SM（≥ 0.82）分别构建 $B_{\text{PM}}(q)$ 和
   $B_{\text{SM}}(q)$；两侧 unique 分别按候选文本是否属于对应集合判定。
 
@@ -164,17 +165,17 @@ uv run --env-file .env python -m examples.experimental.generative_retriever.inde
 | PM | 1 | 0.58 |
 | SM | 2 | 0.82 |
 
-Baseline 比较集合：
+Baseline 比较集合（训练期 $K = 512$，评测期默认 $K = 64$，始终与同阶段被测模型一致）：
 
 ```text
-I_64(q) = frozen_original_GR_constrained_top64_doc_ids(q)
-B_PM(q) = {k | k 对应 I_64(q) 中的某个 ID，s_PM(q,k) >= 0.58}
-B_SM(q) = {k | k 对应 I_64(q) 中的某个 ID，s_SM(q,k) >= 0.82}
+I_K(q) = frozen_original_GR_constrained_topK_doc_ids(q)
+B_PM(q) = {k | k 对应 I_K(q) 中的某个 ID，s_PM(q,k) >= 0.58}
+B_SM(q) = {k | k 对应 I_K(q) 中的某个 ID，s_SM(q,k) >= 0.82}
 U_PM(q,k) = 1[k not in B_PM(q)]
 U_SM(q,k) = 1[k not in B_SM(q)]
 ```
 
-### 统一 relevance 和分头 unique 权重
+### 统一 relevance、分头 unique 权重与同 Query 词频折减
 
 ```text
 P = 1[s_PM >= 0.58]
@@ -182,14 +183,16 @@ S = 1[s_SM >= 0.82]
 W_PM = clip(s_PM / 0.58, 0, 1)
 W_SM = clip(s_SM / 0.82, 0, 1)
 Q = (W_PM + W_SM) / 2
-pm_unique_bonus = 0.5 * U_PM * P * Q
-sm_unique_bonus = 0.5 * U_SM * S * Q
+c_q(k) = max(1, count_of_rollout_docids_under_q_containing_k)
+pm_unique_bonus = (UNIQUE_WEIGHT * 0.5 / c_q(k)) * U_PM * P * Q
+sm_unique_bonus = (UNIQUE_WEIGHT * 0.5 / c_q(k)) * U_SM * S * Q
 unique_bonus = pm_unique_bonus + sm_unique_bonus
 ```
 
-- PM / SM unique bonus 分别在该头过阈值且 keyword 不属于对应 baseline 集合时生效，
-  并乘跨头连续质量因子 `Q`（对单过 SM 的新词提供把 PM 推向 `0.58` 的连续梯度）；
-  单头 bonus 最大为 `0.5`，总 `unique_bonus` 最大为 `1`，两种 reward mode 的范围均为 `[0,3]`。
+- `UNIQUE_WEIGHT = 2.0`：PM / SM unique bonus 分别在该头过阈值且 keyword 不属于对应
+  baseline 集合时生效，乘跨头连续质量因子 `Q`，并按该词在同一 query 的 rollout group
+  中出现的 doc ID 频次 $c_q(k)$ 做 $1/c_q(k)$ 折减（抑制多个 doc ID 映射到同一热门词的重复刷分）。
+- 单头 bonus 最大为 `1.0`，总 `unique_bonus` 最大为 `2.0`，两种 reward mode 的单 keyword 范围均为 `[0,4]`。
 - 实现在 [relevance_reward.py](../../examples/experimental/generative_retriever/reward/relevance_reward.py)。
 
 ### `discrete_relevance_unique`
@@ -210,10 +213,21 @@ R_continuous = continuous_base + unique_bonus
 
 - 阈值以下的 relevance 提供连续 shaping signal；训练中作为 shadow metric 汇报。
 
-### Doc ID reward
+### Doc ID reward、4 层前缀树 Credit Assignment 与耦合 `doc2k` 更新
 
-两种模式均对同一个 doc ID 对应的去重 keyword reward 取算术平均：
-`R_docid = mean(R_keyword)`。GRPO 使用各 doc ID reward 计算组内 advantage。
+- **Doc ID Reward（带 `DOCID_REWARD_FLOOR = 25` 下界）**：
+  对同一个 doc ID $d$ 对应的去重 keyword 集合 $K(d)$ 取带分母下界的平均：
+  `R_docid(q, d) = sum_{k in K(d)} R_keyword(q, k) / max(|K(d)|, 25)`。
+- **4 层 RQ 前缀树 Credit Assignment**（[rollout_metrics.py](../../examples/experimental/generative_retriever/reward/rollout_metrics.py)）：
+  在同一 query 的 rollout group 内计算标准化 leaf advantage $A_{\text{leaf}}(d)$ 后，
+  按 4 层 RQ 前缀树自底向上聚合子树 `top-k` 均值（`TREE_CREDIT_TOP_K = (8, 4, 2)`，
+  分别对应 depth 3 / 2 / 1），并以每层权重 `TREE_CREDIT_LEVEL_WEIGHT = 0.25` 分配到 4 个
+  decoder token 位置。
+- **耦合 `doc2k` 在线动态映射更新**：
+  每个 rollout step 结束时，各 reward worker 通过 `/harvest_step_delta` 汇总本步的动态映射增量并提交至 `mapping_service`（`/update`）：
+  1. **Tail-to-Head 注入**：将尾部（rank > `DOC2K_HEAD_RANK_CUTOFF = 64`）命中的 unique good keywords 注入头部 doc ID（每 query 最多 `DOC2K_MAX_ADDS_PER_QUERY = 8` 个，单 doc ID 词数上限 `DOCID_MAX_KEYWORDS = 150`）；
+  2. **Dead Keyword 裁剪**：对单步至少被 `DOC2K_PRUNE_MIN_QUERIES = 5` 个不同 query 召回且词数超过 `DOCID_REWARD_FLOOR = 25` 的 doc ID，裁剪本步 0 次过阈值的死词（保留至少 25 个词）。
+  同时，Baseline `/prepare` 始终查询初始静态映射（`use_initial=True`），保证 $B(q)$ 参照系固定不变。
 
 GRPO launcher 以 `--reward-mode` 指定训练模式，HTTP reward 请求用 `reward_mode`；
 默认 `discrete_relevance_unique`。W&B 汇报 PM/SM 原始分数、pass、threshold
@@ -247,31 +261,32 @@ HTTP reward hook 对每个 sample 返回一个 doc ID 的平均 keyword reward�
 ### Rollout 配置
 
 - [constrained_decode.py](../../examples/experimental/generative_retriever/model/constrained_decode.py)
-  使用当前映射的 ID 前缀约束。Baseline 为确定性 top-64 beam，训练 rollout 为
-  constrained 64-beam 无放回采样（`decoding_mode="beam_sample"`，每 query 返回 64 个
+  使用当前映射的 ID 前缀约束。训练阶段 Baseline 为确定性 top-512 beam，训练 rollout 为
+  constrained 512-beam 无放回采样（`decoding_mode="beam_sample"`，每 query 返回 512 个
   互不重复的有效 doc ID 及 4 个 decoder token logprob）。
 - Rollout 经 SGLang router 的 `/v1/embeddings` 返回 token 和 logprob；
   同一 query group 只分词一次并共享生成请求，并行准备 reward baseline。Prepare 请求
-  每 10ms 合并，最多 512 个 query；learner 使用同一前缀约束计算 logprob。
-- Rollout engine 使用两卡 DP=2、`mem-fraction-static=0.7`；
-  `sglang-server-concurrency=4096` 可同时容纳 64 个完整的 64-sample query group。
+  每 10ms 合并，最多 512 个 query；learner 使用同一前缀约束在 GPU 上向量化构造 response mask 并计算 logprob。
+- 单机 Rollout engine 使用两卡 DP=2，`sglang-server-concurrency=8192`，
+  `mem-fraction-static` 按并发与 group size 自适应推导（约 `0.15`）。
   Launcher 检查 mapping、baseline 和 reward 服务的 `/health`，
   复用配置一致的常驻服务。
 
-### 训练规模
+### 训练规模（单机 8 卡）
 
-- `n_samples_per_prompt=64`。
-- 每轮处理 `65536 / 64 = 1024` 个 query，即 `rollout_batch_size=1024`。
+- `n_samples_per_prompt=512`（Rollout 与 Baseline 统一使用该 group size）。
+- 每轮处理 `2048000 / 512 = 4000` 个 query，即 `rollout_batch_size=4000`。
 - Prompt dataset 为 2026-04-01 的 `Part0.json`，包含 15,000,000 条记录；
   在 run 目录通过 `.jsonl` 符号链接接入，按固定 seed shuffle。
-- 1,000 个 rollout 各消费 1,024 条记录，合计 1,024,000 条记录
-  （约 0.068 epoch）；源数据中的 query 文本可重复。
+- `3,750` 个 rollout 各消费 `4,000` 条记录，恰好覆盖全部 `15,000,000` 条记录（1.0 epoch）；
+  源数据中的 query 文本可重复。
 - 已完成的 batch 清理多余推理请求时，取消响应不会使训练中断；
   SGLang 对被取消的 embedding 请求返回明确的 503。
   在 batch 尚未完成时，现有 rollout 仍会记录失败 group 并另取 query
   补足；这不等同于对原始数据精确遍历，须单独处理，不能宣称已修复。
-- `global_batch_size=65536`，每次 rollout 恰好形成一个 training step。
-- Learner 使用动态 token batching，每卡每 microbatch 上限 33,024 tokens；
+- `global_batch_size=2048000`，每次 rollout 恰好形成一个 training step。
+- Learner 使用动态 token batching（`--use-dynamic-batch-size`，`max_tokens_per_gpu=131072`，
+  保持每个 query 的 512 个连续 sample 不被打散以最大化 prompt 去重效率）；
   冻结 Qwen encoder 使用 backbone 的 last hidden state。
 - 每 20 个 training step 保存 checkpoint，最终 step 也保存；包括 model、
   optimizer、LR scheduler、RNG 及 rollout 数据位置。
@@ -316,16 +331,16 @@ uv run --env-file .env python -m examples.experimental.generative_retriever.run_
   top-1/top-2 gap 和 zero-std group 比例；GRPO 同时汇报 advantage
   absolute mean/max。
 
-### GPU 分配
+### GPU 分配（单机 8 卡）
 
-当前单机 recipe 使用 8 卡，角色如下：
+当前单机 recipe 使用 8 卡，角色如下（GPU 0-1 专供 FSDP Learner 以避免 AllGather/ReduceScatter 集合通信受干扰，GPU 2-7 共 6 张卡并行承载常驻 Relevance Reward Workers）：
 
 | 物理 GPU | 角色 | 数量 |
 | --- | --- | --- |
-| 0-1 | learner / train | 2 |
-| 2-3 | train rollout inference | 2 |
-| 4-5 | frozen baseline constrained beam | 2 |
-| 6-7 | relevance reward | 2 |
+| 0-1 | learner / train（独占） | 2 |
+| 2-3 | train rollout inference（与 reward worker 0-1 共卡） | 2 |
+| 4-5 | frozen baseline constrained beam（与 reward worker 2-3 共卡） | 2 |
+| 2-7 | relevance reward workers（端口 `30490..30495`） | 6 |
 
 Launcher 设置各服务的 GPU visibility；离线评测与训练使用不同的
 生成和评分端口。
@@ -343,18 +358,15 @@ uv run python -m examples.experimental.generative_retriever.services.mapping_ser
   --host 127.0.0.1 --port 30488
 ```
 
-- `POST /lookup` 返回 ID 对应的去重 keyword 列表；支持可选 `market` 参数
-  （如 `"en-us"`、`"ja-jp"`、`"NA"`），在返回前按 `keyword_id` 的允许 market 集合过滤。
-- `POST /update` 支持在内存中直接增量更新或全量替换 `docid -> keyword_ids` 的 CSR 映射，
-  训练期间无需从磁盘重新读取；`POST /save` 将内存中的最新动态映射写出为新的
-  `docid_keywords.parquet` 与 CSR `.npy` 快照。
+- `POST /lookup` 返回 ID 对应的去重 keyword 列表；支持 `use_initial=True` 查询初始静态映射（供 Baseline `/prepare` 使用），并支持可选 `market` 参数过滤。
+- `POST /update` 支持在内存中直接增量更新或全量替换 `docid -> keyword_ids` 的动态映射（单 doc ID 最多保留 `DOCID_MAX_KEYWORDS = 150` 个词），训练期间无需从磁盘重新读取；`POST /save` 将内存中的最新动态映射写出为快照。
 - 客户端 [lookup_service](../../examples/experimental/generative_retriever/index/id_text_mapping.py)
-  按最多 4,096 个不同 ID 分批请求（可传入 `market`）；服务地址 `http://127.0.0.1:30488`。
+  按最多 4,096 个不同 ID 分批请求；服务地址 `http://127.0.0.1:30488`。
 
 ### 常驻 baseline 服务
 
 [baseline_service.py](../../examples/experimental/generative_retriever/services/baseline_service.py)
-在 GPU 4-5 各加载一份冻结原始 GR，使用当前映射前缀树执行 64-beam。
+在 GPU 4-5 各加载一份冻结原始 GR，使用初始静态映射前缀树执行确定性 constrained top-$K$ beam（训练期默认 `--docids-per-query 512`，与 rollout `n_samples_per_prompt` 一致）。
 
 ```bash
 CUDA_VISIBLE_DEVICES=4,5 uv run python -m \
@@ -362,86 +374,40 @@ CUDA_VISIBLE_DEVICES=4,5 uv run python -m \
   --checkpoint /path/to/stage5 \
   --qwen-model /path/to/qwen \
   --slm-root /path/to/SLMv3 \
-  --id-mapping "$cosmos_data_path/local/User/zihao/online_rl/gr_offline_syn/index/globalindex1_latest_ta_listing_20261019/asiindex_mapping.ta_listing.tsv" \
+  --id-mapping "$cosmos_data_path/local/User/zihao/online_rl/gr_offline_syn/index/slmgrv3_part25_na_intl_20261028_20261029" \
+  --docids-per-query 512 \
   --port 30487
 ```
 
-- `POST /generate` 每次最多 512 个 query，每个 query 返回 64 个不同有效 ID
+- `POST /generate` 每次最多 512 个 query，每个 query 返回 `docids_per_query` 个不同有效 ID
   及四段 token logprob；完整 query group 缓存在 8,192 条 LRU 中。
 
-### 常驻 reward 服务
+### 常驻 reward 服务与二级缓存（L1 Score Cache + L2 $q$/$k$ GPU Embedding Tables）
 
 [reward_service.py](../../examples/experimental/generative_retriever/services/reward_service.py)
-是单 GPU worker。GPU 6 和 7 各运行一个隔离进程，分别缓存 baseline set、
-query/keyword feature 和 query-keyword 分数；[reward_router_service.py](../../examples/experimental/generative_retriever/services/reward_router_service.py)
-在 CPU 上按 query 做 rendezvous hashing，并恢复输入 sample 顺序。
-Baseline cache miss 时 worker 调用常驻 baseline 服务生成同样数量的 ID，
-经 mapping 服务展开并评分后在线构建 `B(q)`。
+是单 GPU worker。单机在 GPU 2–7 上运行 6 个隔离进程（端口 `30490..30495`），
+多机在每台服务节点的 GPU 0–7 上运行 8 个隔离进程（端口 `31583..31590`）。
+[reward_router_service.py](../../examples/experimental/generative_retriever/services/reward_router_service.py)
+按 query 做 rendezvous hashing（`q-hash`），将同一 query 的 `/prepare` 和 `/score` 固定路由到同一个所属 worker，并采用 **二级缓存 + $q$–$k$ 解耦架构**：
 
-```bash
-CUDA_VISIBLE_DEVICES=6 uv run python -m \
-  examples.experimental.generative_retriever.services.reward_service \
-  --baseline-url http://127.0.0.1:30487/generate \
-  --mapping-url http://127.0.0.1:30488 \
-  --mapping-version asiindex_mapping.ta_listing.tsv \
-  --relevance-model "$cosmos_data_path/local/User/yugao/share/qualitymodel/GCQC/GV2.1/ForArcher/Large/" \
-  --port 30490
+1. **一级缓存（L1 Score Cache，`--score-cache-size`）**：
+   - 在 `q-hash` 所属 worker 上缓存 `(q, k) -> (pm_score, sm_score)`。
+   - 同一个 query 在 `/prepare`（Baseline 512 个 doc ID 打分）与 `/score`（Rollout 512 个 doc ID 打分）之间重叠的 `(q, k)` 对、同一 query 跨多个 `/score` 批次的重复词、以及数据集中的重复高频 query 直接在 L1 命中返回，零 GPU 计算、零跨卡 RPC。
+2. **二级缓存（L2 Decoupled GPU Embedding Tables，`--query-cache-size` + `--keyword-cache-size`）**：
+   - 仅当 `(q, k)` 在 L1 未命中时触发，使用预分配在 GPU HBM 显存中的 `bfloat16` `[capacity, 2, 128]` 张量表（[GpuEmbeddingTable](../../examples/experimental/generative_retriever/reward/relevance_model.py)）：
+     - **`query_features`（`--query-cache-size`）**：按 `q-hash` 常驻在所属 worker 显存中（每条仅 `512 Bytes`），Baseline `/prepare` 编码一次 $q$ 后，后续 Rollout `/score` 直接在显存中 $O(1)$ 复用 `q_emb`；
+     - **`keyword_features`（`--keyword-cache-size`）**：按 `xxhash64(k) % num_workers`（`k-hash`）在所有 reward worker 显存间全局分片（每卡最高 `8,388,608` 条仅占 `4.0 GiB` HBM，单机 6 卡合并不重复缓存 `5,033 万`条唯一 keyword 向量，双机 8 卡合并缓存 `6,710 万`条）。
+   - `q-hash` worker 将 L1 miss 的 `(q, k)` 按 `k-hash` 分桶，只把 `512 Bytes` 的 `q_emb` 和 `k` 发送给对应的 peer worker（`/score_pairs`）；peer worker 无需运行 `query_engine`，只需查/编码本地 `keyword_features` 显存表并执行 GPU `cross_model(q_emb, k_emb)`，结果写回 L1 `score_cache`。
 
-CUDA_VISIBLE_DEVICES=7 uv run python -m \
-  examples.experimental.generative_retriever.services.reward_service \
-  <同一模型和服务参数> --port 30491
-
-uv run python -m examples.experimental.generative_retriever.services.reward_router_service \
-  --worker-urls http://127.0.0.1:30490/score,http://127.0.0.1:30491/score \
-  --port 30489
-```
-
-- `POST /prepare` 接收最多 512 个 query，准备 baseline 集合与 relevance 缓存；
-  `POST /score` 每次接收最多 2,048 个 sample，包含 `prompt`、四个
-  `docid_tokens` 和 `reward_mode`，
-  返回 reward、逐 keyword 明细及 cache 指标。
-- Router 按 query 做 rendezvous hashing；worker 使用 2,048 条 keyword 的
-  tower batch，最多 8,192 个 query-keyword pair 一块；cross scorer
-  每批 256 对。Query/keyword tower batch 必须为 4 的倍数，末批补齐到 4 的倍数，
-  以保持评分不随请求大小变化。
-  Baseline 与两侧 feature 各缓存 8,192 条，pair score
-  缓存 131,072 条。
-- Rollout hook 在 10ms 窗口合并最多 2,048 个 sample，训练 HTTP 超时默认 1,200 秒；
-  日志分别记录 prepare 和 score 请求的数量与平均服务时延。
-  训练 reward URL 为 `http://127.0.0.1:30489/score`。
-  Worker 日志的 `reward_baseline_stage`、`reward_score_stage` 和
-  `graphene_score_stage` 分别记录 baseline 生成、映射、tower/cross 评分、
-  请求锁等待与聚合耗时；router 日志记录转发耗时。不输出 query/keyword 原文，
-  用于区分模型计算和 HTTP/CPU 排队瓶颈。
-
-### 两机 16 GPU reward 配置
-
-两机 16×MI300X 使用
-8 learner、4 rollout、4 frozen baseline、8 reward worker（其中 4 个与
-rollout 同卡）。先前的两机吞吐测试每步使用 4,096 query × 64 sample；以下
-正式全量训练为精确遍历 15,000,000 条数据，改用 4,000 query × 64 sample。
-Reward 配置为
-每个 `/score` 请求最多 2,048 sample、客户端并发 8、router 每 worker
-转发并发 1、prepare 并发 1；baseline 模型和 reward 定义不变。
-首轮完整 rollout 中，最后一个 `/prepare` 到最后一个 `/score` 的间隔
-从客户端并发 1 时约 58–59 秒降至并发 8 时的 2.2 秒。
-
-### 多机异步 GRPO：2n × 8 GPU
+### 两机 16 GPU 与多机 `2n × 8` GPU 异步 GRPO 配置
 
 [run_grpo_multinode_async.py](../../examples/experimental/generative_retriever/run_grpo_multinode_async.py)
-是 Git 仓库内的多机入口，底层执行 **`train_async.py`**（Train N 与 Rollout N+1
-重叠），而非 `train.py`。不依赖 `local/` 中的实验脚本或复制的模型/数据：
-Stage5、Qwen、relevance、训练集和当前 TAListing 映射均取上表固定原始路径；
-reward 定义、64-beam constrained beam-sample rollout、`2e-6` constant LR 和每步权重同步保持不变。
+是 Git 仓库内的多机入口，底层执行 **`train_async.py`**（Train N 与 Rollout N+1 重叠）。
+`--hosts` 按「服务/rollout 节点、learner 节点」依次成对排列；每个节点 8 卡，总计 `2n` 台：
 
-`--hosts` 按「服务/rollout 节点、learner 节点」依次成对排列；每个节点 8 卡，
-总计 `2n` 台。每对分配 8 learner、4 rollout、4 frozen baseline 和
-8 reward worker；rollout 与对应服务节点的 4 个 reward worker 共用 GPU 4–7。
-learner/rollout 的 Ray bundle 分别固定到对应节点 IP，避免 Ray 按 IP 排序
-误分配训练卡；角色 IP 由入口从 `--hosts` 推导并在内部传递，无需额外
-CLI 参数。每步 `4000n` query × 64 sample，`global_batch_size=256000n`，
-learner token budget 每卡 `524288`。完整遍历的 optimizer step 数为
-`3750/n`；当 `3750` 不能被 `n` 整除时拒绝启动，不隐式复用或丢弃数据。
+- 每对节点（16 卡）分配 8 learner（节点 `2k+1` 的 GPU 0–7）、4 rollout（节点 `2k` 的 GPU 4–7）、4 frozen baseline（节点 `2k` 的 GPU 0–3）和 8 reward worker（节点 `2k` 的 GPU 0–7）。
+- 每步处理 **`8000n` query × `512` sample**（两机 16 卡即 `8,000` query/step，`global_batch_size = 4,096,000n`）。
+- 完整遍历 `15,000,000` 条数据的 optimizer step 数为 **`1875/n`**；当 `1875` 不能被 `n` 整除时拒绝启动，不隐式复用或丢弃数据。
 支持 `--num-rollout` 指定不超过该上限的短验收步骤；正式训练省略此参数。
 此精确遍历前提是每轮无请求或 group 失败；否则现有 rollout 会
 跳过失败 group 并补取 query，不能将运行结果视为精确遍历。
@@ -484,7 +450,7 @@ uv run --no-sync --env-file .env python -m \
   examples.experimental.generative_retriever.run_grpo_multinode_async \
   --hosts node-0,node-1 --run-id <run_id> --dry-run
 
-# 两机 16 卡：4000 query/step × 3750 step = 1500 万条。
+# 两机 16 卡：8000 query/step × 1875 step = 1500 万条。
 uv run --no-sync --env-file .env python -m \
   examples.experimental.generative_retriever.run_grpo_multinode_async \
   --hosts node-0,node-1 --run-id <run_id>
@@ -494,10 +460,10 @@ uv run --no-sync --env-file .env python -m \
   examples.experimental.generative_retriever.run_grpo_multinode_async \
   --hosts node-0,node-1 --run-id <run_id> --resume
 
-# 四机 32 卡举例：8000 query/step × 1875 step = 1500 万条。
+# 六机 48 卡（n=3）举例：24000 query/step × 625 step = 1500 万条。
 uv run --no-sync --env-file .env python -m \
   examples.experimental.generative_retriever.run_grpo_multinode_async \
-  --hosts node-0,node-1,node-2,node-3 --run-id <another_run_id>
+  --hosts node-0,node-1,node-2,node-3,node-4,node-5 --run-id <another_run_id>
 ```
 
 全局 reward score 请求并发为 `8n`、prepare 并发为 `n`，每个 worker
@@ -519,9 +485,8 @@ uv run --no-sync --env-file .env python -m \
   （`queries.jsonl` SHA-256 为 `d36822a89c715a73281af87118bfde972516f3183f99ef6646a82585cf1ce732`；
   早期单机存档评测曾使用同一 seed 抽取的 1,000-query 子集，SHA-256 为
   `ebfb9943bfb58ab0e354dafbfd00fc17729c500d4810231e90d680697185dc1a`）。
-- Frozen baseline 与 policy checkpoint 均使用当前 Global TAListing 映射
-  `asiindex_mapping.ta_listing.tsv`、同一 Qwen3-4B 编码器与确定性 constrained
-  top-64 beam（每 query 返回 64 个不同有效 ID）；映射展开后按 keyword 原文精确匹配、
+- Frozen baseline 与 policy checkpoint 均使用同一映射、同一 Qwen3-4B 编码器与确定性 constrained
+  top-$K$ beam（默认 `--docids-per-query 64`，最高支持 `512`，且同一次评测中 Policy 与 Baseline 的 `docids_per_query` 必须严格一致）；映射展开后按 keyword 原文精确匹配、
   大小写敏感去重。
 - 评测目录结构为
   `$cosmos_data_path/local/User/zihao/online_rl/gr_offline_syn/<run_id>/eval/valid_100k_10k_top64_step<step>/`，

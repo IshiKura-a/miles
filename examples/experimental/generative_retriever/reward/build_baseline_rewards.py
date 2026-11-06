@@ -27,7 +27,7 @@ from examples.experimental.generative_retriever.reward.relevance_model import (
     resolve_relevance_source,
 )
 from examples.experimental.generative_retriever.reward.relevance_reward import (
-    BASELINE_TOP_K, DOCID_REWARD_FLOOR, PM_THRESHOLD, SM_THRESHOLD, REWARD_MODES, RewardMode,
+    DEFAULT_TRAIN_GROUP_SIZE, DOCID_REWARD_FLOOR, PM_THRESHOLD, SM_THRESHOLD, REWARD_MODES, RewardMode,
     build_baseline_set, calculate_docid_reward, calculate_keyword_rewards,
 )
 
@@ -37,13 +37,14 @@ logger = logging.getLogger(__name__)
 def _build_query(
     query_record, pipeline, mapping_url: str, mapping_version: str, destination: Path,
     reward_mode: RewardMode = "discrete_relevance_unique",
+    docids_per_query: int = DEFAULT_TRAIN_GROUP_SIZE,
 ):
     query = query_record["query"]
     if not isinstance(query, str) or not query.strip():
         raise ValueError("Baseline query must be a non-empty string")
     ids = [tuple(code) for code in query_record["baseline_codes"]]
-    if len(ids) != BASELINE_TOP_K or len(set(ids)) != BASELINE_TOP_K:
-        raise ValueError(f"Official baseline must contain exactly {BASELINE_TOP_K} distinct doc IDs")
+    if len(ids) != docids_per_query or len(set(ids)) != docids_per_query:
+        raise ValueError(f"Official baseline must contain exactly {docids_per_query} distinct doc IDs")
     mapping = lookup_service(mapping_url, ids, expected_mapping_version=mapping_version)
     keyword_ids = {}
     for docid, keywords in mapping.items():

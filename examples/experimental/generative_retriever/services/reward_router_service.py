@@ -21,16 +21,21 @@ from examples.experimental.generative_retriever.services.reward_service import (
     RewardRequest,
     reward_request_model,
 )
+from examples.experimental.generative_retriever.reward.relevance_reward import (
+    DEFAULT_REWARD_BATCH_SIZE,
+    DOCID_MAX_KEYWORDS,
+)
 from examples.experimental.generative_retriever.reward.reward_http import post_json_sync
 
-_SERVICE_API_VERSION = 6
+REWARD_ROUTER_API_VERSION = 6
+_SERVICE_API_VERSION = REWARD_ROUTER_API_VERSION
 logger = logging.getLogger(__name__)
 
 
 class RewardRouter:
     def __init__(
         self, worker_urls: tuple[str, ...], *,
-        max_samples_per_request: int = 2048, forward_concurrency: int = 1,
+        max_samples_per_request: int = DEFAULT_REWARD_BATCH_SIZE, forward_concurrency: int = 1,
     ) -> None:
         if not worker_urls or len(set(worker_urls)) != len(worker_urls):
             raise ValueError("Reward router requires distinct worker URLs")
@@ -207,7 +212,7 @@ class RewardRouter:
         delta_payload = {
             "additions": [{"docid": list(k), "keywords": v} for k, v in merged_adds.items()],
             "removals": [{"docid": list(k), "keywords": v} for k, v in merged_rems.items()],
-            "k_max": 150,
+            "k_max": DOCID_MAX_KEYWORDS,
         }
         result = post_json_sync(
             self._client,

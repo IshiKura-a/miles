@@ -19,14 +19,20 @@ from pydantic import BaseModel, Field, field_validator
 from examples.experimental.generative_retriever.services.lru_cache import LRUCache
 from examples.experimental.generative_retriever.model.model_loading import load_policy_head_checkpoint
 from examples.experimental.generative_retriever.model.transformers_infer import GenerationResult, SLMv3Retriever
+from examples.experimental.generative_retriever.reward.relevance_reward import (
+    DEFAULT_TRAIN_GROUP_SIZE,
+    MAX_DOCIDS_PER_QUERY,
+)
 
 logger = logging.getLogger(__name__)
-_SERVICE_API_VERSION = 2
-_CACHE_SIZE = 8192
+BASELINE_SERVICE_API_VERSION = 2
+BASELINE_CACHE_SIZE = 8192
+_SERVICE_API_VERSION = BASELINE_SERVICE_API_VERSION
+_CACHE_SIZE = BASELINE_CACHE_SIZE
 
 
 class BaselineRequest(BaseModel):
-    queries: Annotated[list[str], Field(min_length=1, max_length=512)]
+    queries: Annotated[list[str], Field(min_length=1, max_length=MAX_DOCIDS_PER_QUERY)]
 
     @field_validator("queries")
     @classmethod
@@ -163,7 +169,7 @@ def create_app(
     qwen_model: str,
     slm_root: str,
     id_mapping: str,
-    docids_per_query: int = 64,
+    docids_per_query: int = DEFAULT_TRAIN_GROUP_SIZE,
     devices: tuple[str, ...] = ("cuda:0", "cuda:1"),
     policy_checkpoint: str | None = None,
 ) -> FastAPI:
@@ -227,7 +233,7 @@ def main() -> None:
     parser.add_argument("--qwen-model", required=True)
     parser.add_argument("--slm-root", required=True)
     parser.add_argument("--id-mapping", required=True)
-    parser.add_argument("--docids-per-query", type=int, default=64)
+    parser.add_argument("--docids-per-query", type=int, default=DEFAULT_TRAIN_GROUP_SIZE)
     parser.add_argument("--devices", default="cuda:0,cuda:1")
     parser.add_argument("--policy-checkpoint")
     parser.add_argument("--host", default="127.0.0.1")

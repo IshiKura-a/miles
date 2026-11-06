@@ -14,6 +14,11 @@ import subprocess
 import sys
 
 from examples.experimental.generative_retriever.model.model_loading import require_directory
+from examples.experimental.generative_retriever.reward.relevance_reward import (
+    DEFAULT_TRAIN_GROUP_SIZE,
+    RQ_CODE_DIM,
+    RQ_CODE_NUM,
+)
 
 
 def require_sglang_abort_patch() -> None:
@@ -55,8 +60,8 @@ def prepare_bundle(
     output: str | Path,
     slm_root: str | Path,
     id_mapping: str | Path,
-    num_beams: int = 64,
-    num_return_sequences: int = 64,
+    num_beams: int = DEFAULT_TRAIN_GROUP_SIZE,
+    num_return_sequences: int = DEFAULT_TRAIN_GROUP_SIZE,
     temperature: float = 1.0,
     decoding_mode: str = "beam_sample",
 ) -> Path:
@@ -86,8 +91,8 @@ def prepare_bundle(
     config["architectures"] = ["GRQwen3ForDocIDGeneration"]
     config["gr_config"] = {
         **gr_config,
-        "docid_size": 4,
-        "docid_dim": 256,
+        "docid_size": RQ_CODE_NUM,
+        "docid_dim": RQ_CODE_DIM,
         "temperature": temperature,
         "slm_root": str(slm_path),
         "id_mapping": str(mapping_path),
@@ -135,8 +140,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True)
     parser.add_argument("--slm-root", required=True)
     parser.add_argument("--id-mapping", required=True)
-    parser.add_argument("--num-beams", type=int, default=64)
-    parser.add_argument("--num-return-sequences", type=int, default=64)
+    parser.add_argument("--num-beams", type=int, default=DEFAULT_TRAIN_GROUP_SIZE)
+    parser.add_argument("--num-return-sequences", type=int, default=DEFAULT_TRAIN_GROUP_SIZE)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument(
         "--decoding-mode",

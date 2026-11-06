@@ -27,9 +27,11 @@ from examples.experimental.generative_retriever.index.id_text_mapping import (
     pack_docid_u32,
     validate_docid,
 )
+from examples.experimental.generative_retriever.reward.relevance_reward import DOCID_MAX_KEYWORDS
 
 logger = logging.getLogger(__name__)
-_SERVICE_API_VERSION = 2
+MAPPING_SERVICE_API_VERSION = 2
+_SERVICE_API_VERSION = MAPPING_SERVICE_API_VERSION
 _NA_LOCALE_ALIASES = frozenset({"NA", "EN-US", "EN-CA", "ES-US", "FR-CA"})
 
 
@@ -87,7 +89,7 @@ class UpdateMappingRequest(BaseModel):
 class DeltaMappingRequest(BaseModel):
     additions: list[DocidKeywordTextPair] = Field(default_factory=list)
     removals: list[DocidKeywordTextPair] = Field(default_factory=list)
-    k_max: int = 150
+    k_max: int = DOCID_MAX_KEYWORDS
 
 
 class SaveMappingRequest(BaseModel):

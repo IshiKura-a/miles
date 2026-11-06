@@ -15,16 +15,24 @@ import httpx
 from miles.rollout.base_types import GenerateFnInput, GenerateFnOutput
 from miles.utils.http_utils import GeneralHttpClientProvider
 from miles.utils.types import Sample
-from examples.experimental.generative_retriever.reward.relevance_reward import REWARD_MODES
+from examples.experimental.generative_retriever.reward.relevance_reward import (
+    DEFAULT_REWARD_BATCH_SIZE,
+    DOCID_TOKEN_OFFSET,
+    MAX_DOCIDS_PER_QUERY,
+    QUERY_MAX_TOKENS,
+    REWARD_MODES,
+    RQ_CODE_DIM,
+    RQ_CODE_NUM,
+)
 from examples.experimental.generative_retriever.reward.reward_http import post_json_async
 
 _REQUESTS_BY_STATE: WeakKeyDictionary[Any, dict[Any, Any]] = WeakKeyDictionary()
 _PREPARE_BATCHERS: WeakKeyDictionary[
     asyncio.AbstractEventLoop, dict[tuple[str, float, int], _BaselinePrepareBatcher]
 ] = WeakKeyDictionary()
-_DOCID_SIZE = 4
-_DOCID_DIM = 256
-_MAX_PREPARE_QUERIES = 512
+_DOCID_SIZE = RQ_CODE_NUM
+_DOCID_DIM = RQ_CODE_DIM
+_MAX_PREPARE_QUERIES = MAX_DOCIDS_PER_QUERY
 _PREPARE_BATCH_WAIT_SECONDS = 0.01
 _TRANSPORT_ATTEMPTS = 3
 _RETRY_DELAY_SECONDS = 0.5
@@ -161,7 +169,11 @@ def _add_arguments(parser) -> None:
         default=300.0,
         help="Retrieval-reward HTTP request timeout in seconds.",
     )
-    parser.add_argument("--generative-retriever-reward-batch-size", type=int, default=2048)
+    parser.add_argument(
+        "--generative-retriever-reward-batch-size",
+        type=int,
+        default=DEFAULT_REWARD_BATCH_SIZE,
+    )
     parser.add_argument("--generative-retriever-reward-concurrency", type=int, default=1)
     parser.add_argument("--generative-retriever-prepare-concurrency", type=int, default=1)
 
@@ -188,7 +200,7 @@ def _parse_embedding(
            for value, token_id in zip(raw[:docid_size], token_ids, strict=True)):
         raise ValueError(f"GR SGLang returned non-integral token ids: {raw[:docid_size]!r}")
     for position, token_id in enumerate(token_ids):
-        start = 2 + position * docid_dim
+        start = DOCID_TOKEN_OFFSET + position * docid_dim
         if not start <= token_id < start + docid_dim:
             raise ValueError(
                 f"GR SGLang returned token {token_id} outside position {position} codebook"
@@ -259,7 +271,7 @@ async def _request_embedding_and_prepare(
 def _training_prompt_ids(state: Any, sample: Sample) -> list[int]:
     if not isinstance(sample.prompt, str) or not sample.prompt.strip():
         raise ValueError("GR rollout requires a non-empty query string prompt")
-    query_ids = state.tokenizer.encode(sample.prompt, add_special_tokens=False)[:16]
+    query_ids = state.tokenizer.encode(sample.prompt, add_special_tokens=False)[:QUERY_MAX_TOKENS]
     truncated_query = state.tokenizer.decode(query_ids)
     instruction = f'Given the user Query: "{truncated_query}", summarize it in one token:'
     prompt = state.tokenizer.apply_chat_template(

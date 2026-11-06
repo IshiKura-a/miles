@@ -34,18 +34,42 @@ from examples.experimental.generative_retriever.runtime.prepare_rocm_env import 
     locked_accelerator_env,
 )
 from examples.experimental.generative_retriever.runtime.prepare_sglang_bundle import require_sglang_abort_patch
-from examples.experimental.generative_retriever.reward.relevance_reward import REWARD_MODES, RewardMode
+from examples.experimental.generative_retriever.reward.relevance_reward import (
+    DEFAULT_REWARD_BATCH_SIZE,
+    DEFAULT_TRAIN_GROUP_SIZE,
+    PROMPT_DATASET_ROWS,
+    REWARD_MODES,
+    REWARD_PAIR_BATCH_SIZE,
+    REWARD_TOWER_BATCH_SIZE,
+    RewardMode,
+)
 from examples.experimental.generative_retriever.reward.relevance_model import resolve_relevance_source
+from examples.experimental.generative_retriever.services.baseline_service import (
+    BASELINE_CACHE_SIZE,
+    BASELINE_SERVICE_API_VERSION,
+)
+from examples.experimental.generative_retriever.services.mapping_service import (
+    MAPPING_SERVICE_API_VERSION,
+)
+from examples.experimental.generative_retriever.services.reward_router_service import (
+    REWARD_ROUTER_API_VERSION,
+)
+from examples.experimental.generative_retriever.services.reward_service import (
+    REWARD_SERVICE_API_VERSION,
+)
 
 _TRAIN_GPUS = "0,1"
 _ROLLOUT_GPUS = "2,3"
 _BASELINE_GPUS = "4,5"
-_REWARD_GPUS = "4,5,6,7"
+_REWARD_GPUS = "2,3,4,5,6,7"
 _MAPPING_PORT = 30488
 _BASELINE_PORT = 30487
 _REWARD_PORT = 30489
-_REWARD_WORKER_PORTS = (30490, 30491, 30492, 30493)
+_REWARD_WORKER_PORTS = (30490, 30491, 30492, 30493, 30494, 30495)
 _SERVICE_START_TIMEOUT = 1800.0
+_QUERIES_PER_STEP = 4000
+_GLOBAL_BATCH_SIZE = _QUERIES_PER_STEP * DEFAULT_TRAIN_GROUP_SIZE
+_MAX_STEPS = PROMPT_DATASET_ROWS // _QUERIES_PER_STEP
 
 
 def _required_directory(value: str, name: str) -> str:
@@ -91,19 +115,19 @@ class ScriptArgs(U.ExecuteTrainConfig):
     sglang_dp_size: int = 2
     sglang_mem_fraction_static: float = 0.0
     sglang_server_concurrency: int = 8192
-    rollout_batch_size: int = 4000
-    n_samples_per_prompt: int = 512
-    baseline_top_k: int = 64
-    global_batch_size: int = 2048000
+    rollout_batch_size: int = _QUERIES_PER_STEP
+    n_samples_per_prompt: int = DEFAULT_TRAIN_GROUP_SIZE
+    global_batch_size: int = _GLOBAL_BATCH_SIZE
     max_tokens_per_gpu: int = 131072
     reward_timeout: float = 1800.0
-    reward_batch_size: int = 2048
-    reward_request_concurrency: int = 8
+    reward_batch_size: int = DEFAULT_REWARD_BATCH_SIZE
+    reward_request_concurrency: int = 2 * len(_REWARD_WORKER_PORTS)
     prepare_concurrency: int = 2
     reward_forward_concurrency: int = 2
+    reward_query_cache_size: int = 0
     reward_keyword_cache_size: int = 0
     reward_score_cache_size: int = 0
-    num_rollout: int = 3750
+    num_rollout: int = _MAX_STEPS
     one_step_async: bool = True
     temperature: float = 1.0
     lr: float = 2e-6
@@ -156,7 +180,7 @@ def _count_records(path: Path) -> int:
         except Exception:
             pass
     if path.name == "Part0.json" and stat.st_size > 1_000_000_000:
-        count = 15_000_000
+        count = PROMPT_DATASET_ROWS
     else:
         with path.open("rb", buffering=16 * 1024 * 1024) as stream:
             count = sum(bool(line.strip()) for line in stream)
@@ -263,14 +287,28 @@ def _ensure_resident_services(
     mapping_url = f"http://127.0.0.1:{_MAPPING_PORT}"
     baseline_url = f"http://127.0.0.1:{_BASELINE_PORT}/generate"
     reward_url = f"http://127.0.0.1:{_REWARD_PORT}/score"
-    _, derived_kw_cache, derived_score_cache = derive_reward_cache_sizes(
+    worker_urls = [f"http://127.0.0.1:{port}/score" for port in _REWARD_WORKER_PORTS]
+    peer_urls_csv = ",".join(worker_urls)
+    derived_query_cache, derived_kw_cache, derived_score_cache = derive_reward_cache_sizes(
         args.rollout_batch_size,
         args.n_samples_per_prompt,
         len(_REWARD_WORKER_PORTS),
-        baseline_top_k=args.baseline_top_k,
     )
-    kw_cache_size = args.reward_keyword_cache_size if args.reward_keyword_cache_size > 0 else derived_kw_cache
-    score_cache_size = args.reward_score_cache_size if args.reward_score_cache_size > 0 else derived_score_cache
+    query_cache_size = (
+        args.reward_query_cache_size
+        if args.reward_query_cache_size > 0
+        else derived_query_cache
+    )
+    kw_cache_size = (
+        args.reward_keyword_cache_size
+        if args.reward_keyword_cache_size > 0
+        else derived_kw_cache
+    )
+    score_cache_size = (
+        args.reward_score_cache_size
+        if args.reward_score_cache_size > 0
+        else derived_score_cache
+    )
     specs = [
         (
             "mapping",
@@ -288,7 +326,7 @@ def _ensure_resident_services(
             {
                 "status": "ready",
                 "mapping_version": mapping.name,
-                "service_config": {"api_version": 2, "mapping": str(mapping)},
+                "service_config": {"api_version": MAPPING_SERVICE_API_VERSION, "mapping": str(mapping)},
             },
         ),
         (
@@ -306,7 +344,7 @@ def _ensure_resident_services(
                 "--id-mapping",
                 os.fspath(mapping),
                 "--docids-per-query",
-                str(args.baseline_top_k),
+                str(args.n_samples_per_prompt),
                 "--port",
                 str(_BASELINE_PORT),
             ],
@@ -315,16 +353,16 @@ def _ensure_resident_services(
             {
                 "status": "ready",
                 "worker_count": 2,
-                "docids_per_query": args.baseline_top_k,
+                "docids_per_query": args.n_samples_per_prompt,
                 "service_config": {
-                    "api_version": 2,
+                    "api_version": BASELINE_SERVICE_API_VERSION,
                     "checkpoint": checkpoint,
                     "qwen_model": qwen_model,
                     "slm_root": slm_root,
                     "id_mapping": str(mapping),
                     "devices": ["cuda:0", "cuda:1"],
-                    "cache_size": 8192,
-                    "docids_per_query": args.baseline_top_k,
+                    "cache_size": BASELINE_CACHE_SIZE,
+                    "docids_per_query": args.n_samples_per_prompt,
                 },
             },
         ),
@@ -347,18 +385,24 @@ def _ensure_resident_services(
                     mapping.name,
                     "--relevance-model",
                     os.fspath(relevance_model),
-                    "--baseline-top-k",
-                    str(args.baseline_top_k),
+                    "--docids-per-query",
+                    str(args.n_samples_per_prompt),
                     "--batch-size",
-                    "8192",
+                    str(REWARD_TOWER_BATCH_SIZE),
                     "--pair-batch-size",
-                    "32768",
+                    str(REWARD_PAIR_BATCH_SIZE),
                     "--max-samples-per-request",
                     str(args.reward_batch_size),
+                    "--query-cache-size",
+                    str(query_cache_size),
                     "--keyword-cache-size",
                     str(kw_cache_size),
                     "--score-cache-size",
                     str(score_cache_size),
+                    "--peer-urls",
+                    peer_urls_csv,
+                    "--self-worker-index",
+                    str(index),
                     "--port",
                     str(port),
                 ],
@@ -370,18 +414,18 @@ def _ensure_resident_services(
                     "worker_count": 1,
                     "mapping_version": mapping.name,
                     "service_config": {
-                        "api_version": 9,
+                        "api_version": REWARD_SERVICE_API_VERSION,
                         "baseline_url": baseline_url,
                         "mapping_url": mapping_url,
                         "mapping_version": mapping.name,
                         "relevance_source": str(relevance_source),
                         "relevance_model": str(relevance_model),
-                        "query_cache_size": 8192,
+                        "query_cache_size": query_cache_size,
                         "keyword_cache_size": kw_cache_size,
                         "score_cache_size": score_cache_size,
-                        "batch_size": 8192,
-                        "pair_batch_size": 32768,
-                        "baseline_top_k": args.baseline_top_k,
+                        "batch_size": REWARD_TOWER_BATCH_SIZE,
+                        "pair_batch_size": REWARD_PAIR_BATCH_SIZE,
+                        "docids_per_query": args.n_samples_per_prompt,
                         "max_samples_per_request": args.reward_batch_size,
                     },
                 },
@@ -395,9 +439,7 @@ def _ensure_resident_services(
                 "-m",
                 "examples.experimental.generative_retriever.services.reward_router_service",
                 "--worker-urls",
-                ",".join(
-                    f"http://127.0.0.1:{port}/score" for port in _REWARD_WORKER_PORTS
-                ),
+                peer_urls_csv,
                 "--port",
                 str(_REWARD_PORT),
                 "--max-samples-per-request",
@@ -413,11 +455,8 @@ def _ensure_resident_services(
                 "worker_count": len(_REWARD_WORKER_PORTS),
                 "mapping_version": mapping.name,
                 "service_config": {
-                    "api_version": 6,
-                    "worker_urls": [
-                        f"http://127.0.0.1:{port}/score"
-                        for port in _REWARD_WORKER_PORTS
-                    ],
+                    "api_version": REWARD_ROUTER_API_VERSION,
+                    "worker_urls": worker_urls,
                     "max_samples_per_request": args.reward_batch_size,
                     "forward_concurrency": args.reward_forward_concurrency,
                 },

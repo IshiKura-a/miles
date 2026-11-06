@@ -10,6 +10,11 @@ from typing import Any
 import httpx
 import numpy as np
 
+from examples.experimental.generative_retriever.reward.relevance_reward import (
+    TREE_CREDIT_LEVEL_WEIGHT,
+    TREE_CREDIT_TOP_K,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -49,14 +54,15 @@ def apply_hierarchical_tree_credit(args: Any, samples: list[Any]) -> None:
             by_p0[d[0]].append(r)
             by_p1[(d[0], d[1])].append(r)
             by_p2[(d[0], d[1], d[2])].append(r)
-        v0_map = {k: _mean_top_k(v, 8) for k, v in by_p0.items()}
-        v1_map = {k: _mean_top_k(v, 4) for k, v in by_p1.items()}
-        v2_map = {k: _mean_top_k(v, 2) for k, v in by_p2.items()}
+        k0, k1, k2 = TREE_CREDIT_TOP_K
+        v0_map = {k: _mean_top_k(v, k0) for k, v in by_p0.items()}
+        v1_map = {k: _mean_top_k(v, k1) for k, v in by_p1.items()}
+        v2_map = {k: _mean_top_k(v, k2) for k, v in by_p2.items()}
         for sample, d, r in items:
             v0 = v0_map[d[0]]
             v1 = v1_map[(d[0], d[1])]
             v2 = v2_map[(d[0], d[1], d[2])]
-            sample.reward = 0.25 * (v0 + v1 + v2 + r)
+            sample.reward = TREE_CREDIT_LEVEL_WEIGHT * (v0 + v1 + v2 + r)
 
 
 def commit_coupled_doc2k_updates(args: Any, output: dict[str, Any]) -> None:

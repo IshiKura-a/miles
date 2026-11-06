@@ -12,7 +12,12 @@ from typing import Any, Literal
 import httpx
 import numpy as np
 
-from examples.experimental.generative_retriever.reward.relevance_reward import PM_THRESHOLD, SM_THRESHOLD
+from examples.experimental.generative_retriever.reward.relevance_reward import (
+    DEFAULT_EVAL_GROUP_SIZE,
+    MAX_DOCIDS_PER_QUERY,
+    PM_THRESHOLD,
+    SM_THRESHOLD,
+)
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -47,7 +52,7 @@ def _score(
     queries: list[str],
     generated: list[dict[str, Any]],
     *,
-    docids_per_query: int = 64,
+    docids_per_query: int = DEFAULT_EVAL_GROUP_SIZE,
 ) -> list[dict[str, Any]]:
     samples = []
     for query, result in zip(queries, generated, strict=True):
@@ -276,17 +281,17 @@ def run(
     generate_url: str,
     score_url: str,
     baseline_results: Path | None,
-    batch_size: int = 64,
-    docids_per_query: int = 64,
+    batch_size: int = DEFAULT_EVAL_GROUP_SIZE,
+    docids_per_query: int = DEFAULT_EVAL_GROUP_SIZE,
     score_head: Literal["sm", "pm"] = "sm",
     summary_output: Path | None = None,
 ) -> dict[str, Any] | None:
     if mode not in ("baseline", "policy"):
         raise ValueError(f"Unknown evaluation mode: {mode!r}")
-    if not 1 <= batch_size <= 512:
-        raise ValueError("batch_size must be between 1 and 512")
-    if not 1 <= docids_per_query <= 64:
-        raise ValueError("docids_per_query must be between 1 and 64")
+    if not 1 <= batch_size <= MAX_DOCIDS_PER_QUERY:
+        raise ValueError(f"batch_size must be between 1 and {MAX_DOCIDS_PER_QUERY}")
+    if not 1 <= docids_per_query <= MAX_DOCIDS_PER_QUERY:
+        raise ValueError(f"docids_per_query must be between 1 and {MAX_DOCIDS_PER_QUERY}")
     if score_head not in ("sm", "pm"):
         raise ValueError(f"Unknown score head: {score_head!r}")
     if mode == "policy" and baseline_results is None:
@@ -309,6 +314,13 @@ def run(
             for row in baseline_by_query.values()
         ):
             raise ValueError("Baseline results lack PM/SM scores; rerun baseline evaluation")
+        if any(
+            isinstance(row.get("docids"), list) and len(row["docids"]) != docids_per_query
+            for row in baseline_by_query.values()
+        ):
+            raise ValueError(
+                f"Baseline results group size does not match policy docids_per_query={docids_per_query}"
+            )
         missing = manifest_by_query.keys() - baseline_by_query.keys()
         if missing:
             raise ValueError(f"Baseline results missing for {len(missing)} manifest queries")
@@ -393,8 +405,8 @@ def main() -> None:
     parser.add_argument("--generate-url", required=True)
     parser.add_argument("--score-url", required=True)
     parser.add_argument("--baseline-results", type=Path)
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--docids-per-query", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_EVAL_GROUP_SIZE)
+    parser.add_argument("--docids-per-query", type=int, default=DEFAULT_EVAL_GROUP_SIZE)
     parser.add_argument("--score-head", choices=("sm", "pm"), default="sm")
     parser.add_argument("--summary-output", type=Path)
     args = parser.parse_args()

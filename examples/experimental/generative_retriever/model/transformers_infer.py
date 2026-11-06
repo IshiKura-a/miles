@@ -39,6 +39,12 @@ from examples.experimental.generative_retriever.model.model_loading import (
     load_checkpoint,
     require_directory,
 )
+from examples.experimental.generative_retriever.reward.relevance_reward import (
+    DEFAULT_EVAL_GROUP_SIZE,
+    DOCID_TOKEN_OFFSET,
+    QUERY_MAX_TOKENS,
+    RQ_CODE_DIM,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +131,7 @@ class SLMv3Retriever:
         truncated_query = self.tokenizer.decode(
             self.tokenizer.encode(
                 query,
-                max_length=16,
+                max_length=QUERY_MAX_TOKENS,
                 truncation=True,
                 add_special_tokens=False,
             )
@@ -144,8 +150,8 @@ class SLMv3Retriever:
         self,
         queries: list[str],
         *,
-        num_beams: int = 64,
-        num_return_sequences: int = 64,
+        num_beams: int = DEFAULT_EVAL_GROUP_SIZE,
+        num_return_sequences: int = DEFAULT_EVAL_GROUP_SIZE,
     ) -> list[GenerationResult]:
         if not queries or any(not isinstance(query, str) or not query.strip() for query in queries):
             raise ValueError("queries must contain at least one non-empty string")
@@ -170,7 +176,7 @@ class SLMv3Retriever:
                 },
                 return_hidden_states=True,
             )
-            if isinstance(self.constraint, SortedU32Constraint) or num_beams > 256:
+            if isinstance(self.constraint, SortedU32Constraint) or num_beams > RQ_CODE_DIM:
                 tokens_3d, scores_3d = generate_beams_tree(
                     self.model,
                     hidden_states,
@@ -218,9 +224,9 @@ class SLMv3Retriever:
             zip(flat_tokens, flat_scores, strict=True)
         ):
             query_index = output_index // num_return_sequences
-            positional_docid = [token_id - 2 for token_id in decoder_token_ids]
+            positional_docid = [token_id - DOCID_TOKEN_OFFSET for token_id in decoder_token_ids]
             rq_codes = [
-                token_id - 2 - position * self.code_dim
+                token_id - DOCID_TOKEN_OFFSET - position * self.code_dim
                 for position, token_id in enumerate(decoder_token_ids)
             ]
             results.append(
@@ -250,8 +256,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--id-mapping", required=True)
     parser.add_argument("--query", action="append", required=True)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--num-beams", type=int, default=64)
-    parser.add_argument("--num-return-sequences", type=int, default=64)
+    parser.add_argument("--num-beams", type=int, default=DEFAULT_EVAL_GROUP_SIZE)
+    parser.add_argument("--num-return-sequences", type=int, default=DEFAULT_EVAL_GROUP_SIZE)
     return parser.parse_args()
 
 
