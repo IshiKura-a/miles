@@ -47,7 +47,7 @@ python3 -m examples.experimental.generative_retriever.runtime.prepare_rocm_env \
 - **Group Size 对齐协议**：
   - **训练阶段**：Rollout（constrained `beam_sample` 无放回采样）与冻结 Baseline（确定性 constrained top-$K$ beam）的 group size **永远保持一致**（默认 `DEFAULT_TRAIN_GROUP_SIZE = 512`）。
   - **离线评测阶段**：Policy 与冻结 Baseline 的确定性 constrained top-$K$ beam group size **永远保持一致**（默认 `DEFAULT_EVAL_GROUP_SIZE = 64`，支持最高 `512`）。
-- 使用 SLMGR_dev 的 constrained decoder（`infer_mode=2`）与统一列式 ID 映射（或固定版本 TSV 映射）。
+- 使用 SLMGR_dev 的 constrained decoder（`infer_mode=2`）与统一列式 ID 映射。
 - Baseline 比较集合按 PM（≥ 0.58）与 SM（≥ 0.82）分别构建 $B_{\text{PM}}(q)$ 和
   $B_{\text{SM}}(q)$；两侧 unique 分别按候选文本是否属于对应集合判定。
 
@@ -333,7 +333,7 @@ uv run --env-file .env python -m examples.experimental.generative_retriever.run_
 
 ### GPU 分配（单机 8 卡）
 
-当前单机 recipe 使用 8 卡，角色如下（GPU 0-1 专供 FSDP Learner 以避免 AllGather/ReduceScatter 集合通信受干扰，GPU 2-7 共 6 张卡并行承载常驻 Relevance Reward Workers）：
+当前单机 recipe 使用 8 卡，角色如下（全 8 卡 `GPU 0-7` 并行承载常驻 Relevance Reward Workers，端口 `30490..30497`）：
 
 | 物理 GPU | 角色 | 数量 |
 | --- | --- | --- |
@@ -348,18 +348,17 @@ Launcher 设置各服务的 GPU visibility；离线评测与训练使用不同�
 ### 常驻 ID-text 服务
 
 [mapping_service.py](../../examples/experimental/generative_retriever/services/mapping_service.py)
-支持加载上述统一列式索引目录（`keywords.parquet` + `docid_keywords.parquet` / CSR `.npy`）
-或传统 `.tsv` 映射文件，启动后常驻内存提供服务：
+加载上述统一列式索引目录（`keywords.parquet` + `docid_keywords.parquet` / CSR `.npy`），启动后常驻内存提供服务：
 
 ```bash
-# 加载统一列式索引目录（约 30s 启动）或 .tsv 映射文件
+# 加载统一列式索引目录（约 30s 启动）
 uv run python -m examples.experimental.generative_retriever.services.mapping_service \
   --mapping "$cosmos_data_path/local/User/zihao/online_rl/gr_offline_syn/index/slmgrv3_part25_na_intl_20261028_20261029" \
   --host 127.0.0.1 --port 30488
 ```
 
-- `POST /lookup` 返回 ID 对应的去重 keyword 列表；支持 `use_initial=True` 查询初始静态映射（供 Baseline `/prepare` 使用），并支持可选 `market` 参数过滤。
-- `POST /update` 支持在内存中直接增量更新或全量替换 `docid -> keyword_ids` 的动态映射（单 doc ID 最多保留 `DOCID_MAX_KEYWORDS = 150` 个词），训练期间无需从磁盘重新读取；`POST /save` 将内存中的最新动态映射写出为快照。
+- `POST /lookup` 返回 ID 对应的去重 keyword 列表；支持 `use_initial=True` 查询只读初始静态映射（供 Baseline `/prepare` 使用），并支持可选 `market` 参数按离散 `keyword_id` 过滤。
+- `POST /update_delta` 与 `POST /update` 在内存中基于离散 `keyword_id: uint32`（`_overlay_kw_ids`）增量更新动态映射（单 doc ID 最多保留 `DOCID_MAX_KEYWORDS = 150` 个词），训练期间无需从磁盘重新读取；`POST /save` 将 `_overlay_kw_ids` 与初始 CSR 合并写出为新的 `docid_keywords.parquet` 与 `.u32.npy` 快照。
 - 客户端 [lookup_service](../../examples/experimental/generative_retriever/index/id_text_mapping.py)
   按最多 4,096 个不同 ID 分批请求；服务地址 `http://127.0.0.1:30488`。
 
@@ -385,7 +384,7 @@ CUDA_VISIBLE_DEVICES=4,5 uv run python -m \
 ### 常驻 reward 服务与二级缓存（L1 Score Cache + L2 $q$/$k$ GPU Embedding Tables）
 
 [reward_service.py](../../examples/experimental/generative_retriever/services/reward_service.py)
-是单 GPU worker。单机在 GPU 2–7 上运行 6 个隔离进程（端口 `30490..30495`），
+是单 GPU worker。单机在 GPU 0–7 上运行 8 个隔离进程（端口 `30490..30497`），
 多机在每台服务节点的 GPU 0–7 上运行 8 个隔离进程（端口 `31583..31590`）。
 [reward_router_service.py](../../examples/experimental/generative_retriever/services/reward_router_service.py)
 按 query 做 rendezvous hashing（`q-hash`），将同一 query 的 `/prepare` 和 `/score` 固定路由到同一个所属 worker，并采用 **二级缓存 + $q$–$k$ 解耦架构**：
@@ -417,12 +416,12 @@ CUDA_VISIBLE_DEVICES=4,5 uv run python -m \
 所有节点必须部署同一 Miles commit，且运行工作树干净；入口启动前检查
 commit 和工作树状态，另行验证外部 SGLang 补丁、SLMv3 模型源码与
 Stage5/Qwen 索引。不一致就拒绝启动，不会覆盖其他节点的工作树。
-入口优先检测首个服务节点的 `31480` 常驻 mapping；仅当 `/health` 的版本、
-238,836,331 行、文件大小和底层文件的逐字节内容均与上表固定映射一致时才复用，
+入口优先检测首个服务节点的 `31480` 常驻 mapping；仅当 `/health` 的 `api_version == 2`、
+版本名称和映射路径与当前统一列式索引一致时才复用，
 并且不会在本次任务退出时停止该服务。没有常驻服务时才在 `31580` 启动任务专属
 mapping；有服务但映射不符则明确报错，不使用错误数据。
 冻结 baseline 同样在每个服务节点的 `31581` 验证健康状态和完整配置
-（Stage5、Qwen、SLMv3、当前映射、4 GPU、constrained top-64）；一致则复用，
+（Stage5、Qwen、SLMv3、当前映射、4 GPU、constrained top-512）；一致则复用，
 端口被不匹配服务占用时拒绝启动。首次启动的 baseline 在本次训练结束后仍常驻
 服务节点 GPU 0–3，供下一次相同配置的 run 复用，不由训练任务清理。确认没有
 训练任务依赖它之后，可根据 `31581` 的监听 PID 单独停止；不要按进程名批量清理。
