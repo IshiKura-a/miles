@@ -250,7 +250,12 @@ class RewardRouter:
             response = self._client.get(url.removesuffix("/score") + "/health", timeout=10.0)
             response.raise_for_status()
             payload = response.json()
-            if payload.get("status") != "ready" or payload.get("worker_count") != 1:
+            worker_count = payload.get("worker_count")
+            if (
+                payload.get("status") != "ready"
+                or not isinstance(worker_count, int)
+                or worker_count < 1
+            ):
                 raise RuntimeError(f"Reward worker is not ready: {payload}")
             worker_limit = payload["service_config"]["max_samples_per_request"]
             if worker_limit < self.max_samples_per_request:
