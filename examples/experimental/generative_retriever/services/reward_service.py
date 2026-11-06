@@ -11,6 +11,7 @@ Run:
 from __future__ import annotations
 
 import argparse
+import gc
 import logging
 import math
 import time
@@ -603,6 +604,9 @@ def create_app(
             pair_batch_size=pair_batch_size,
             keyword_cache_size=keyword_cache_size,
         )
+        gc.collect()
+        gc.freeze()
+        gc.set_threshold(100_000, 500, 500)
         try:
             yield
         finally:

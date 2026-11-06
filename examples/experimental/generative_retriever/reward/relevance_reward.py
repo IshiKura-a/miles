@@ -35,13 +35,13 @@ TREE_CREDIT_TOP_K = (8, 4, 2)
 TREE_CREDIT_LEVEL_WEIGHT = 0.25
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class BaselineSets:
     pm: frozenset[str] = frozenset()
     sm: frozenset[str] = frozenset()
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RewardBreakdown:
     pm_score: float
     sm_score: float

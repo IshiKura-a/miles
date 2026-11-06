@@ -8,6 +8,7 @@ Run:
 from __future__ import annotations
 
 import argparse
+import gc
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -397,6 +398,9 @@ def create_app(mapping: str | Path) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.mapping = ResidentMapping(path)
+        gc.collect()
+        gc.freeze()
+        gc.set_threshold(100_000, 500, 500)
         yield
         del app.state.mapping
 

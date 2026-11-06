@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
+import gc
 import importlib
 import logging
 import multiprocessing as mp
@@ -491,6 +492,9 @@ def _gpu_worker_loop(
             pair_batch_size=pair_batch_size,
             keyword_cache_size=keyword_cache_size,
         )
+        gc.collect()
+        gc.freeze()
+        gc.set_threshold(100_000, 500, 500)
         conn.send(("ready", None))
         while True:
             msg = conn.recv()

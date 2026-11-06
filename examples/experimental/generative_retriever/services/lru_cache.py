@@ -10,7 +10,7 @@ K = TypeVar("K")
 V = TypeVar("V")
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class CacheStats:
     capacity: int
     size: int
