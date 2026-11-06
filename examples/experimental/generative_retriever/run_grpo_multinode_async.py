@@ -591,16 +591,8 @@ def _service_node(manifest: Manifest, index: int) -> None:
             _SAMPLES_PER_PROMPT,
             _REWARD_WORKERS_PER_PAIR * pairs,
         )
-        peer_urls = [
-            f"http://{peer_host}:{peer_port}/score"
-            for peer_host in manifest["addresses"][::2]
-            for peer_port in _REWARD_PORTS
-        ]
-        peer_urls_csv = ",".join(peer_urls)
-        pair_index = index // 2
         for gpu, port in enumerate(_REWARD_PORTS):
             name = f"reward-{gpu}"
-            global_worker_idx = pair_index * len(_REWARD_PORTS) + gpu
             _start_service(
                 processes, name, "reward_service", host, port,
                 [
@@ -615,8 +607,6 @@ def _service_node(manifest: Manifest, index: int) -> None:
                     "--query-cache-size", str(query_cache),
                     "--keyword-cache-size", str(kw_cache),
                     "--score-cache-size", str(score_cache),
-                    "--peer-urls", peer_urls_csv,
-                    "--self-worker-index", str(global_worker_idx),
                 ],
                 gpus=str(gpu),
             )

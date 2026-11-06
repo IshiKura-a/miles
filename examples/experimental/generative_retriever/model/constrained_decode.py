@@ -253,12 +253,15 @@ def load_constraint(slm_root: str, mapping_path: str, code_num: int, code_dim: i
         raise ValueError("Official mapping must cover the initial codebook used by SLMGR")
     del raw_ids
     if packed_list:
+        unique_arr = np.unique(np.asarray(packed_list, dtype=np.uint32))
         try:
             tmp_cache = cache_u32_path.with_suffix(".tmp.npy")
-            np.save(tmp_cache, np.asarray(packed_list, dtype=np.uint32))
+            np.save(tmp_cache, unique_arr)
             tmp_cache.replace(cache_u32_path)
         except Exception:
             pass
+        del packed_list
+        return SortedU32Constraint(unique_arr, code_dim=code_dim)
     del packed_list
     args = slmv3["RunArguments"](infer_mode=2, code_num=code_num, code_dim=code_dim, uniqueid=1)
     return slmv3["get_restrict_decode_vocab"](args, docid_list=docids, id_bias=2)

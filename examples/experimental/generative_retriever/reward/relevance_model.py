@@ -32,7 +32,7 @@ GRAPHENE_NUM_TOKENS = 2
 GRAPHENE_FEATURE_DIM = 128
 GRAPHENE_NUM_SCORE_HEADS = 4
 DEFAULT_QUERY_CACHE_SIZE = 16384
-DEFAULT_KEYWORD_CACHE_SIZE = 4194304
+DEFAULT_KEYWORD_CACHE_SIZE = 8388608
 DEFAULT_SCORE_CACHE_SIZE = 1048576
 DEFAULT_PAIR_BATCH_SIZE = 32768
 logger = logging.getLogger(__name__)
@@ -175,14 +175,18 @@ class GpuEmbeddingTable:
         self.feature_dim = feature_dim
         self.device = torch.device(device)
         self.dtype = dtype
-        self.storage: torch.Tensor | None = None
+        self.storage: torch.Tensor = torch.empty(
+            (self.capacity, self.num_tokens, self.feature_dim),
+            dtype=self.dtype,
+            device=self.device,
+        )
         self._slots: OrderedDict[str, int] = OrderedDict()
         self._hits = 0
         self._misses = 0
         self._evictions = 0
 
     def ensure_storage(self, num_tokens: int, feature_dim: int) -> torch.Tensor:
-        if self.storage is None:
+        if self.storage.shape[1:] != (num_tokens, feature_dim):
             self.num_tokens = num_tokens
             self.feature_dim = feature_dim
             self.storage = torch.empty(
@@ -244,7 +248,7 @@ class GpuEmbeddingTable:
 
 
 class RelevanceScorer:
-    """Two-level GPU relevance cache: L1 (q, k) score cache + L2 (q_emb, k_emb) GPU tables.
+    """Two-level in-VRAM GPU relevance cache: L1 (q, k) score cache + L2 (q_emb, k_emb) GPU tables.
 
     The caller serializes access to the pipeline and caches.
     """
@@ -315,21 +319,6 @@ class RelevanceScorer:
         return storage, slot_map, delta
 
     @torch.no_grad()
-    def encode_queries_cached(
-        self, queries: list[str],
-    ) -> tuple[dict[str, torch.Tensor], dict[str, int]]:
-        unique_queries = list(dict.fromkeys(queries))
-        if not unique_queries:
-            return {}, {"hits": 0, "misses": 0, "evictions": 0}
-        q_storage, q_map, q_delta = self._encode_gpu_table(unique_queries, query=True)
-        slots = torch.tensor([q_map[q] for q in unique_queries], dtype=torch.long, device=q_storage.device)
-        fetched = q_storage[slots].detach().cpu()
-        return (
-            {query: fetched[idx] for idx, query in enumerate(unique_queries)},
-            q_delta,
-        )
-
-    @torch.no_grad()
     def _cross_score_gpu(
         self,
         q_embeds_gpu: torch.Tensor,
@@ -356,40 +345,6 @@ class RelevanceScorer:
             raise RuntimeError("Official relevance model returned invalid scores")
         return all_scores[:, 1:3].cpu().numpy()
 
-    @torch.no_grad()
-    def score_with_query_embeddings(
-        self,
-        query_embeddings: torch.Tensor,
-        keywords: list[str],
-        q_indices: list[int],
-        k_indices: list[int],
-    ) -> tuple[list[tuple[float, float]], dict[str, int]]:
-        if len(q_indices) != len(k_indices):
-            raise ValueError("q_indices and k_indices must have equal length")
-        if not q_indices:
-            return [], {"hits": 0, "misses": 0, "evictions": 0}
-        started = time.perf_counter()
-        q_gpu = query_embeddings.to(device=self.pipeline.device, dtype=self.pipeline.dtype)
-        phase = time.perf_counter()
-        k_storage, k_map, k_delta = self._encode_gpu_table(keywords, query=False)
-        keyword_seconds = time.perf_counter() - phase
-        mapped_k_slots = [k_map[kw] for kw in keywords]
-        pair_k_slots = [mapped_k_slots[i] for i in k_indices]
-        phase = time.perf_counter()
-        pm_sm = self._cross_score_gpu(
-            q_gpu,
-            k_storage,
-            q_indices,
-            pair_k_slots,
-        )
-        cross_seconds = time.perf_counter() - phase
-        results = [(float(row[0]), float(row[1])) for row in pm_sm]
-        logger.info(
-            "graphene_score_stage pairs=%d keywords=%d keyword_s=%.3f cross_s=%.3f total_s=%.3f",
-            len(q_indices), len(keywords), keyword_seconds, cross_seconds, time.perf_counter() - started,
-        )
-        return results, k_delta
-
     def score(self, pairs: list[tuple[str, str]]) -> dict[tuple[str, str], tuple[float, float]]:
         started = time.perf_counter()
         resolved = {}
@@ -402,29 +357,30 @@ class RelevanceScorer:
                 resolved[pair] = score
         lookup_seconds = time.perf_counter() - started
         query_seconds = keyword_seconds = cross_seconds = store_seconds = 0.0
-        if missing:
-            unique_queries = list(dict.fromkeys(query for query, _ in missing))
-            unique_keywords = list(dict.fromkeys(keyword for _, keyword in missing))
+        for start in range(0, len(missing), self.pair_batch_size):
+            chunk = missing[start:start + self.pair_batch_size]
+            unique_queries = list(dict.fromkeys(query for query, _ in chunk))
+            unique_keywords = list(dict.fromkeys(keyword for _, keyword in chunk))
             phase = time.perf_counter()
             q_storage, q_map, _ = self._encode_gpu_table(unique_queries, query=True)
-            query_seconds = time.perf_counter() - phase
+            query_seconds += time.perf_counter() - phase
             phase = time.perf_counter()
             k_storage, k_map, _ = self._encode_gpu_table(unique_keywords, query=False)
-            keyword_seconds = time.perf_counter() - phase
+            keyword_seconds += time.perf_counter() - phase
             phase = time.perf_counter()
             pm_sm = self._cross_score_gpu(
                 q_storage,
                 k_storage,
-                [q_map[query] for query, _ in missing],
-                [k_map[keyword] for _, keyword in missing],
+                [q_map[query] for query, _ in chunk],
+                [k_map[keyword] for _, keyword in chunk],
             )
-            cross_seconds = time.perf_counter() - phase
+            cross_seconds += time.perf_counter() - phase
             phase = time.perf_counter()
-            for pair, row in zip(missing, pm_sm, strict=True):
+            for pair, row in zip(chunk, pm_sm, strict=True):
                 score = (float(row[0]), float(row[1]))
                 self.scores.put(pair, score)
                 resolved[pair] = score
-            store_seconds = time.perf_counter() - phase
+            store_seconds += time.perf_counter() - phase
         logger.info(
             "graphene_score_stage pairs=%d misses=%d lookup_s=%.3f query_s=%.3f "
             "keyword_s=%.3f cross_s=%.3f store_s=%.3f total_s=%.3f",

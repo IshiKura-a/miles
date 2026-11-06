@@ -61,11 +61,11 @@ from examples.experimental.generative_retriever.services.reward_service import (
 _TRAIN_GPUS = "0,1"
 _ROLLOUT_GPUS = "2,3"
 _BASELINE_GPUS = "4,5"
-_REWARD_GPUS = "2,3,4,5,6,7"
+_REWARD_GPUS = "0,1,2,3,4,5,6,7"
 _MAPPING_PORT = 30488
 _BASELINE_PORT = 30487
 _REWARD_PORT = 30489
-_REWARD_WORKER_PORTS = (30490, 30491, 30492, 30493, 30494, 30495)
+_REWARD_WORKER_PORTS = (30490, 30491, 30492, 30493, 30494, 30495, 30496, 30497)
 _SERVICE_START_TIMEOUT = 1800.0
 _QUERIES_PER_STEP = 4000
 _GLOBAL_BATCH_SIZE = _QUERIES_PER_STEP * DEFAULT_TRAIN_GROUP_SIZE
@@ -399,10 +399,6 @@ def _ensure_resident_services(
                     str(kw_cache_size),
                     "--score-cache-size",
                     str(score_cache_size),
-                    "--peer-urls",
-                    peer_urls_csv,
-                    "--self-worker-index",
-                    str(index),
                     "--port",
                     str(port),
                 ],

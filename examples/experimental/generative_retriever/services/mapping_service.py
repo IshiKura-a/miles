@@ -1,8 +1,8 @@
-"""Resident official doc-ID to keyword-list service.
+"""Resident official doc-ID to keyword-list service for the unified columnar index.
 
 Run:
     python -m examples.experimental.generative_retriever.services.mapping_service \
-        --mapping /path/to/asiindex_mapping.ta_listing.tsv --port 30488
+        --mapping /path/to/slmgrv3_part25_na_intl_20261028_20261029 --port 30488
 """
 
 from __future__ import annotations
@@ -98,29 +98,31 @@ class SaveMappingRequest(BaseModel):
 
 class ResidentMapping:
     def __init__(self, path: Path) -> None:
+        if not is_columnar_index_dir(path):
+            raise ValueError(f"Mapping path must be a columnar index directory: {path}")
         self.path = path
         self._lock = RLock()
-        self._is_columnar = is_columnar_index_dir(path)
-        self._keywords: dict[bytes, list[bytes]] = {}
-        self._overlay_texts: dict[PositionalID, list[str]] = {}
+        self._overlay_kw_ids: dict[int, tuple[int, ...]] = {}
+        self._text_to_kid: dict[str, int] = {}
         self._kw_array: Any = None
-        self._in_na_array: np.ndarray | None = None
+        self._in_na_array: np.ndarray = np.empty(0, dtype=np.bool_)
         self._markets_array: Any = None
-        self._unique_docids_u32: np.ndarray | None = None
-        self._csr_offsets: np.ndarray | None = None
-        self._csr_kw_ids: np.ndarray | None = None
-
-        if self._is_columnar:
-            self._load_columnar(path)
-        else:
-            self._load_tsv(path)
+        self._unique_docids_u32: np.ndarray = np.empty(0, dtype=np.uint32)
+        self._csr_offsets: np.ndarray = np.empty(0, dtype=np.int64)
+        self._csr_kw_ids: np.ndarray = np.empty(0, dtype=np.uint32)
+        self._load_columnar(path)
 
     def _load_columnar(self, directory: Path) -> None:
         logger.info("Loading columnar index into memory: %s", directory)
         kw_path = directory / "keywords.parquet"
         pairs_path = directory / "docid_keywords.parquet"
-        kw_table = pq.read_table(kw_path, columns=["keyword", "in_na", "markets"])
+        kw_table = pq.read_table(kw_path, columns=["keyword_id", "keyword", "in_na", "markets"])
         self._kw_array = kw_table.column("keyword").combine_chunks()
+        n_kw = len(self._kw_array)
+        if n_kw > 0:
+            kid_col = kw_table.column("keyword_id")
+            if int(kid_col[0].as_py()) != 0 or int(kid_col[n_kw - 1].as_py()) != n_kw - 1:
+                raise ValueError("keywords.parquet keyword_id column must be contiguous 0..N-1")
         self._in_na_array = kw_table.column("in_na").to_numpy(zero_copy_only=False)
         self._markets_array = kw_table.column("markets").combine_chunks()
 
@@ -137,7 +139,6 @@ class ResidentMapping:
             kw_id = pairs_table.column("keyword_id").to_numpy(zero_copy_only=False)
             self._rebuild_csr(docid_u32, kw_id)
 
-        assert self._unique_docids_u32 is not None and self._csr_kw_ids is not None
         self.rows = int(len(self._csr_kw_ids))
         self.byte_count = int(kw_path.stat().st_size + pairs_path.stat().st_size)
         logger.info(
@@ -167,52 +168,12 @@ class ResidentMapping:
         self._csr_kw_ids = sorted_kw_ids
         self.rows = int(len(sorted_kw_ids))
 
-    def _load_tsv(self, path: Path) -> None:
-        initial = path.stat()
-        keywords: dict[bytes, list[bytes]] = {}
-        scanned_bytes = scanned_rows = 0
-        previous_id = None
-        bucket: list[bytes] = []
-        logger.info("Loading official mapping into memory: %s", path)
-        with path.open("rb", buffering=8 * 1024 * 1024) as stream:
-            for line_number, line in enumerate(stream, 1):
-                raw_id, separator, rest = line.partition(b"\t")
-                if not separator:
-                    raise ValueError(f"Official mapping row {line_number} has no text column")
-                raw_text = rest.partition(b"\t")[0].rstrip(b"\r\n")
-                if not raw_text.strip():
-                    raise ValueError(f"Official mapping row {line_number} has empty text")
-                if raw_id != previous_id:
-                    components = [int(value) for value in raw_id.split()]
-                    if len(components) != 4:
-                        raise ValueError(f"Official mapping row {line_number} must have four ID components")
-                    values = (components[0], components[1], components[2], components[3])
-                    validate_docid(values)
-                    canonical_id = " ".join(map(str, values)).encode("ascii")
-                    bucket = keywords.setdefault(canonical_id, [])
-                    previous_id = raw_id
-                bucket.append(raw_text)
-                scanned_bytes += len(line)
-                scanned_rows += 1
-                if scanned_rows % 10_000_000 == 0:
-                    logger.info("Loaded %d rows, %d IDs", scanned_rows, len(keywords))
-        final = path.stat()
-        if (scanned_bytes, final.st_size, final.st_mtime_ns) != (initial.st_size, initial.st_size, initial.st_mtime_ns):
-            raise RuntimeError("Official mapping changed during startup")
-        self._keywords = keywords
-        self.rows = scanned_rows
-        self.byte_count = scanned_bytes
-        logger.info("Official mapping ready: %d IDs, %d rows", len(keywords), scanned_rows)
-
     @property
     def id_count(self) -> int:
         with self._lock:
-            if self._is_columnar and self._unique_docids_u32 is not None:
-                return int(len(self._unique_docids_u32))
-            return len(self._keywords)
+            return int(len(self._unique_docids_u32))
 
     def _market_allows(self, kw_id: int, target_market_upper: str) -> bool:
-        assert self._in_na_array is not None and self._markets_array is not None
         if target_market_upper in _NA_LOCALE_ALIASES and bool(self._in_na_array[kw_id]):
             return True
         mkt_str: str = self._markets_array[kw_id].as_py()
@@ -230,35 +191,20 @@ class ResidentMapping:
             pos = mkt_str.find(target_market_upper, pos + 1)
         return False
 
-    def _base_lookup_one(self, docid: PositionalID, target_mkt: str | None) -> list[str] | None:
-        if not self._is_columnar:
-            raw_id = " ".join(map(str, docid)).encode("ascii")
-            values = self._keywords.get(raw_id)
-            if values is None:
-                return None
-            return [value.decode("utf-8") for value in dict.fromkeys(values)]
-        assert (
-            self._unique_docids_u32 is not None
-            and self._csr_offsets is not None
-            and self._csr_kw_ids is not None
-            and self._kw_array is not None
-        )
-        target_u32 = np.uint32(pack_docid_u32(docid))
-        idx = int(np.searchsorted(self._unique_docids_u32, target_u32))
+    def _base_kw_ids_one(self, target_u32: int) -> tuple[int, ...] | None:
+        idx = int(np.searchsorted(self._unique_docids_u32, np.uint32(target_u32)))
         n_unique = len(self._unique_docids_u32)
         if idx >= n_unique or int(self._unique_docids_u32[idx]) != int(target_u32):
             return None
         start = int(self._csr_offsets[idx])
         end = int(self._csr_offsets[idx + 1])
-        kw_ids = self._csr_kw_ids[start:end]
-        texts = []
-        for raw_kid in kw_ids:
-            kid = int(raw_kid)
-            if target_mkt is not None and not self._market_allows(kid, target_mkt):
-                continue
-            raw_bytes: bytes = self._kw_array[kid].as_py()
-            texts.append(raw_bytes.decode("utf-8"))
-        return texts
+        return tuple(int(k) for k in self._csr_kw_ids[start:end])
+
+    def _decode_kid(self, kid: int) -> str:
+        raw_bytes: bytes = self._kw_array[kid].as_py()
+        text = raw_bytes.decode("utf-8")
+        self._text_to_kid[text] = kid
+        return text
 
     def lookup(
         self,
@@ -269,63 +215,30 @@ class ResidentMapping:
     ) -> LookupResponse:
         target_mkt = market.strip().upper() if market else None
         with self._lock:
-            if not self._is_columnar:
-                results = []
-                for docid in docids:
-                    if not use_initial and docid in self._overlay_texts:
-                        results.append(
-                            KeywordResult(
-                                docid=docid,
-                                keywords=list(self._overlay_texts[docid]),
-                                status="ok",
-                            )
-                        )
-                        continue
-                    raw_id = " ".join(map(str, docid)).encode("ascii")
-                    values = self._keywords.get(raw_id)
-                    if values is None:
-                        logger.warning("Official mapping ID not found: %s", docid)
-                        results.append(KeywordResult(docid=docid, keywords=[], status="not_found"))
-                        continue
-                    texts = [value.decode("utf-8") for value in dict.fromkeys(values)]
-                    results.append(KeywordResult(docid=docid, keywords=texts, status="ok"))
-                return LookupResponse(mapping_version=self.path.name, results=results)
-
-            assert (
-                self._unique_docids_u32 is not None
-                and self._csr_offsets is not None
-                and self._csr_kw_ids is not None
-                and self._kw_array is not None
-            )
             packed_targets = np.asarray([pack_docid_u32(d) for d in docids], dtype=np.uint32)
             positions = np.searchsorted(self._unique_docids_u32, packed_targets)
             results = []
             n_unique = len(self._unique_docids_u32)
             for docid, target_u32, pos in zip(docids, packed_targets, positions, strict=True):
-                if not use_initial and docid in self._overlay_texts:
-                    results.append(
-                        KeywordResult(
-                            docid=docid,
-                            keywords=list(self._overlay_texts[docid]),
-                            status="ok",
-                        )
-                    )
-                    continue
-                idx = int(pos)
-                if idx >= n_unique or int(self._unique_docids_u32[idx]) != int(target_u32):
-                    logger.warning("Columnar mapping ID not found: %s", docid)
-                    results.append(KeywordResult(docid=docid, keywords=[], status="not_found"))
-                    continue
-                start = int(self._csr_offsets[idx])
-                end = int(self._csr_offsets[idx + 1])
-                kw_ids = self._csr_kw_ids[start:end]
+                u32_int = int(target_u32)
+                overlay_kids = None if use_initial else self._overlay_kw_ids.get(u32_int)
+                if overlay_kids is not None:
+                    kw_ids_iter: Any = overlay_kids
+                else:
+                    idx = int(pos)
+                    if idx >= n_unique or int(self._unique_docids_u32[idx]) != u32_int:
+                        logger.warning("Columnar mapping ID not found: %s", docid)
+                        results.append(KeywordResult(docid=docid, keywords=[], status="not_found"))
+                        continue
+                    start = int(self._csr_offsets[idx])
+                    end = int(self._csr_offsets[idx + 1])
+                    kw_ids_iter = self._csr_kw_ids[start:end]
                 texts = []
-                for raw_kid in kw_ids:
+                for raw_kid in kw_ids_iter:
                     kid = int(raw_kid)
                     if target_mkt is not None and not self._market_allows(kid, target_mkt):
                         continue
-                    raw_bytes: bytes = self._kw_array[kid].as_py()
-                    texts.append(raw_bytes.decode("utf-8"))
+                    texts.append(self._decode_kid(kid))
                 results.append(KeywordResult(docid=docid, keywords=texts, status="ok"))
             return LookupResponse(mapping_version=self.path.name, results=results)
 
@@ -333,51 +246,57 @@ class ResidentMapping:
         if request.k_max < 1:
             raise ValueError("k_max must be at least 1")
         with self._lock:
-            updated_docids: set[PositionalID] = set()
+            updated_u32: set[int] = set()
             added_edges = 0
             removed_edges = 0
             for item in request.removals:
-                docid = item.docid
-                current = self._overlay_texts.get(docid)
-                if current is None:
-                    base = self._base_lookup_one(docid, None)
-                    if not base:
+                u32 = pack_docid_u32(item.docid)
+                current_kids = self._overlay_kw_ids.get(u32)
+                if current_kids is None:
+                    current_kids = self._base_kw_ids_one(u32)
+                    if not current_kids:
                         continue
-                    current = list(base)
-                remove_set = {kw for kw in item.keywords if kw.strip()}
-                filtered = [kw for kw in current if kw not in remove_set]
-                if not filtered:
-                    filtered = [current[0]]
-                if len(filtered) < len(current):
-                    removed_edges += len(current) - len(filtered)
-                    self._overlay_texts[docid] = filtered
-                    updated_docids.add(docid)
+                remove_kids = {
+                    self._text_to_kid[kw]
+                    for kw in item.keywords
+                    if kw in self._text_to_kid
+                }
+                if not remove_kids:
+                    continue
+                filtered_kids = tuple(kid for kid in current_kids if kid not in remove_kids)
+                if not filtered_kids:
+                    filtered_kids = (current_kids[0],)
+                if len(filtered_kids) < len(current_kids):
+                    removed_edges += len(current_kids) - len(filtered_kids)
+                    self._overlay_kw_ids[u32] = filtered_kids
+                    updated_u32.add(u32)
             for item in request.additions:
-                docid = item.docid
-                current = self._overlay_texts.get(docid)
-                if current is None:
-                    base = self._base_lookup_one(docid, None)
-                    if not base:
+                u32 = pack_docid_u32(item.docid)
+                current_kids = self._overlay_kw_ids.get(u32)
+                if current_kids is None:
+                    current_kids = self._base_kw_ids_one(u32)
+                    if not current_kids:
                         continue
-                    current = list(base)
-                existing = set(current)
+                kid_list = list(current_kids)
+                existing_kids = set(kid_list)
                 changed = False
                 for kw in item.keywords:
-                    if len(current) >= request.k_max:
+                    if len(kid_list) >= request.k_max:
                         break
-                    if kw.strip() and kw not in existing:
-                        current.append(kw)
-                        existing.add(kw)
+                    kid = self._text_to_kid.get(kw)
+                    if kid is not None and kid not in existing_kids:
+                        kid_list.append(kid)
+                        existing_kids.add(kid)
                         added_edges += 1
                         changed = True
                 if changed:
-                    self._overlay_texts[docid] = current
-                    updated_docids.add(docid)
+                    self._overlay_kw_ids[u32] = tuple(kid_list)
+                    updated_u32.add(u32)
             return {
-                "updated_docids": len(updated_docids),
+                "updated_docids": len(updated_u32),
                 "added_edges": added_edges,
                 "removed_edges": removed_edges,
-                "overlay_docids": len(self._overlay_texts),
+                "overlay_docids": len(self._overlay_kw_ids),
             }
 
     def update_docid_mappings(
@@ -387,41 +306,64 @@ class ResidentMapping:
         replace_all: bool = False,
     ) -> dict[str, int]:
         with self._lock:
-            if not self._is_columnar or self._kw_array is None:
-                raise ValueError("In-memory docid2keyword update requires a columnar index")
             max_kw_id = len(self._kw_array)
-            new_docids: list[int] = []
-            new_kw_ids: list[int] = []
+            if replace_all:
+                self._overlay_kw_ids.clear()
             for entry in entries:
                 u32 = pack_docid_u32(entry.docid)
+                dedup_kids: list[int] = []
+                seen: set[int] = set()
                 for kid in entry.keyword_ids:
                     if not 0 <= kid < max_kw_id:
                         raise ValueError(f"keyword_id {kid} out of range [0, {max_kw_id})")
-                    new_docids.append(u32)
-                    new_kw_ids.append(kid)
-            new_docids_arr = np.asarray(new_docids, dtype=np.uint32)
-            new_kw_ids_arr = np.asarray(new_kw_ids, dtype=np.uint32)
-            if not replace_all and self._unique_docids_u32 is not None and self._csr_offsets is not None and self._csr_kw_ids is not None:
-                counts = np.diff(self._csr_offsets)
-                existing_docids = np.repeat(self._unique_docids_u32, counts)
-                updated_set = np.unique(new_docids_arr)
-                keep_mask = ~np.isin(existing_docids, updated_set)
-                merged_docids = np.concatenate([existing_docids[keep_mask], new_docids_arr])
-                merged_kw_ids = np.concatenate([self._csr_kw_ids[keep_mask], new_kw_ids_arr])
-                self._rebuild_csr(merged_docids, merged_kw_ids)
-            else:
-                self._rebuild_csr(new_docids_arr, new_kw_ids_arr)
-            assert self._unique_docids_u32 is not None
-            return {"id_count": int(len(self._unique_docids_u32)), "rows": self.rows}
+                    if kid not in seen:
+                        dedup_kids.append(int(kid))
+                        seen.add(int(kid))
+                self._overlay_kw_ids[u32] = tuple(dedup_kids)
+            return {
+                "id_count": int(len(self._unique_docids_u32)),
+                "overlay_docids": len(self._overlay_kw_ids),
+            }
 
     def save_docid_mappings(self, output_dir: str | Path) -> dict[str, Any]:
         with self._lock:
-            if not self._is_columnar or self._unique_docids_u32 is None or self._csr_offsets is None or self._csr_kw_ids is None:
-                raise ValueError("Saving dynamic docid2keyword mappings requires a columnar index")
             target_dir = Path(output_dir).expanduser().resolve()
             target_dir.mkdir(parents=True, exist_ok=True)
             counts = np.diff(self._csr_offsets)
-            expanded_docids = np.repeat(self._unique_docids_u32, counts)
+            base_docids = np.repeat(self._unique_docids_u32, counts)
+            if self._overlay_kw_ids:
+                overlay_u32 = np.asarray(list(self._overlay_kw_ids.keys()), dtype=np.uint32)
+                keep_mask = ~np.isin(base_docids, overlay_u32)
+                ov_docids_list: list[int] = []
+                ov_kids_list: list[int] = []
+                for u32, kids in self._overlay_kw_ids.items():
+                    ov_docids_list.extend([u32] * len(kids))
+                    ov_kids_list.extend(kids)
+                merged_docids = np.concatenate([
+                    base_docids[keep_mask],
+                    np.asarray(ov_docids_list, dtype=np.uint32),
+                ])
+                merged_kids = np.concatenate([
+                    self._csr_kw_ids[keep_mask],
+                    np.asarray(ov_kids_list, dtype=np.uint32),
+                ])
+                packed = (merged_docids.astype(np.uint64) << np.uint64(32)) | merged_kids.astype(np.uint64)
+                packed = np.unique(packed)
+                expanded_docids = (packed >> np.uint64(32)).astype(np.uint32)
+                csr_kw_ids = (packed & np.uint64(0xFFFFFFFF)).astype(np.uint32)
+                change_idx = np.flatnonzero(expanded_docids[1:] != expanded_docids[:-1]) + 1
+                unique_docids = np.empty(len(change_idx) + 1, dtype=np.uint32)
+                unique_docids[0] = expanded_docids[0]
+                unique_docids[1:] = expanded_docids[change_idx]
+                csr_offsets = np.empty(len(unique_docids) + 1, dtype=np.int64)
+                csr_offsets[0] = 0
+                csr_offsets[1:-1] = change_idx
+                csr_offsets[-1] = len(expanded_docids)
+            else:
+                expanded_docids = base_docids
+                unique_docids = self._unique_docids_u32
+                csr_offsets = self._csr_offsets
+                csr_kw_ids = self._csr_kw_ids
             pairs_schema = pa.schema([
                 ("docid_u32", pa.uint32()),
                 ("keyword_id", pa.uint32()),
@@ -429,23 +371,23 @@ class ResidentMapping:
             pairs_path = target_dir / "docid_keywords.parquet"
             pq.write_table(
                 pa.Table.from_arrays(
-                    [pa.array(expanded_docids, type=pa.uint32()), pa.array(self._csr_kw_ids, type=pa.uint32())],
+                    [pa.array(expanded_docids, type=pa.uint32()), pa.array(csr_kw_ids, type=pa.uint32())],
                     schema=pairs_schema,
                 ),
                 pairs_path,
                 compression="zstd",
             )
-            np.save(target_dir / "docid_unique.u32.npy", self._unique_docids_u32)
-            np.save(target_dir / "docid_offsets.i64.npy", self._csr_offsets)
-            np.save(target_dir / "docid_kw_ids.u32.npy", self._csr_kw_ids)
+            np.save(target_dir / "docid_unique.u32.npy", unique_docids)
+            np.save(target_dir / "docid_offsets.i64.npy", csr_offsets)
+            np.save(target_dir / "docid_kw_ids.u32.npy", csr_kw_ids)
             src_kw = self.path / "keywords.parquet"
             dst_kw = target_dir / "keywords.parquet"
             if not dst_kw.exists() and src_kw.is_file():
                 dst_kw.symlink_to(src_kw)
             return {
                 "output_dir": str(target_dir),
-                "id_count": int(len(self._unique_docids_u32)),
-                "rows": self.rows,
+                "id_count": int(len(unique_docids)),
+                "rows": int(len(csr_kw_ids)),
             }
 
 

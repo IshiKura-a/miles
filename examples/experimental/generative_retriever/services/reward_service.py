@@ -11,11 +11,10 @@ Run:
 from __future__ import annotations
 
 import argparse
-import base64
 import logging
 import math
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
@@ -23,10 +22,7 @@ from threading import Lock
 from typing import Annotated, Any
 
 import httpx
-import numpy as np
-import torch
 import uvicorn
-import xxhash
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, StrictInt, create_model, field_validator
 
@@ -59,10 +55,9 @@ from examples.experimental.generative_retriever.reward.relevance_reward import (
     build_baseline_set,
     calculate_keyword_rewards,
 )
-from examples.experimental.generative_retriever.reward.reward_http import post_json_sync
 
 logger = logging.getLogger(__name__)
-REWARD_SERVICE_API_VERSION = 10
+REWARD_SERVICE_API_VERSION = 11
 _SERVICE_API_VERSION = REWARD_SERVICE_API_VERSION
 _QUERY_CACHE_SIZE = DEFAULT_QUERY_CACHE_SIZE
 _KEYWORD_CACHE_SIZE = DEFAULT_KEYWORD_CACHE_SIZE
@@ -120,14 +115,6 @@ class BaselinePrepareRequest(BaseModel):
         return queries
 
 
-class ScorePairsRequest(BaseModel):
-    query_embeddings_b64: str
-    num_queries: StrictInt
-    keywords: Annotated[list[str], Field(min_length=1)]
-    q_indices: Annotated[list[int], Field(min_length=1)]
-    k_indices: Annotated[list[int], Field(min_length=1)]
-
-
 def summarize_breakdown_metrics(breakdown: dict[str, Any]) -> dict[str, float]:
     items = list(breakdown.values())
     n = float(len(items))
@@ -178,15 +165,11 @@ class KeywordRewardEngine:
         *,
         pair_batch_size: int,
         keyword_cache_size: int = _KEYWORD_CACHE_SIZE,
-        peer_urls: tuple[str, ...] = (),
-        self_worker_index: int = -1,
     ) -> None:
         self.mapping_version = mapping_version
         self.mapping_url = mapping_url
         self.baseline_url = baseline_url
         self.docids_per_query = docids_per_query
-        self.peer_urls = peer_urls
-        self.self_worker_index = self_worker_index
         self._baseline_queries: set[str] = set()
         self.baselines: LRUCache[str, BaselineSets] = LRUCache(query_cache_size)
         relevance_source = resolve_relevance_source(relevance_model)
@@ -205,201 +188,25 @@ class KeywordRewardEngine:
         self._lock = Lock()
         self._scorer_lock = Lock()
         self._baseline_inflight: dict[str, Future[BaselineSets]] = {}
-        self._client = httpx.Client(timeout=300.0, trust_env=False)
-        self._peer_executor = (
-            ThreadPoolExecutor(max_workers=max(1, len(peer_urls)))
-            if len(peer_urls) > 1
-            else None
+        self._client = httpx.Client(
+            timeout=300.0,
+            limits=httpx.Limits(max_connections=128, max_keepalive_connections=32),
+            trust_env=False,
         )
         self._step_additions: dict[tuple[int, int, int, int], list[str]] = {}
         self._step_docid_queries: dict[tuple[int, int, int, int], set[str]] = {}
         self._step_docid_keywords: dict[tuple[int, int, int, int], list[str]] = {}
         self._step_edge_passes: dict[tuple[tuple[int, int, int, int], str], int] = {}
 
-    @staticmethod
-    def _pack_shard_inputs(
-        shard_pairs: list[tuple[str, str]],
-        query_embeddings: dict[str, torch.Tensor],
-    ) -> tuple[torch.Tensor, list[str], list[int], list[int]]:
-        q_map: dict[str, int] = {}
-        k_map: dict[str, int] = {}
-        q_tensors: list[torch.Tensor] = []
-        keywords: list[str] = []
-        q_indices: list[int] = []
-        k_indices: list[int] = []
-        for q, k in shard_pairs:
-            qi = q_map.get(q)
-            if qi is None:
-                qi = len(q_tensors)
-                q_map[q] = qi
-                q_tensors.append(query_embeddings[q])
-            ki = k_map.get(k)
-            if ki is None:
-                ki = len(keywords)
-                k_map[k] = ki
-                keywords.append(k)
-            q_indices.append(qi)
-            k_indices.append(ki)
-        return torch.stack(q_tensors, dim=0), keywords, q_indices, k_indices
-
-    def _score_shard_local(
-        self,
-        shard_pairs: list[tuple[str, str]],
-        query_embeddings: dict[str, torch.Tensor],
-    ) -> tuple[dict[tuple[str, str], tuple[float, float]], dict[str, int]]:
-        q_tensor, keywords, q_indices, k_indices = self._pack_shard_inputs(
-            shard_pairs, query_embeddings,
-        )
-        with self._scorer_lock:
-            scores, k_delta = self.scorer.score_with_query_embeddings(
-                q_tensor, keywords, q_indices, k_indices,
-            )
-        return dict(zip(shard_pairs, scores, strict=True)), k_delta
-
-    def _post_peer_score_pairs(
-        self,
-        peer_score_url: str,
-        shard_pairs: list[tuple[str, str]],
-        query_embeddings: dict[str, torch.Tensor],
-    ) -> tuple[dict[tuple[str, str], tuple[float, float]], dict[str, int]]:
-        q_tensor, keywords, q_indices, k_indices = self._pack_shard_inputs(
-            shard_pairs, query_embeddings,
-        )
-        q_bytes = q_tensor.contiguous().view(torch.uint16).cpu().numpy().tobytes()
-        url = peer_score_url.removesuffix("/score") + "/score_pairs"
-        payload = post_json_sync(
-            self._client,
-            url,
-            {
-                "query_embeddings_b64": base64.b64encode(q_bytes).decode("ascii"),
-                "num_queries": int(q_tensor.shape[0]),
-                "keywords": keywords,
-                "q_indices": q_indices,
-                "k_indices": k_indices,
-            },
-        )
-        raw_scores = payload.get("scores")
-        if not isinstance(raw_scores, list) or len(raw_scores) != len(shard_pairs):
-            raise ValueError("Peer reward worker returned invalid pair score count")
-        raw_delta = payload.get("keyword_cache_delta", {})
-        k_delta = {
-            "hits": int(raw_delta.get("hits", 0)),
-            "misses": int(raw_delta.get("misses", 0)),
-            "evictions": int(raw_delta.get("evictions", 0)),
-        }
-        return (
-            {
-                pair: (float(row[0]), float(row[1]))
-                for pair, row in zip(shard_pairs, raw_scores, strict=True)
-            },
-            k_delta,
-        )
-
-    def _score_pairs_k_sharded(
+    def _score_pairs_local(
         self,
         pairs: list[tuple[str, str]],
     ) -> tuple[dict[tuple[str, str], tuple[float, float]], dict[str, dict[str, int]]]:
-        zero_counter = {"hits": 0, "misses": 0, "evictions": 0}
-        unique_pairs = list(dict.fromkeys(pairs))
-        if not unique_pairs:
-            return {}, {
-                "baseline": dict(zero_counter),
-                "reward": dict(zero_counter),
-                "query_features": dict(zero_counter),
-                "keyword_features": dict(zero_counter),
-            }
-        num_peers = len(self.peer_urls)
-        if num_peers <= 1 or self._peer_executor is None:
-            with self._scorer_lock:
-                before = self._cache_stats()
-                scored = self.scorer.score(unique_pairs)
-                after = self._cache_stats()
+        with self._scorer_lock:
+            before = self._cache_stats()
+            scored = self.scorer.score(pairs)
+            after = self._cache_stats()
             return scored, self._cache_delta(before, after)
-        resolved: dict[tuple[str, str], tuple[float, float]] = {}
-        missing_pairs: list[tuple[str, str]] = []
-        r_hits = r_misses = 0
-        with self._scorer_lock:
-            for pair in unique_pairs:
-                cached = self.scorer.scores.get(pair)
-                if cached is not None:
-                    resolved[pair] = cached
-                    r_hits += 1
-                else:
-                    missing_pairs.append(pair)
-                    r_misses += 1
-            if not missing_pairs:
-                return resolved, {
-                    "baseline": dict(zero_counter),
-                    "reward": {"hits": r_hits, "misses": 0, "evictions": 0},
-                    "query_features": dict(zero_counter),
-                    "keyword_features": dict(zero_counter),
-                }
-            query_embeddings, q_delta = self.scorer.encode_queries_cached(
-                [q for q, _ in missing_pairs]
-            )
-        buckets: list[list[tuple[str, str]]] = [[] for _ in range(num_peers)]
-        for pair in missing_pairs:
-            shard_idx = xxhash.xxh64_intdigest(pair[1]) % num_peers
-            buckets[shard_idx].append(pair)
-        futures: list[Future[tuple[dict[tuple[str, str], tuple[float, float]], dict[str, int]]]] = []
-        for shard_idx, shard_pairs in enumerate(buckets):
-            if not shard_pairs:
-                continue
-            if shard_idx == self.self_worker_index:
-                futures.append(
-                    self._peer_executor.submit(
-                        self._score_shard_local, shard_pairs, query_embeddings,
-                    )
-                )
-            else:
-                futures.append(
-                    self._peer_executor.submit(
-                        self._post_peer_score_pairs,
-                        self.peer_urls[shard_idx],
-                        shard_pairs,
-                        query_embeddings,
-                    )
-                )
-        newly_scored: dict[tuple[str, str], tuple[float, float]] = {}
-        k_delta_total = {"hits": 0, "misses": 0, "evictions": 0}
-        for future in futures:
-            shard_scores, shard_k_delta = future.result()
-            newly_scored.update(shard_scores)
-            for key in ("hits", "misses", "evictions"):
-                k_delta_total[key] += shard_k_delta[key]
-        with self._scorer_lock:
-            evictions_before = self.scorer.scores.stats().evictions
-            for pair in missing_pairs:
-                score = newly_scored[pair]
-                self.scorer.scores.put(pair, score)
-                resolved[pair] = score
-            r_evictions = self.scorer.scores.stats().evictions - evictions_before
-        return resolved, {
-            "baseline": dict(zero_counter),
-            "reward": {"hits": r_hits, "misses": r_misses, "evictions": r_evictions},
-            "query_features": q_delta,
-            "keyword_features": k_delta_total,
-        }
-
-    def score_pairs(self, request: ScorePairsRequest) -> dict[str, Any]:
-        raw_bytes = base64.b64decode(request.query_embeddings_b64)
-        arr = np.frombuffer(raw_bytes, dtype=np.uint16).copy()
-        num_tokens = self.scorer.keyword_features.num_tokens
-        feature_dim = self.scorer.keyword_features.feature_dim
-        q_tensor = torch.from_numpy(arr).view(torch.bfloat16).reshape(
-            request.num_queries, num_tokens, feature_dim,
-        )
-        with self._scorer_lock:
-            scores, k_delta = self.scorer.score_with_query_embeddings(
-                q_tensor,
-                request.keywords,
-                request.q_indices,
-                request.k_indices,
-            )
-        return {
-            "scores": [[pm, sm] for pm, sm in scores],
-            "keyword_cache_delta": k_delta,
-        }
 
     def _cache_stats(self) -> dict[str, Any]:
         return {
@@ -525,7 +332,7 @@ class KeywordRewardEngine:
                     for query in missing_queries
                 }
                 mapped_at = time.perf_counter()
-                pair_scores, scoring_delta = self._score_pairs_k_sharded([
+                pair_scores, scoring_delta = self._score_pairs_local([
                     (query, keyword)
                     for query in missing_queries
                     for keyword in query_keywords[query]
@@ -607,7 +414,7 @@ class KeywordRewardEngine:
             for sample, keywords in zip(request.samples, sample_keywords, strict=True)
             for keyword in keywords
         ]
-        pair_scores, scoring_delta = self._score_pairs_k_sharded(pairs)
+        pair_scores, scoring_delta = self._score_pairs_local(pairs)
         scored_at = time.perf_counter()
         query_kw_freq: dict[str, dict[str, int]] = {}
         query_group_indices: dict[str, list[int]] = {}
@@ -750,8 +557,6 @@ class KeywordRewardEngine:
             }
 
     def close(self) -> None:
-        if self._peer_executor is not None:
-            self._peer_executor.shutdown(wait=True)
         self._client.close()
 
 
@@ -768,8 +573,6 @@ def create_app(
     query_cache_size: int = _QUERY_CACHE_SIZE,
     keyword_cache_size: int = _KEYWORD_CACHE_SIZE,
     score_cache_size: int = _SCORE_CACHE_SIZE,
-    peer_urls: tuple[str, ...] = (),
-    self_worker_index: int = -1,
 ) -> FastAPI:
     if batch_size < 4 or batch_size % 4:
         raise ValueError("batch_size must be a positive multiple of 4")
@@ -793,8 +596,6 @@ def create_app(
             docids_per_query,
             pair_batch_size=pair_batch_size,
             keyword_cache_size=keyword_cache_size,
-            peer_urls=peer_urls,
-            self_worker_index=self_worker_index,
         )
         try:
             yield
@@ -866,10 +667,6 @@ def create_app(
     def harvest_step_delta() -> dict[str, Any]:
         return app.state.engine.harvest_step_delta()
 
-    @app.post("/score_pairs")
-    def score_pairs(request: ScorePairsRequest) -> dict[str, Any]:
-        return app.state.engine.score_pairs(request)
-
     return app
 
 
@@ -888,10 +685,7 @@ def main() -> None:
     parser.add_argument("--query-cache-size", type=int, default=_QUERY_CACHE_SIZE)
     parser.add_argument("--keyword-cache-size", type=int, default=_KEYWORD_CACHE_SIZE)
     parser.add_argument("--score-cache-size", type=int, default=_SCORE_CACHE_SIZE)
-    parser.add_argument("--peer-urls", default="")
-    parser.add_argument("--self-worker-index", type=int, default=-1)
     args = parser.parse_args()
-    peer_urls = tuple(u.strip() for u in args.peer_urls.split(",") if u.strip())
     logging.basicConfig(level=logging.INFO)
     uvicorn.run(
         create_app(
@@ -906,8 +700,6 @@ def main() -> None:
             query_cache_size=args.query_cache_size,
             keyword_cache_size=args.keyword_cache_size,
             score_cache_size=args.score_cache_size,
-            peer_urls=peer_urls,
-            self_worker_index=args.self_worker_index,
         ),
         host=args.host,
         port=args.port,

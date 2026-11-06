@@ -337,10 +337,10 @@ uv run --env-file .env python -m examples.experimental.generative_retriever.run_
 
 | 物理 GPU | 角色 | 数量 |
 | --- | --- | --- |
-| 0-1 | learner / train（独占） | 2 |
-| 2-3 | train rollout inference（与 reward worker 0-1 共卡） | 2 |
-| 4-5 | frozen baseline constrained beam（与 reward worker 2-3 共卡） | 2 |
-| 2-7 | relevance reward workers（端口 `30490..30495`） | 6 |
+| 0-1 | learner / train（与 reward worker 0-1 共卡） | 2 |
+| 2-3 | train rollout inference（与 reward worker 2-3 共卡） | 2 |
+| 4-5 | frozen baseline constrained beam（与 reward worker 4-5 共卡） | 2 |
+| 0-7 | relevance reward workers（全 8 卡，端口 `30490..30497`） | 8 |
 
 Launcher 设置各服务的 GPU visibility；离线评测与训练使用不同的
 生成和评分端口。
@@ -393,11 +393,10 @@ CUDA_VISIBLE_DEVICES=4,5 uv run python -m \
 1. **一级缓存（L1 Score Cache，`--score-cache-size`）**：
    - 在 `q-hash` 所属 worker 上缓存 `(q, k) -> (pm_score, sm_score)`。
    - 同一个 query 在 `/prepare`（Baseline 512 个 doc ID 打分）与 `/score`（Rollout 512 个 doc ID 打分）之间重叠的 `(q, k)` 对、同一 query 跨多个 `/score` 批次的重复词、以及数据集中的重复高频 query 直接在 L1 命中返回，零 GPU 计算、零跨卡 RPC。
-2. **二级缓存（L2 Decoupled GPU Embedding Tables，`--query-cache-size` + `--keyword-cache-size`）**：
-   - 仅当 `(q, k)` 在 L1 未命中时触发，使用预分配在 GPU HBM 显存中的 `bfloat16` `[capacity, 2, 128]` 张量表（[GpuEmbeddingTable](../../examples/experimental/generative_retriever/reward/relevance_model.py)）：
-     - **`query_features`（`--query-cache-size`）**：按 `q-hash` 常驻在所属 worker 显存中（每条仅 `512 Bytes`），Baseline `/prepare` 编码一次 $q$ 后，后续 Rollout `/score` 直接在显存中 $O(1)$ 复用 `q_emb`；
-     - **`keyword_features`（`--keyword-cache-size`）**：按 `xxhash64(k) % num_workers`（`k-hash`）在所有 reward worker 显存间全局分片（每卡最高 `8,388,608` 条仅占 `4.0 GiB` HBM，单机 6 卡合并不重复缓存 `5,033 万`条唯一 keyword 向量，双机 8 卡合并缓存 `6,710 万`条）。
-   - `q-hash` worker 将 L1 miss 的 `(q, k)` 按 `k-hash` 分桶，只把 `512 Bytes` 的 `q_emb` 和 `k` 发送给对应的 peer worker（`/score_pairs`）；peer worker 无需运行 `query_engine`，只需查/编码本地 `keyword_features` 显存表并执行 GPU `cross_model(q_emb, k_emb)`，结果写回 L1 `score_cache`。
+2. **二级缓存（L2 纯 GPU 显存 Embedding Tables，`--query-cache-size` + `--keyword-cache-size`）**：
+   - 仅当 `(q, k)` 在 L1 未命中时触发，全部常驻在各 GPU HBM 显存预分配的 `bfloat16` `[capacity, 2, 128]` 张量表（[GpuEmbeddingTable](../../examples/experimental/generative_retriever/reward/relevance_model.py)）中，不使用主机 `/dev/shm` 或跨进程 RPC：
+     - **`query_features`（`--query-cache-size`）**：常驻在所属 worker 显存中（每条仅 `512 Bytes`），Baseline `/prepare` 编码一次 $q$ 后，后续 Rollout `/score` 直接在显存中 $O(1)$ 复用 `q_emb`；
+     - **`keyword_features`（`--keyword-cache-size`）**：每张 GPU 显存独立常驻最高 `8,388,608` 条（仅占 `4.0 GiB` HBM），所有查询、编码与 `cross_model(q_emb, k_emb)` 打分 100% 在本卡显存内闭环完成，零跨进程通信与同步等待。
 
 ### 两机 16 GPU 与多机 `2n × 8` GPU 异步 GRPO 配置
 
