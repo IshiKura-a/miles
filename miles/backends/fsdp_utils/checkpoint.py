@@ -9,7 +9,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
-from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
+from torch.distributed.checkpoint.state_dict import StateDictOptions, get_state_dict, set_state_dict
 from torch.distributed.checkpoint.stateful import Stateful
 
 logger = logging.getLogger(__name__)
@@ -23,10 +23,24 @@ class ModelState(Stateful):
 
     def state_dict(self):
         model_state_dict, _ = get_state_dict(self.model, optimizers=[])
+        if getattr(self.model, "_miles_fsdp_ignore_frozen_parameters", False):
+            trainable_keys = {
+                name for name, param in self.model.named_parameters() if param.requires_grad
+            }
+            model_state_dict = {
+                key: value for key, value in model_state_dict.items() if key in trainable_keys
+            }
         return {"model": model_state_dict}
 
     def load_state_dict(self, state_dict):
-        set_state_dict(self.model, optimizers=[], model_state_dict=state_dict["model"], optim_state_dict=None)
+        strict = not getattr(self.model, "_miles_fsdp_ignore_frozen_parameters", False)
+        set_state_dict(
+            self.model,
+            optimizers=[],
+            model_state_dict=state_dict["model"],
+            optim_state_dict=None,
+            options=StateDictOptions(strict=strict),
+        )
 
 
 class OptimizerState(Stateful):

@@ -2,6 +2,7 @@ import logging
 from argparse import Namespace
 from collections.abc import Sequence
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -47,15 +48,28 @@ def get_rollout_data(
         witness_info=witness_info,
     )
     # move tokens to GPU in advance
-    rollout_data["tokens"] = [
-        torch.tensor(t, dtype=torch.long, device=torch.cuda.current_device()) for t in rollout_data["tokens"]
-    ]
-    rollout_data["loss_masks"] = [
-        torch.tensor(t, dtype=torch.int, device=torch.cuda.current_device()) for t in rollout_data["loss_masks"]
-    ]
+    current_device = torch.cuda.current_device()
+    raw_tokens = rollout_data["tokens"]
+    if raw_tokens and isinstance(raw_tokens[0], np.ndarray):
+        token_lengths = [len(t) for t in raw_tokens]
+        flat_tokens = torch.as_tensor(np.concatenate(raw_tokens), dtype=torch.long, device=current_device)
+        rollout_data["tokens"] = list(flat_tokens.split(token_lengths))
+    else:
+        rollout_data["tokens"] = [
+            torch.tensor(t, dtype=torch.long, device=current_device) for t in raw_tokens
+        ]
+    raw_masks = rollout_data["loss_masks"]
+    if raw_masks and isinstance(raw_masks[0], np.ndarray):
+        mask_lengths = [len(m) for m in raw_masks]
+        flat_masks = torch.as_tensor(np.concatenate(raw_masks), dtype=torch.int, device=current_device)
+        rollout_data["loss_masks"] = list(flat_masks.split(mask_lengths))
+    else:
+        rollout_data["loss_masks"] = [
+            torch.tensor(t, dtype=torch.int, device=current_device) for t in raw_masks
+        ]
     if "rollout_mask_sums" in rollout_data:
         rollout_data["rollout_mask_sums"] = torch.tensor(
-            rollout_data["rollout_mask_sums"], dtype=torch.float32, device=torch.cuda.current_device()
+            rollout_data["rollout_mask_sums"], dtype=torch.float32, device=current_device
         )
     if args.enable_witness:
         seq_witness_ids = rollout_data.pop("seq_witness_ids")
@@ -93,27 +107,32 @@ def get_rollout_data(
     for key in ("rollout_log_probs", "teacher_log_probs", "opd_reverse_kl"):
         if key in rollout_data:
             dtype = _rollout_logprob_dtype(args) if key == "rollout_log_probs" else torch.float32
-            rollout_data[key] = [
-                torch.as_tensor(
-                    slice_log_prob_with_cp(
-                        value,
-                        total_length,
-                        response_length,
-                        args.qkv_format,
-                        rollout_data["max_seq_lens"][i] if args.qkv_format == "bshd" else None,
-                    ),
-                    device=torch.cuda.current_device(),
-                    dtype=dtype,
-                )
-                for i, (value, total_length, response_length) in enumerate(
-                    zip(
-                        rollout_data[key],
-                        rollout_data["total_lengths"],
-                        rollout_data["response_lengths"],
-                        strict=False,
+            if parallel_state.cp.size == 1 and rollout_data[key] and isinstance(rollout_data[key][0], np.ndarray):
+                val_lengths = [len(v) for v in rollout_data[key]]
+                flat_vals = torch.as_tensor(np.concatenate(rollout_data[key]), dtype=dtype, device=current_device)
+                rollout_data[key] = list(flat_vals.split(val_lengths))
+            else:
+                rollout_data[key] = [
+                    torch.as_tensor(
+                        slice_log_prob_with_cp(
+                            value,
+                            total_length,
+                            response_length,
+                            args.qkv_format,
+                            rollout_data["max_seq_lens"][i] if args.qkv_format == "bshd" else None,
+                        ),
+                        device=current_device,
+                        dtype=dtype,
                     )
-                )
-            ]
+                    for i, (value, total_length, response_length) in enumerate(
+                        zip(
+                            rollout_data[key],
+                            rollout_data["total_lengths"],
+                            rollout_data["response_lengths"],
+                            strict=False,
+                        )
+                    )
+                ]
     if "rollout_routed_experts" in rollout_data:
         rollout_data["rollout_routed_experts"] = [torch.from_numpy(r) for r in rollout_data["rollout_routed_experts"]]
     if "rollout_indexer_topk" in rollout_data:
@@ -546,17 +565,25 @@ def get_data_iterator(
         for i, num_mbs in enumerate(num_microbatches):
             start, end = i * num_local_gbs, (i + 1) * num_local_gbs
             samples = rollout_data["total_lengths"][start:end]
-            partitions = get_seqlen_balanced_partitions(samples, num_mbs, equal_size=False)
-            for j in range(num_mbs):
-                for k in range(len(partitions[j])):
-                    partitions[j][k] += start
-                # Multi-LoRA: microbatches must be contiguous-by-slot for the
-                # grouped GEMM's per-adapter token-count math.
+            if args.balance_data:
+                partitions = get_seqlen_balanced_partitions(samples, num_mbs, equal_size=False)
+                for j in range(num_mbs):
+                    for k in range(len(partitions[j])):
+                        partitions[j][k] += start
+                    if "adapter_slots" in rollout_data:
+                        partitions[j].sort(key=lambda index: rollout_data["adapter_slots"][index])
+            else:
+                step_count = end - start
+                partitions = [
+                    list(range(start + (j * step_count) // num_mbs, start + ((j + 1) * step_count) // num_mbs))
+                    for j in range(num_mbs)
+                ]
                 if "adapter_slots" in rollout_data:
-                    partitions[j].sort(key=lambda index: rollout_data["adapter_slots"][index])
+                    for j in range(num_mbs):
+                        partitions[j].sort(key=lambda index: rollout_data["adapter_slots"][index])
             micro_batch_indices.extend(partitions)
 
-        assert len(set(sum(micro_batch_indices, []))) == num_local_samples
+        assert sum(len(mb) for mb in micro_batch_indices) == num_local_samples
 
         data_iterator = _generate_data_iterator(rollout_data, None, micro_batch_indices)
 

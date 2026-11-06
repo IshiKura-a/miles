@@ -58,6 +58,29 @@ def compute_ess_ratio_contribution(
         max_seq_lens,
     )
     local_lengths = [mask.size(0) for mask in local_masks]
+    if local_masks and len(set(local_lengths)) == 1 and len(set(response_lengths)) == 1 and local_lengths[0] > 0:
+        batch_size = len(loss_masks)
+        local_len = local_lengths[0]
+        weights_2d = _safe_exp_neg_ppo_kl(ppo_kl.detach()).view(batch_size, local_len)
+        local_masks_2d = torch.stack(local_masks).to(device=weights_2d.device, dtype=weights_2d.dtype)
+        masked_w = weights_2d * local_masks_2d
+        partial_sums = torch.stack([masked_w.sum(dim=-1), (masked_w * masked_w).sum(dim=-1)], dim=-1).float()
+        if cp_size > 1:
+            dist.all_reduce(partial_sums, op=dist.ReduceOp.SUM, group=parallel_state.cp.group)
+        full_masks_2d = (
+            local_masks_2d
+            if cp_size == 1
+            else torch.stack(loss_masks).to(device=ppo_kl.device, dtype=torch.float32)
+        )
+        num_valid = torch.clamp_min(full_masks_2d.float().sum(dim=-1), 1.0)
+        sum_w = partial_sums[:, 0]
+        sum_w2 = partial_sums[:, 1]
+        ess_ratios = (sum_w * sum_w) / (num_valid * torch.clamp_min(sum_w2, 1e-8))
+        ess_ratio_sum = (ess_ratios * num_valid if calculate_per_token_loss else ess_ratios).sum()
+        if cp_size > 1 and parallel_state.cp.rank != 0:
+            ess_ratio_sum = ess_ratio_sum * 0
+        return ess_ratio_sum
+
     is_weights_per_sample = _safe_exp_neg_ppo_kl(ppo_kl.detach()).split(local_lengths, dim=0)
 
     partial_sums = torch.zeros(len(loss_masks), 2, device=ppo_kl.device, dtype=torch.float32)
@@ -454,6 +477,12 @@ def get_grpo_returns(
     rewards: torch.Tensor,
     kl: list[torch.Tensor],
 ):
+    if not kl:
+        return []
+    lengths = [k.numel() for k in kl]
+    if len(set(lengths)) == 1:
+        expanded = rewards.to(dtype=kl[0].dtype).unsqueeze(1).expand(len(rewards), lengths[0]).contiguous()
+        return list(expanded.unbind(0))
     returns = []
     for i in range(len(rewards)):
         returns.append(torch.ones_like(kl[i]) * rewards[i])

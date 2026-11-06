@@ -14,8 +14,10 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
+from transformers import T5Config, T5ForConditionalGeneration
 
-from examples.experimental.generative_retriever.index.id_text_mapping import _validate_id
+from examples.experimental.generative_retriever.index.id_text_mapping import validate_docid
 from examples.experimental.generative_retriever.model.model_loading import (
     build_run_arguments,
     checkpoint_tensor_shape,
@@ -50,9 +52,6 @@ def _record(mm: mmap.mmap, offsets: np.memmap, index: int) -> dict[str, Any]:
 
 
 def _load_model(checkpoint: Path, qwen_model: Path, slm_root: Path, device: str) -> Any:
-    import torch
-    from transformers import T5Config, T5ForConditionalGeneration
-
     slmv3 = import_slmv3(slm_root)
     args = build_run_arguments(slmv3["RunArguments"], checkpoint, qwen_model)
     config = T5Config.from_pretrained(checkpoint)
@@ -71,8 +70,6 @@ def _load_model(checkpoint: Path, qwen_model: Path, slm_root: Path, device: str)
 def _encode(
     model: Any, support: Any, records: list[dict[str, Any]], device: str,
 ) -> list[tuple[int, int, int, int]]:
-    import torch
-
     prompts = [
         support.cutomized_apply_chat_template(
             support.customized_tokenize(Query=record["query"], Doc=record)["doc_str"]
@@ -95,7 +92,7 @@ def _encode(
     result = []
     for row in codes:
         docid = (row[0] - 2, row[1] - 2, row[2] - 2, row[3] - 2)
-        _validate_id(docid)
+        validate_docid(docid)
         result.append(docid)
     return result
 
@@ -206,7 +203,7 @@ def merge_shards(args: argparse.Namespace) -> None:
             if len(components) != 4:
                 raise ValueError(f"Invalid merged doc ID at row {rows}")
             docid = (components[0], components[1], components[2], components[3])
-            _validate_id(docid)
+            validate_docid(docid)
             roots.add(docid[0])
     if roots != set(range(256)):
         raise ValueError(f"Index misses first-level codes: {sorted(set(range(256)) - roots)}")

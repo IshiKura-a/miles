@@ -161,6 +161,64 @@ class RewardRouter:
         )
         return result
 
+    def commit_step_updates(self) -> dict[str, Any]:
+        started = time.perf_counter()
+        futures = [
+            self._executor.submit(
+                post_json_sync,
+                self._client,
+                url.removesuffix("/score") + "/harvest_step_delta",
+                {},
+            )
+            for url in self.worker_urls
+        ]
+        harvested = [future.result() for future in futures]
+        mapping_url = next(
+            (item.get("mapping_url") for item in harvested if isinstance(item.get("mapping_url"), str)),
+            None,
+        )
+        merged_adds: dict[tuple[int, int, int, int], list[str]] = {}
+        merged_rems: dict[tuple[int, int, int, int], list[str]] = {}
+        for item in harvested:
+            for entry in item.get("additions", []):
+                key = tuple(int(v) for v in entry["docid"])
+                bucket = merged_adds.setdefault(key, [])  # type: ignore[arg-type]
+                seen = set(bucket)
+                for kw in entry["keywords"]:
+                    if kw not in seen:
+                        bucket.append(kw)
+                        seen.add(kw)
+            for entry in item.get("removals", []):
+                key = tuple(int(v) for v in entry["docid"])
+                bucket = merged_rems.setdefault(key, [])  # type: ignore[arg-type]
+                seen = set(bucket)
+                for kw in entry["keywords"]:
+                    if kw not in seen:
+                        bucket.append(kw)
+                        seen.add(kw)
+        if not mapping_url or (not merged_adds and not merged_rems):
+            return {
+                "updated_docids": 0,
+                "added_edges": 0,
+                "removed_edges": 0,
+                "overlay_docids": 0,
+                "latency_seconds": time.perf_counter() - started,
+            }
+        delta_payload = {
+            "additions": [{"docid": list(k), "keywords": v} for k, v in merged_adds.items()],
+            "removals": [{"docid": list(k), "keywords": v} for k, v in merged_rems.items()],
+            "k_max": 150,
+        }
+        result = post_json_sync(
+            self._client,
+            mapping_url.rstrip("/") + "/update_delta",
+            delta_payload,
+        )
+        return {
+            **result,
+            "latency_seconds": time.perf_counter() - started,
+        }
+
     @staticmethod
     def _response_metrics(responses: dict[int, dict[str, Any]]) -> dict[str, Any]:
         version = next(iter(responses.values())).get("mapping_version")
@@ -268,6 +326,13 @@ def create_app(
     def prepare(request: BaselinePrepareRequest) -> dict[str, Any]:
         try:
             return app.state.router.prepare(request)
+        except (httpx.HTTPError, RuntimeError, ValueError) as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+
+    @app.post("/commit_step_updates")
+    def commit_step_updates() -> dict[str, Any]:
+        try:
+            return app.state.router.commit_step_updates()
         except (httpx.HTTPError, RuntimeError, ValueError) as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
 

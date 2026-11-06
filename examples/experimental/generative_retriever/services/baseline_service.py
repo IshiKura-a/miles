@@ -168,6 +168,21 @@ def create_app(
     policy_checkpoint: str | None = None,
 ) -> FastAPI:
     devices = _validate_devices(devices)
+    resolved_service_config = {
+        "api_version": _SERVICE_API_VERSION,
+        "checkpoint": str(Path(checkpoint).expanduser().resolve()),
+        "qwen_model": str(Path(qwen_model).expanduser().resolve()),
+        "slm_root": str(Path(slm_root).expanduser().resolve()),
+        "id_mapping": str(Path(id_mapping).expanduser().resolve()),
+        "devices": list(devices),
+        "cache_size": _CACHE_SIZE,
+        "docids_per_query": docids_per_query,
+        **(
+            {"policy_checkpoint": str(Path(policy_checkpoint).expanduser().resolve())}
+            if policy_checkpoint is not None
+            else {}
+        ),
+    }
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -196,21 +211,7 @@ def create_app(
             "devices": pool.devices,
             "docids_per_query": pool.docids_per_query,
             "cache": asdict(pool.cache.stats()),
-            "service_config": {
-                "api_version": _SERVICE_API_VERSION,
-                "checkpoint": str(Path(checkpoint).expanduser().resolve()),
-                "qwen_model": str(Path(qwen_model).expanduser().resolve()),
-                "slm_root": str(Path(slm_root).expanduser().resolve()),
-                "id_mapping": str(Path(id_mapping).expanduser().resolve()),
-                "devices": list(devices),
-                "cache_size": _CACHE_SIZE,
-                "docids_per_query": docids_per_query,
-                **(
-                    {"policy_checkpoint": str(Path(policy_checkpoint).expanduser().resolve())}
-                    if policy_checkpoint is not None
-                    else {}
-                ),
-            },
+            "service_config": resolved_service_config,
         }
 
     @app.post("/generate")

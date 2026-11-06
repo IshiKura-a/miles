@@ -9,9 +9,14 @@ from typing import Any
 import torch
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
+from transformers import T5Config, T5ForConditionalGeneration
 from transformers.modeling_outputs import CausalLMOutput
 from transformers.models.t5.modeling_t5 import T5Attention
-from examples.experimental.generative_retriever.model.constrained_decode import PrefixConstraint, load_constraint
+from examples.experimental.generative_retriever.model.constrained_decode import (
+    PrefixConstraint,
+    SortedU32Constraint,
+    load_constraint,
+)
 
 from examples.experimental.generative_retriever.model.model_loading import (
     build_run_arguments,
@@ -48,6 +53,7 @@ class GRStage5Policy(nn.Module):
         self.code_dim: int = source.docid_dim
         self.code_num: int = source.docid_size
         self.constraint = constraint
+        self._prefix_allowed_cache: dict[tuple[int, ...], tuple[torch.Tensor, set[int]]] = {}
 
         self.encoder_list: Any = source.encoder_list
         self.docEnc2decoder: Any = source.docEnc2decoder
@@ -75,7 +81,7 @@ class GRStage5Policy(nn.Module):
         self,
         sample_tokens: list[torch.Tensor],
         response_lengths: list[int],
-    ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[int]]:
         prompt_lengths = [
             tokens.shape[0] - response_length
             for tokens, response_length in zip(sample_tokens, response_lengths, strict=True)
@@ -89,20 +95,60 @@ class GRStage5Policy(nn.Module):
             batch_first=True,
             padding_value=self.pad_token_id,
         ).flip(1)
-        attention_mask = padded_prompts.ne(self.pad_token_id).long()
+        unique_prompts, inverse_indices = torch.unique(
+            padded_prompts,
+            dim=0,
+            return_inverse=True,
+        )
+        unique_mask = unique_prompts.ne(self.pad_token_id).long()
         with torch.no_grad():
             causal_lm = self.encoder_list[0].model.encoder
             backbone = getattr(causal_lm, "model", None)
             if backbone is None:
                 raise TypeError("GR Qwen encoder must expose its backbone as .model")
             outputs = backbone(
-                input_ids=padded_prompts,
-                attention_mask=attention_mask,
+                input_ids=unique_prompts,
+                attention_mask=unique_mask,
                 return_dict=True,
                 use_cache=False,
             )
-            hidden_states = outputs.last_hidden_state
-        return hidden_states, attention_mask, prompt_lengths
+            unique_hidden_states = outputs.last_hidden_state
+        return unique_hidden_states, unique_mask, inverse_indices, prompt_lengths
+
+    def _allowed_for_prefix(self, prefix_tuple: tuple[int, ...]) -> tuple[torch.Tensor, set[int]]:
+        cached = self._prefix_allowed_cache.get(prefix_tuple)
+        if cached is not None:
+            return cached
+        allowed_list = self.constraint(0, torch.tensor(prefix_tuple, dtype=torch.long))
+        allowed_tensor = torch.tensor(allowed_list, dtype=torch.long)
+        entry = (allowed_tensor, set(allowed_list))
+        if len(self._prefix_allowed_cache) < 262_144:
+            self._prefix_allowed_cache[prefix_tuple] = entry
+        return entry
+
+    def _build_allowed_mask(
+        self,
+        responses: torch.Tensor,
+        vocab_size: int,
+    ) -> torch.Tensor:
+        if isinstance(self.constraint, SortedU32Constraint):
+            mask_gpu = self.constraint.build_response_mask(responses, vocab_size)
+            if not bool(mask_gpu.gather(2, responses.unsqueeze(-1)).all()):
+                raise ValueError("GR response violates official prefix constraint")
+            return mask_gpu
+        sample_count = responses.shape[0]
+        responses_cpu: list[list[int]] = responses.detach().cpu().tolist()
+        mask_cpu = torch.zeros((sample_count, self.code_num, vocab_size), dtype=torch.bool)
+        for index, row in enumerate(responses_cpu):
+            prefix: tuple[int, ...] = (0,)
+            for position in range(self.code_num):
+                allowed_tensor, allowed_set = self._allowed_for_prefix(prefix)
+                token_id = row[position]
+                if not allowed_set or token_id not in allowed_set:
+                    raise ValueError(f"GR response violates official prefix constraint at position {position}")
+                mask_cpu[index, position, allowed_tensor] = True
+                prefix = (*prefix, token_id)
+        return mask_cpu.to(device=responses.device, non_blocking=True)
 
     @staticmethod
     def _unpack_tokens(
@@ -147,16 +193,19 @@ class GRStage5Policy(nn.Module):
             raise ValueError(f"GR response lengths must all equal {self.code_num}")
         sample_tokens, output_offsets = self._unpack_tokens(input_ids, total_lengths)
 
-        hidden_states, attention_mask, prompt_lengths = self._encode_prompts(
+        unique_hidden_states, unique_mask, inverse_indices, prompt_lengths = self._encode_prompts(
             sample_tokens,
             response_lengths,
         )
-        hidden_states = hidden_states.to(self.docEnc2decoder.weight.dtype)
-        projected_hidden_states = self.docEnc2decoder(hidden_states)
+        unique_hidden_states = unique_hidden_states.to(self.docEnc2decoder.weight.dtype)
+        unique_projected = self.docEnc2decoder(unique_hidden_states)
+        projected_hidden_states = unique_projected.index_select(0, inverse_indices)
+        attention_mask = unique_mask.index_select(0, inverse_indices)
         input_batch_size, sequence_length = input_ids.shape
         sample_count = len(sample_tokens)
+        vocab_size = self.code_num * self.code_dim + 2
         logits = projected_hidden_states.new_zeros(
-            (input_batch_size, sequence_length, self.code_num * self.code_dim + 2)
+            (input_batch_size, sequence_length, vocab_size)
         )
 
         responses = torch.stack([
@@ -183,26 +232,28 @@ class GRStage5Policy(nn.Module):
         )
         response_logits = self.lm_head(decoder_outputs.last_hidden_state)
         invalid_logit = torch.finfo(response_logits.dtype).min
-        for index, (prompt_length, output_offset) in enumerate(
-            zip(prompt_lengths, output_offsets, strict=True)
-        ):
-            output_row = index if input_ids.shape[0] > 1 else 0
-            start = output_offset + prompt_length - 1
-            for position in range(self.code_num):
-                position_logits = logits[output_row, start + position]
-                position_logits.fill_(invalid_logit)
-                prefix = torch.cat((responses.new_zeros(1), responses[index, :position]))
-                allowed = self.constraint(index, prefix)
-                if not allowed or responses[index, position].item() not in allowed:
-                    raise ValueError(f"GR response violates official prefix constraint at position {position}")
-                position_logits[allowed] = response_logits[index, position, allowed]
+        allowed_mask = self._build_allowed_mask(responses, vocab_size)
+        masked_response_logits = response_logits.masked_fill(~allowed_mask, invalid_logit)
+        starts = torch.tensor(
+            [
+                output_offset + prompt_length - 1
+                for prompt_length, output_offset in zip(prompt_lengths, output_offsets, strict=True)
+            ],
+            dtype=torch.long,
+            device=input_ids.device,
+        )
+        positions = starts.unsqueeze(1) + torch.arange(self.code_num, device=input_ids.device).unsqueeze(0)
+        if input_batch_size == 1:
+            logits[0, positions.reshape(-1)] = masked_response_logits.reshape(-1, vocab_size)
+        else:
+            row_indices = torch.arange(sample_count, device=input_ids.device).unsqueeze(1).expand_as(positions)
+            logits[row_indices, positions] = masked_response_logits
         return CausalLMOutput(logits=logits)
 
 
 def build_gr_stage5_policy(checkpoint_path: str, args: Any, init_context) -> GRStage5Policy:
     """Miles ``--custom-fsdp-model-factory-path`` entrypoint."""
     del checkpoint_path, args
-    from transformers import T5Config, T5ForConditionalGeneration
 
     checkpoint = _required_path("GR_CHECKPOINT")
     qwen_model = _required_path("GR_QWEN_MODEL")

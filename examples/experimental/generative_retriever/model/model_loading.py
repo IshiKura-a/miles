@@ -2,11 +2,20 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import importlib
 import json
-import sys
 from pathlib import Path
+import shutil
+import sys
+import tempfile
 from typing import Any
+
+import torch
+from torch.distributed.checkpoint.filesystem import FileSystemReader
+from torch.distributed.checkpoint.metadata import TensorStorageMetadata
+from torch.distributed.checkpoint.state_dict_loader import load
+import transformers
 
 _POLICY_HEAD_PREFIXES = ("docEnc2decoder.", "decoder.", "lm_head.")
 
@@ -24,7 +33,6 @@ def import_slmv3(slm_root: Path) -> dict[str, Any]:
         sys.path.insert(0, root_string)
 
     model_module = importlib.import_module("model")
-    import transformers
 
     # Model imports can replace Transformers' lazy module; patch the active module before utils.
     transformers_dynamic: Any = transformers
@@ -93,8 +101,6 @@ def checkpoint_shards(checkpoint: Path) -> list[Path]:
 
 
 def checkpoint_tensor_shape(checkpoint: Path, tensor_name: str) -> tuple[int, ...]:
-    import torch
-
     index_path = checkpoint / "pytorch_model.bin.index.json"
     if not index_path.is_file():
         raise FileNotFoundError(f"checkpoint index is missing: {index_path}")
@@ -115,8 +121,6 @@ def checkpoint_tensor_shape(checkpoint: Path, tensor_name: str) -> tuple[int, ..
 
 
 def load_checkpoint(model: Any, checkpoint: Path) -> None:
-    import torch
-
     loaded_keys: set[str] = set()
     for shard_path in checkpoint_shards(checkpoint):
         state_dict = torch.load(shard_path, map_location="cpu", mmap=True, weights_only=True)
@@ -142,8 +146,6 @@ def load_checkpoint(model: Any, checkpoint: Path) -> None:
 
 
 def load_policy_head_checkpoint(model: Any, checkpoint: str | Path) -> int:
-    import torch
-
     path = Path(checkpoint).expanduser().resolve()
     if not path.is_file():
         raise FileNotFoundError(f"Policy checkpoint does not exist: {path}")
@@ -175,14 +177,6 @@ def export_policy_head_checkpoint(
     dcp_model_dir: str | Path,
     output_path: str | Path,
 ) -> int:
-    from concurrent.futures import ThreadPoolExecutor
-    import shutil
-    import tempfile
-    import torch
-    from torch.distributed.checkpoint.filesystem import FileSystemReader
-    from torch.distributed.checkpoint.metadata import TensorStorageMetadata
-    from torch.distributed.checkpoint.state_dict_loader import load
-
     ckpt_dir = require_directory(dcp_model_dir, "DCP model checkpoint")
     metadata_file = ckpt_dir / ".metadata"
     if not metadata_file.is_file():

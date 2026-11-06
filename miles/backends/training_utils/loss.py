@@ -19,6 +19,8 @@ def _detach_rollout_tensor_list(rollout_data: RolloutBatch, key: str) -> list[to
     tensors = rollout_data.get(key)
     if tensors is None:
         return None
+    if not any(tensor.requires_grad for tensor in tensors):
+        return tensors
 
     detached_tensors = [tensor.detach() for tensor in tensors]
     rollout_data[key] = detached_tensors
@@ -86,7 +88,9 @@ def compute_advantages_and_returns(
     elif args.kl_coef == 0 or not log_probs:
         # when kl_coef is 0, we won't compute ref_log_prob
         xs = log_probs if log_probs is not None else values
-        kl = [torch.zeros_like(x, dtype=torch.float32, device=x.device) for x in xs]
+        xs_lengths = [x.numel() for x in xs]
+        flat_kl = torch.zeros(sum(xs_lengths), dtype=torch.float32, device=xs[0].device)
+        kl = list(flat_kl.split(xs_lengths))
     else:
         kl = [
             compute_approx_kl(
@@ -161,7 +165,11 @@ def loss_function(
           Tinker losses may also return "per_datum" outputs.
     """
     parallel_state = get_parallel_state()
-    num_tokens = sum([torch.clamp_min(loss_mask.sum(), 1) for loss_mask in batch["loss_masks"]])
+    loss_masks_batch = batch["loss_masks"]
+    if loss_masks_batch and len(set(batch["response_lengths"])) == 1:
+        num_tokens = torch.clamp_min(torch.stack(loss_masks_batch).sum(dim=-1), 1).sum()
+    else:
+        num_tokens = sum([torch.clamp_min(loss_mask.sum(), 1) for loss_mask in loss_masks_batch])
     num_samples = len(batch["response_lengths"])
 
     sum_of_sample_mean = get_sum_of_sample_mean(

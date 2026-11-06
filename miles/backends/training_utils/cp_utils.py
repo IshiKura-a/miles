@@ -108,12 +108,33 @@ def get_sum_of_sample_mean(
     """Calculate correct sample mean for CP; ``denominators`` overrides each
     sample's own ``loss_mask.sum()`` (e.g. pass ``rollout_mask_sums`` for
     per-rollout means)."""
-    if denominators is None:
-        denominators = [m.sum() for m in loss_masks]
-
     parallel_state = get_parallel_state()
     cp_size = parallel_state.cp.size
     if cp_size == 1:
+        if loss_masks and len(set(response_lengths)) == 1 and response_lengths[0] > 0:
+            batch_size = len(loss_masks)
+            resp_len = response_lengths[0]
+            masks_2d = torch.stack(loss_masks)
+            if denominators is None:
+                denom_vec = masks_2d.sum(dim=-1)
+            elif isinstance(denominators, torch.Tensor):
+                denom_vec = denominators
+            elif isinstance(denominators[0], torch.Tensor):
+                denom_vec = torch.stack(denominators)
+            else:
+                denom_vec = torch.tensor(denominators, device=masks_2d.device, dtype=torch.float32)
+            denom_clamped = torch.clamp_min(denom_vec, 1)
+
+            def sum_of_sample_mean(x: torch.Tensor) -> torch.Tensor:
+                return ((x.view(batch_size, resp_len) * masks_2d).sum(dim=-1) / denom_clamped).sum()
+
+            def sum_of_token(x: torch.Tensor) -> torch.Tensor:
+                return (x.view(batch_size, resp_len) * masks_2d).sum()
+
+            return sum_of_sample_mean if not calculate_per_token_loss else sum_of_token
+
+        if denominators is None:
+            denominators = [m.sum() for m in loss_masks]
 
         def sum_of_sample_mean(x: torch.Tensor) -> torch.Tensor:
             return sum(
@@ -134,6 +155,8 @@ def get_sum_of_sample_mean(
             )
 
     else:
+        if denominators is None:
+            denominators = [m.sum() for m in loss_masks]
         cp_chunk_lengths = []
         chunked_loss_masks = []
         for i, (total_length, response_length, loss_mask) in enumerate(

@@ -20,7 +20,7 @@ class MappingLookup:
     scanned_bytes: int
 
 
-def _validate_id(docid: PositionalID) -> None:
+def validate_docid(docid: PositionalID) -> None:
     if len(docid) != 4:
         raise ValueError("GR positional ID must have four components")
     for position, code in enumerate(docid):
@@ -28,6 +28,9 @@ def _validate_id(docid: PositionalID) -> None:
             raise TypeError("GR positional ID components must be integers")
         if not position * 256 <= code < (position + 1) * 256:
             raise ValueError(f"GR ID component {code} is outside position {position}'s codebook")
+
+
+_validate_id = validate_docid
 
 
 def pack_docid_u32(docid: PositionalID) -> int:
@@ -107,6 +110,7 @@ def lookup_service(
     service_url: str, docids: Iterable[PositionalID], *, timeout: float = 30.0,
     expected_mapping_version: str | None = None,
     market: str | None = None,
+    use_initial: bool = False,
     client: httpx.Client | None = None,
 ) -> dict[PositionalID, tuple[str, ...]]:
     requested = list(dict.fromkeys(docids))
@@ -122,6 +126,8 @@ def lookup_service(
             req_body: dict[str, object] = {"docids": chunk}
             if market is not None:
                 req_body["market"] = market
+            if use_initial:
+                req_body["use_initial"] = True
             response = session.post(url, json=req_body, timeout=timeout)
             response.raise_for_status()
             payload = response.json()

@@ -23,10 +23,11 @@ from examples.experimental.generative_retriever.index.id_text_mapping import loo
 from examples.experimental.generative_retriever.model.model_loading import require_directory
 from examples.experimental.generative_retriever.reward.relevance_model import (
     load_relevance_pipeline_factory,
+    optimize_graphene_pipeline,
     resolve_relevance_source,
 )
 from examples.experimental.generative_retriever.reward.relevance_reward import (
-    BASELINE_TOP_K, PM_THRESHOLD, SM_THRESHOLD, REWARD_MODES, RewardMode,
+    BASELINE_TOP_K, DOCID_REWARD_FLOOR, PM_THRESHOLD, SM_THRESHOLD, REWARD_MODES, RewardMode,
     build_baseline_set, calculate_docid_reward, calculate_keyword_rewards,
 )
 
@@ -83,7 +84,7 @@ def _build_query(
         for docid, texts in mapping.items():
             output.write(json.dumps({
                 "query": query, "docid": docid, "keyword_count": len(texts),
-                "mode": reward_mode, "aggregation": "mean",
+                "mode": reward_mode, "aggregation": f"floor_{DOCID_REWARD_FLOOR}",
                 "reward": calculate_docid_reward(
                     {text: keyword_scores[text] for text in texts}, baseline, mode=reward_mode,
                 ),
@@ -98,7 +99,7 @@ def _build_query(
     )
     summary = {
         "query": query, "baseline_docids": len(ids),
-        "reward_mode": reward_mode, "docid_aggregation": "mean",
+        "reward_mode": reward_mode, "docid_aggregation": f"floor_{DOCID_REWARD_FLOOR}",
         "mapped_docids": len(mapping), "id_keyword_pairs": sum(map(len, mapping.values())),
         "distinct_scored_keywords": len(keywords),
         "baseline_pm_keyword_count": len(baseline.pm),
@@ -156,6 +157,7 @@ def main() -> None:
         cup="large", device=args.device, dtype="bf16", batch_size=args.batch_size,
         cross_batch_size=256, show_progress=True,
     )
+    optimize_graphene_pipeline(pipeline)
     summaries = [
         _build_query(record, pipeline, args.mapping_url, mapping_version,
                      output / f"query-{index:04d}", args.reward_mode)

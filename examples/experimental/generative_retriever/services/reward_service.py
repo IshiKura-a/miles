@@ -34,6 +34,7 @@ from examples.experimental.generative_retriever.reward.relevance_model import (
     resolve_relevance_source,
 )
 from examples.experimental.generative_retriever.reward.relevance_reward import (
+    DOCID_REWARD_FLOOR,
     BaselineSets,
     RewardMode,
     build_baseline_set,
@@ -90,6 +91,41 @@ class BaselinePrepareRequest(BaseModel):
         return queries
 
 
+def summarize_breakdown_metrics(breakdown: dict[str, Any]) -> dict[str, float]:
+    items = list(breakdown.values())
+    n = float(len(items))
+    metrics = {
+        "pm_score": math.fsum(r.pm_score for r in items) / n,
+        "sm_score": math.fsum(r.sm_score for r in items) / n,
+        "pm_pass": math.fsum(r.pm_pass for r in items) / n,
+        "sm_pass": math.fsum(r.sm_pass for r in items) / n,
+        "normalized_pm": math.fsum(r.normalized_pm for r in items) / n,
+        "normalized_sm": math.fsum(r.normalized_sm for r in items) / n,
+        "pm_relevance": math.fsum(r.pm_relevance for r in items) / n,
+        "sm_relevance": math.fsum(r.sm_relevance for r in items) / n,
+        "relevance_quality": math.fsum(r.relevance_quality for r in items) / n,
+        "pm_unique_bonus": math.fsum(r.pm_unique_bonus for r in items) / n,
+        "sm_unique_bonus": math.fsum(r.sm_unique_bonus for r in items) / n,
+        "unique_bonus": math.fsum(r.unique_bonus for r in items) / n,
+        "discrete_base": math.fsum(r.discrete_base for r in items) / n,
+        "continuous_base": math.fsum(r.continuous_base for r in items) / n,
+        "discrete_total": math.fsum(r.discrete_total for r in items) / n,
+        "continuous_total": math.fsum(r.continuous_total for r in items) / n,
+        "reward": math.fsum(r.reward for r in items) / n,
+        "pm_unique_keyword_rate": math.fsum(float(r.is_pm_unique) for r in items) / n,
+        "sm_unique_keyword_rate": math.fsum(float(r.is_sm_unique) for r in items) / n,
+        "unique_keyword_rate": math.fsum(float(r.is_unique) for r in items) / n,
+        "relevance_eligible_rate": math.fsum(float(r.relevance_eligible) for r in items) / n,
+        "pm_unique_eligible_rate": math.fsum(float(r.pm_unique_eligible) for r in items) / n,
+        "sm_unique_eligible_rate": math.fsum(float(r.sm_unique_eligible) for r in items) / n,
+        "unique_eligible_rate": math.fsum(float(r.unique_eligible) for r in items) / n,
+    }
+    unique_qual = [r.relevance_quality for r in items if r.is_pm_unique or r.is_sm_unique]
+    metrics["unique_quality"] = math.fsum(unique_qual) / len(unique_qual) if unique_qual else 0.0
+    metrics["train_total"] = metrics["reward"]
+    return metrics
+
+
 class KeywordRewardEngine:
     def __init__(
         self,
@@ -125,6 +161,10 @@ class KeywordRewardEngine:
         self._lock = Lock()
         self._baseline_inflight: dict[str, Future[BaselineSets]] = {}
         self._client = httpx.Client(timeout=300.0)
+        self._step_additions: dict[tuple[int, int, int, int], list[str]] = {}
+        self._step_docid_queries: dict[tuple[int, int, int, int], set[str]] = {}
+        self._step_docid_keywords: dict[tuple[int, int, int, int], list[str]] = {}
+        self._step_edge_passes: dict[tuple[tuple[int, int, int, int], str], int] = {}
 
     def _cache_stats(self) -> dict[str, Any]:
         return {
@@ -137,10 +177,14 @@ class KeywordRewardEngine:
     def _lookup_docids(
         self,
         docids: list[tuple[int, int, int, int]],
+        *,
+        use_initial: bool = False,
     ) -> dict[tuple[int, int, int, int], tuple[str, ...]]:
         return lookup_service(
             self.mapping_url, docids,
-            expected_mapping_version=self.mapping_version, client=self._client,
+            expected_mapping_version=self.mapping_version,
+            use_initial=use_initial,
+            client=self._client,
         )
 
     @staticmethod
@@ -230,9 +274,12 @@ class KeywordRewardEngine:
                     raise KeyError(f"Prepared baseline missing for queries {missing_queries!r}")
                 query_docids = self._generate_baseline_docids(missing_queries)
                 generated_at = time.perf_counter()
-                mapping = self._lookup_docids([
-                    docid for query in missing_queries for docid in query_docids[query]
-                ])
+                mapping = self._lookup_docids(
+                    [
+                        docid for query in missing_queries for docid in query_docids[query]
+                    ],
+                    use_initial=True,
+                )
                 query_keywords = {
                     query: list(dict.fromkeys(
                         keyword
@@ -325,8 +372,16 @@ class KeywordRewardEngine:
             ]
             pair_scores = self.scorer.score(pairs)
             scored_at = time.perf_counter()
+            query_kw_freq: dict[str, dict[str, int]] = {}
+            query_group_indices: dict[str, list[int]] = {}
+            for idx, (sample, keywords) in enumerate(zip(request.samples, sample_keywords, strict=True)):
+                freq_map = query_kw_freq.setdefault(sample.prompt, {})
+                for keyword in keywords:
+                    freq_map[keyword] = freq_map.get(keyword, 0) + 1
+                query_group_indices.setdefault(sample.prompt, []).append(idx)
             rewards = []
             details = []
+            sample_breakdowns: list[dict[str, Any]] = []
             for sample, docid, keywords in zip(
                 request.samples, docids, sample_keywords, strict=True,
             ):
@@ -336,18 +391,67 @@ class KeywordRewardEngine:
                 }
                 baseline = baselines[sample.prompt]
                 breakdown = calculate_keyword_rewards(
-                    scores, baseline, mode=request.reward_mode,
+                    scores,
+                    baseline,
+                    mode=request.reward_mode,
+                    keyword_frequencies=query_kw_freq.get(sample.prompt),
                 )
-                value = math.fsum(result.reward for result in breakdown.values()) / len(breakdown)
+                sample_breakdowns.append(breakdown)
+                denominator = max(len(breakdown), DOCID_REWARD_FLOOR)
+                value = math.fsum(result.reward for result in breakdown.values()) / float(denominator)
                 rewards.append(value)
-                details.append({
+                detail_entry: dict[str, Any] = {
                     "query": sample.prompt, "docid": docid, "keyword_count": len(scores),
-                    "aggregation": "mean", "reward": value,
-                    "keywords": [{"keyword": keyword, **asdict(result)}
-                                 for keyword, result in breakdown.items()],
-                })
+                    "aggregation": f"floor_{DOCID_REWARD_FLOOR}", "reward": value,
+                    "metrics": summarize_breakdown_metrics(breakdown),
+                }
+                if len(request.samples) <= 16:
+                    detail_entry["keywords"] = [
+                        {"keyword": keyword, **asdict(result)}
+                        for keyword, result in breakdown.items()
+                    ]
+                details.append(detail_entry)
+                if len(keywords) > DOCID_REWARD_FLOOR:
+                    self._step_docid_queries.setdefault(docid, set()).add(sample.prompt)
+                    self._step_docid_keywords.setdefault(docid, keywords)
+                    for keyword, result in breakdown.items():
+                        edge = (docid, keyword)
+                        self._step_edge_passes[edge] = (
+                            self._step_edge_passes.get(edge, 0) + int(result.relevance_eligible)
+                        )
                 logger.debug("reward_mode=%s docid=%s keywords=%d reward=%f",
                             request.reward_mode, docid, len(scores), value)
+            for indices in query_group_indices.values():
+                if len(indices) < 4:
+                    continue
+                head_cutoff = min(64, max(16, len(indices) // 2))
+                head_indices = indices[:head_cutoff]
+                tail_indices = indices[head_cutoff:]
+                if not tail_indices:
+                    continue
+                head_keywords = {
+                    kw for i in head_indices for kw in sample_keywords[i]
+                }
+                tail_unique_good: list[str] = []
+                seen_tail: set[str] = set()
+                for i in tail_indices:
+                    for kw, res in sample_breakdowns[i].items():
+                        if res.unique_eligible and kw not in head_keywords and kw not in seen_tail:
+                            tail_unique_good.append(kw)
+                            seen_tail.add(kw)
+                if not tail_unique_good:
+                    continue
+                target_docid = docids[head_indices[0]]
+                for i in head_indices:
+                    if len(sample_keywords[i]) < DOCID_REWARD_FLOOR:
+                        target_docid = docids[i]
+                        break
+                bucket_adds = self._step_additions.setdefault(target_docid, [])
+                existing_adds = set(bucket_adds)
+                for kw in tail_unique_good[:8]:
+                    if kw not in existing_adds:
+                        bucket_adds.append(kw)
+                        existing_adds.add(kw)
             cache = self._cache_stats()
         finished = time.perf_counter()
         logger.info(
@@ -368,6 +472,40 @@ class KeywordRewardEngine:
                 baseline_delta, self._cache_delta(before, cache),
             ),
         }
+
+    def harvest_step_delta(self, min_queries: int = 5) -> dict[str, Any]:
+        with self._lock:
+            additions = [
+                {"docid": list(docid), "keywords": list(keywords)}
+                for docid, keywords in self._step_additions.items()
+                if keywords
+            ]
+            removals = []
+            for docid, queries in self._step_docid_queries.items():
+                if len(queries) < min_queries:
+                    continue
+                keywords = self._step_docid_keywords.get(docid, [])
+                if len(keywords) <= DOCID_REWARD_FLOOR:
+                    continue
+                dead_keywords = [
+                    kw for kw in keywords
+                    if self._step_edge_passes.get((docid, kw), 0) == 0
+                ]
+                max_removable = max(0, len(keywords) - DOCID_REWARD_FLOOR)
+                if dead_keywords and max_removable > 0:
+                    removals.append({
+                        "docid": list(docid),
+                        "keywords": dead_keywords[:max_removable],
+                    })
+            self._step_additions.clear()
+            self._step_docid_queries.clear()
+            self._step_docid_keywords.clear()
+            self._step_edge_passes.clear()
+            return {
+                "additions": additions,
+                "removals": removals,
+                "mapping_url": self.mapping_url,
+            }
 
     def close(self) -> None:
         self._client.close()
@@ -391,6 +529,8 @@ def create_app(
     if keyword_cache_size <= 0 or score_cache_size <= 0:
         raise ValueError("Reward cache capacities must be positive")
     request_model = reward_request_model(max_samples_per_request)
+    resolved_relevance_source = str(resolve_relevance_source(relevance_model))
+    resolved_relevance_model = str(Path(relevance_model).expanduser().resolve())
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -431,8 +571,8 @@ def create_app(
                 "baseline_url": baseline_url,
                 "mapping_url": mapping_url,
                 "mapping_version": mapping_version,
-                "relevance_source": str(resolve_relevance_source(relevance_model)),
-                "relevance_model": str(Path(relevance_model).expanduser().resolve()),
+                "relevance_source": resolved_relevance_source,
+                "relevance_model": resolved_relevance_model,
                 "query_cache_size": _QUERY_CACHE_SIZE,
                 "keyword_cache_size": keyword_cache_size,
                 "score_cache_size": score_cache_size,
@@ -472,6 +612,11 @@ def create_app(
         except httpx.HTTPError as error:
             logger.error("Dependent service unavailable during preparation: %s", error)
             raise HTTPException(status_code=502, detail=str(error)) from error
+
+    @app.post("/harvest_step_delta")
+    def harvest_step_delta() -> dict[str, Any]:
+        return app.state.engine.harvest_step_delta()
+
     return app
 
 

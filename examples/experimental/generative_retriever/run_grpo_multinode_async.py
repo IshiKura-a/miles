@@ -38,6 +38,10 @@ from ray._private.node import Node
 from ray._private.parameter import RayParams
 
 from examples.experimental.generative_retriever import run_grpo
+from examples.experimental.generative_retriever.runtime.prepare_rocm_env import (
+    derive_reward_cache_sizes,
+    derive_sglang_mem_fraction,
+)
 from examples.experimental.generative_retriever.runtime.prepare_sglang_bundle import (
     prepare_bundle,
     require_sglang_abort_patch,
@@ -53,6 +57,17 @@ _REWARD_PORTS = tuple(range(31583, 31591))
 _ROUTER_PORT = 31593
 _RAY_PORT = 16380
 _SERVICE_TIMEOUT = 3600
+
+_PROMPT_DATASET_ROWS = 15_000_000
+_QUERIES_PER_STEP_PER_PAIR = 8000
+_SAMPLES_PER_PROMPT = 512
+_BASELINE_TOP_K = 64
+_GLOBAL_BATCH_SIZE_PER_PAIR = _QUERIES_PER_STEP_PER_PAIR * _SAMPLES_PER_PROMPT
+_REWARD_WORKERS_PER_PAIR = len(_REWARD_PORTS)
+_ROLLOUT_GPUS_PER_PAIR = 4
+_LEARNER_GPUS_PER_NODE = 8
+_SGLANG_CONCURRENCY_PER_PAIR = 16384
+_MAX_STEPS_PER_PAIR = _PROMPT_DATASET_ROWS // _QUERIES_PER_STEP_PER_PAIR
 
 
 def _disable_uv_runtime_env() -> None:
@@ -179,23 +194,42 @@ def _hosts(text: str) -> tuple[list[str], list[str]]:
 def _recipe(run_id: str, pairs: int, num_rollout: int) -> run_grpo.ScriptArgs:
     if not run_id or "/" in run_id or run_id in {".", ".."}:
         raise ValueError("run-id must be a nonempty directory name without slashes")
-    if 3750 % pairs:
-        raise ValueError(f"Cannot cover 15M rows exactly with {pairs} pairs at 4000n queries/step")
-    if not 1 <= num_rollout <= 3750 // pairs:
-        raise ValueError(f"num-rollout must be between 1 and {3750 // pairs}")
+    if _MAX_STEPS_PER_PAIR % pairs:
+        raise ValueError(
+            f"Cannot cover {_PROMPT_DATASET_ROWS} rows exactly with {pairs} pairs "
+            f"at {_QUERIES_PER_STEP_PER_PAIR}n queries/step"
+        )
+    max_rollouts = _MAX_STEPS_PER_PAIR // pairs
+    if not 1 <= num_rollout <= max_rollouts:
+        raise ValueError(f"num-rollout must be between 1 and {max_rollouts}")
+    _, kw_cache, score_cache = derive_reward_cache_sizes(
+        _QUERIES_PER_STEP_PER_PAIR * pairs,
+        _SAMPLES_PER_PROMPT,
+        _REWARD_WORKERS_PER_PAIR * pairs,
+        baseline_top_k=_BASELINE_TOP_K,
+    )
+    mem_fraction = derive_sglang_mem_fraction(
+        _SGLANG_CONCURRENCY_PER_PAIR * pairs,
+        _SAMPLES_PER_PROMPT,
+        _ROLLOUT_GPUS_PER_PAIR * pairs,
+    )
     return replace(
         run_grpo.ScriptArgs(),
         run_id=run_id,
         num_rollout=num_rollout,
-        rollout_batch_size=4000 * pairs,
-        global_batch_size=256000 * pairs,
-        actor_num_gpus_per_node=8,
-        rollout_num_gpus=4 * pairs,
-        max_tokens_per_gpu=524288,
-        sglang_server_concurrency=8192 * pairs,
+        rollout_batch_size=_QUERIES_PER_STEP_PER_PAIR * pairs,
+        n_samples_per_prompt=_SAMPLES_PER_PROMPT,
+        global_batch_size=_GLOBAL_BATCH_SIZE_PER_PAIR * pairs,
+        actor_num_gpus_per_node=_LEARNER_GPUS_PER_NODE,
+        rollout_num_gpus=_ROLLOUT_GPUS_PER_PAIR * pairs,
+        max_tokens_per_gpu=131072,
+        sglang_mem_fraction_static=mem_fraction,
+        sglang_server_concurrency=_SGLANG_CONCURRENCY_PER_PAIR * pairs,
         reward_timeout=1800,
-        reward_request_concurrency=8 * pairs,
+        reward_request_concurrency=_REWARD_WORKERS_PER_PAIR * pairs,
         prepare_concurrency=pairs,
+        reward_keyword_cache_size=kw_cache,
+        reward_score_cache_size=score_cache,
     )
 
 
@@ -366,7 +400,10 @@ def _manifest(
     relevance = run_grpo._required_directory(args.relevance_model, "relevance model")
     mapping = Path(os.path.expandvars(args.id_mapping)).resolve()
     prompt = Path(os.path.expandvars(args.prompt_data)).resolve()
-    if not mapping.is_file() or not prompt.is_file():
+    if (
+        not mapping.is_file()
+        and not (mapping.is_dir() and (mapping / "docid_keywords.parquet").is_file())
+    ) or not prompt.is_file():
         raise FileNotFoundError(f"Official mapping or prompt dataset missing: {mapping}, {prompt}")
     mapping_url, mapping_owned = _mapping_service(mapping, addresses[0])
     output = run_grpo._expanded_path(args.output_dir, "output_dir", directory=False)
@@ -375,8 +412,8 @@ def _manifest(
     alias = run_dir / "prompt_data.jsonl"
     bundle = run_dir / "sglang_bundle"
     count = run_grpo._count_records(prompt)
-    if count != 15_000_000 or args.rollout_batch_size * args.num_rollout > count:
-        raise ValueError(f"Expected 15M source rows without wrapping, got {count}")
+    if count != _PROMPT_DATASET_ROWS or args.rollout_batch_size * args.num_rollout > count:
+        raise ValueError(f"Expected {_PROMPT_DATASET_ROWS} source rows without wrapping, got {count}")
     if create:
         if resume:
             tracker = checkpoint_dir / "latest_checkpointed_iteration.txt"
@@ -396,8 +433,8 @@ def _manifest(
         run_grpo._prepare_prompt_data(prompt, alias)
         prepare_bundle(
             checkpoint=checkpoint, qwen_model=qwen, slm_root=slm_root,
-            id_mapping=mapping, output=bundle, num_beams=64,
-            num_return_sequences=64, temperature=1.0, decoding_mode="beam_sample",
+            id_mapping=mapping, output=bundle, num_beams=args.n_samples_per_prompt,
+            num_return_sequences=args.n_samples_per_prompt, temperature=1.0, decoding_mode="beam_sample",
         )
     return {
         "run_id": args.run_id,
@@ -537,6 +574,12 @@ def _service_node(manifest: Manifest, index: int) -> None:
     try:
         baseline = _start_baseline(processes, manifest, host)
         reward_health = []
+        _, kw_cache, score_cache = derive_reward_cache_sizes(
+            _QUERIES_PER_STEP_PER_PAIR * (len(manifest["hosts"]) // 2),
+            _SAMPLES_PER_PROMPT,
+            _REWARD_WORKERS_PER_PAIR * (len(manifest["hosts"]) // 2),
+            baseline_top_k=_BASELINE_TOP_K,
+        )
         for gpu, port in enumerate(_REWARD_PORTS):
             name = f"reward-{gpu}"
             _start_service(
@@ -548,7 +591,7 @@ def _service_node(manifest: Manifest, index: int) -> None:
                     "--relevance-model", manifest["relevance_model"],
                     "--batch-size", "8192", "--pair-batch-size", "32768",
                     "--baseline-top-k", "64", "--max-samples-per-request", "2048",
-                    "--keyword-cache-size", "8192", "--score-cache-size", "131072",
+                    "--keyword-cache-size", str(kw_cache), "--score-cache-size", str(score_cache),
                 ],
                 gpus=str(gpu),
             )
@@ -944,7 +987,7 @@ def main() -> None:
     pairs = len(hosts) // 2
     args = _recipe(
         cli.run_id, pairs,
-        cli.num_rollout if cli.num_rollout is not None else 3750 // pairs,
+        cli.num_rollout if cli.num_rollout is not None else _MAX_STEPS_PER_PAIR // pairs,
     )
     manifest = _manifest(
         args, hosts=hosts, addresses=addresses,

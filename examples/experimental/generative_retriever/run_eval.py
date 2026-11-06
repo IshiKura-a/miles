@@ -26,6 +26,7 @@ import httpx
 
 from examples.experimental.generative_retriever.eval.good_count_eval import run as run_good_count_eval
 from examples.experimental.generative_retriever.model.model_loading import export_policy_head_checkpoint
+from examples.experimental.generative_retriever.runtime.prepare_rocm_env import build_service_env
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _DEFAULT_GENERATOR_DEVICES = "cuda:0,cuda:1,cuda:2,cuda:3"
@@ -54,7 +55,7 @@ class EvalConfig:
     slm_root: str = "/home/aiscuser/SLMGR_dev/SLMv3"
     id_mapping: str = (
         "$cosmos_data_path/local/User/zihao/online_rl/gr_offline_syn/index/"
-        "globalindex1_latest_ta_listing_20261019/asiindex_mapping.ta_listing.tsv"
+        "slmgrv3_part25_na_intl_20261028_20261029"
     )
     relevance_model: str = (
         "$cosmos_data_path/local/User/yugao/share/qualitymodel/"
@@ -79,16 +80,7 @@ class _ManagedService:
     log_handle: IO[str]
 
 
-def _ensure_cosmos_env() -> None:
-    if os.environ.get("cosmos_data_path"):
-        return
-    fallback = os.environ.get("cosmos_datapath") or os.environ.get("datastore")
-    if fallback:
-        os.environ["cosmos_data_path"] = fallback
-
-
 def _expand_path(value: str, name: str, *, expect_dir: bool = False, expect_file: bool = False) -> Path:
-    _ensure_cosmos_env()
     expanded = Path(os.path.expandvars(value)).expanduser().resolve()
     if "$" in os.fspath(expanded):
         raise ValueError(f"{name} contains an unresolved environment variable: {value}")
@@ -161,10 +153,7 @@ def _start_service(
     log_path: Path,
 ) -> _ManagedService:
     _assert_port_free(port)
-    env = os.environ.copy()
-    pythonpath = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = f"{_REPO_ROOT}{':' + pythonpath if pythonpath else ''}"
-    env["PYTHONUNBUFFERED"] = "1"
+    env = build_service_env("", _REPO_ROOT)
     log_handle = log_path.open("a", encoding="utf-8")
     command = [
         sys.executable,
@@ -357,7 +346,7 @@ def main() -> None:
         "--id-mapping",
         default=(
             "$cosmos_data_path/local/User/zihao/online_rl/gr_offline_syn/index/"
-            "globalindex1_latest_ta_listing_20261019/asiindex_mapping.ta_listing.tsv"
+            "slmgrv3_part25_na_intl_20261028_20261029"
         ),
     )
     parser.add_argument(

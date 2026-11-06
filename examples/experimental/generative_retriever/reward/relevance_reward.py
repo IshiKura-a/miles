@@ -13,7 +13,8 @@ REWARD_MODES: tuple[RewardMode, ...] = ("continuous_relevance_unique", "discrete
 PM_THRESHOLD = 0.58
 SM_THRESHOLD = 0.82
 BASELINE_TOP_K = 16
-UNIQUE_WEIGHT = 1.0
+UNIQUE_WEIGHT = 2.0
+DOCID_REWARD_FLOOR = 25
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,7 @@ class RewardBreakdown:
     discrete_total: float
     continuous_total: float
     reward: float
+    keyword_frequency: int = 1
     mode: RewardMode = "discrete_relevance_unique"
 
 
@@ -67,12 +69,15 @@ def calculate_reward(
     is_pm_unique: bool,
     is_sm_unique: bool,
     mode: RewardMode = "discrete_relevance_unique",
+    keyword_frequency: int = 1,
 ) -> RewardBreakdown:
     """Combine PM/SM with per-head keyword novelty against the baseline sets."""
     if not isinstance(is_pm_unique, bool) or not isinstance(is_sm_unique, bool):
         raise TypeError("is_pm_unique and is_sm_unique must be booleans")
     if mode not in REWARD_MODES:
         raise ValueError(f"Unknown reward mode: {mode!r}")
+    if isinstance(keyword_frequency, bool) or not isinstance(keyword_frequency, int) or keyword_frequency < 1:
+        raise ValueError(f"keyword_frequency must be a positive integer, got {keyword_frequency!r}")
     normalized_pm = _normalize_score(pm_score, PM_THRESHOLD, "PM score")
     normalized_sm = _normalize_score(sm_score, SM_THRESHOLD, "SM score")
     pm_pass = float(pm_score >= PM_THRESHOLD)
@@ -94,12 +99,13 @@ def calculate_reward(
         pm_relevance = normalized_pm
         sm_relevance = normalized_sm
         relevance = continuous_base
-        reward = continuous_total
+        raw_reward = continuous_total
     else:
         pm_relevance = pm_pass
         sm_relevance = sm_pass
         relevance = discrete_base
-        reward = discrete_total
+        raw_reward = discrete_total
+    reward = raw_reward / float(keyword_frequency)
     return RewardBreakdown(
         pm_score=float(pm_score),
         sm_score=float(sm_score),
@@ -126,6 +132,7 @@ def calculate_reward(
         discrete_total=discrete_total,
         continuous_total=continuous_total,
         reward=reward,
+        keyword_frequency=keyword_frequency,
         mode=mode,
     )
 
@@ -155,6 +162,7 @@ def calculate_keyword_rewards(
     baseline: BaselineSets,
     *,
     mode: RewardMode = "discrete_relevance_unique",
+    keyword_frequencies: Mapping[str, int] | None = None,
 ) -> dict[str, RewardBreakdown]:
     if mode not in REWARD_MODES:
         raise ValueError(f"Unknown reward mode: {mode!r}")
@@ -162,12 +170,14 @@ def calculate_keyword_rewards(
     for keyword, (pm_score, sm_score) in keyword_scores.items():
         if not isinstance(keyword, str) or not keyword.strip():
             raise ValueError("Candidate keyword must be a non-empty string")
+        freq = max(1, int(keyword_frequencies.get(keyword, 1))) if keyword_frequencies is not None else 1
         results[keyword] = calculate_reward(
             pm_score=pm_score,
             sm_score=sm_score,
             is_pm_unique=keyword not in baseline.pm,
             is_sm_unique=keyword not in baseline.sm,
             mode=mode,
+            keyword_frequency=freq,
         )
     return results
 
@@ -177,9 +187,19 @@ def calculate_docid_reward(
     baseline: BaselineSets,
     *,
     mode: RewardMode = "discrete_relevance_unique",
+    keyword_frequencies: Mapping[str, int] | None = None,
+    k_floor: int = DOCID_REWARD_FLOOR,
 ) -> float:
-    """Average rewards over distinct keyword texts belonging to one doc ID."""
+    """Aggregate rewards over distinct keyword texts belonging to one doc ID with floor denominator."""
     if not keyword_scores:
         raise ValueError("Doc ID reward requires at least one keyword")
-    rewards = calculate_keyword_rewards(keyword_scores, baseline, mode=mode)
-    return math.fsum(result.reward for result in rewards.values()) / len(rewards)
+    if k_floor <= 0:
+        raise ValueError("k_floor must be positive")
+    rewards = calculate_keyword_rewards(
+        keyword_scores,
+        baseline,
+        mode=mode,
+        keyword_frequencies=keyword_frequencies,
+    )
+    denominator = max(len(rewards), k_floor)
+    return math.fsum(result.reward for result in rewards.values()) / float(denominator)

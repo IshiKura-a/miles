@@ -15,13 +15,23 @@ Example:
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
 import logging
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from examples.experimental.generative_retriever.model.constrained_decode import PrefixConstraint, load_constraint
+import torch
+import transformers
+from transformers import T5Config, T5ForConditionalGeneration
+from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
+
+from examples.experimental.generative_retriever.model.constrained_decode import (
+    PrefixConstraint,
+    SortedU32Constraint,
+    generate_beams_tree,
+    load_constraint,
+)
 from examples.experimental.generative_retriever.model.model_loading import (
     build_run_arguments,
     checkpoint_tensor_shape,
@@ -44,8 +54,6 @@ class GenerationResult:
 
 
 def _check_transformers_version(checkpoint: Path) -> None:
-    import transformers
-
     config_path = checkpoint / "config.json"
     with config_path.open(encoding="utf-8") as config_file:
         expected_version = json.load(config_file).get("transformers_version")
@@ -76,9 +84,6 @@ class SLMv3Retriever:
         if not mapping.is_file() and not (mapping.is_dir() and (mapping / "docid_keywords.parquet").is_file()):
             raise FileNotFoundError(f"Official ID mapping is missing: {mapping}")
         _check_transformers_version(self.checkpoint)
-
-        import torch
-        from transformers import T5Config, T5ForConditionalGeneration
 
         if device.startswith("cuda") and not torch.cuda.is_available():
             raise RuntimeError(f"requested device {device!r}, but no CUDA/ROCm device is available")
@@ -142,9 +147,6 @@ class SLMv3Retriever:
         num_beams: int = 64,
         num_return_sequences: int = 64,
     ) -> list[GenerationResult]:
-        import torch
-        from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
-
         if not queries or any(not isinstance(query, str) or not query.strip() for query in queries):
             raise ValueError("queries must contain at least one non-empty string")
         if num_beams <= 0 or num_return_sequences <= 0 or num_return_sequences > num_beams:
@@ -168,37 +170,54 @@ class SLMv3Retriever:
                 },
                 return_hidden_states=True,
             )
-            encoder_outputs = BaseModelOutputWithPastAndCrossAttentions(
-                last_hidden_state=hidden_states,
-                hidden_states=hidden_states,
-                attentions=attention_mask,
-            )
-            generated = self.model.generate(
-                encoder_outputs=encoder_outputs,
-                attention_mask=attention_mask,
-                max_length=self.code_num + 1,
-                min_length=self.code_num + 1,
-                num_beams=num_beams,
-                num_return_sequences=num_return_sequences,
-                prefix_allowed_tokens_fn=self._allowed_tokens,
-                early_stopping=True,
-                forced_bos_token_id=None,
-                forced_eos_token_id=None,
-                decoder_start_token_id=0,
-                return_dict_in_generate=True,
-                output_scores=True,
-            )
-            transition_scores = self.model.compute_transition_scores(
-                generated.sequences,
-                generated.scores,
-                getattr(generated, "beam_indices", None),
-                normalize_logits=True,
-            )
+            if isinstance(self.constraint, SortedU32Constraint) or num_beams > 256:
+                tokens_3d, scores_3d = generate_beams_tree(
+                    self.model,
+                    hidden_states,
+                    attention_mask,
+                    self.constraint,
+                    code_num=self.code_num,
+                    num_beams=num_beams,
+                    num_return_sequences=num_return_sequences,
+                    do_sample=False,
+                )
+                flat_tokens = tokens_3d.reshape(-1, self.code_num).tolist()
+                flat_scores = scores_3d.reshape(-1, self.code_num).tolist()
+            else:
+                encoder_outputs = BaseModelOutputWithPastAndCrossAttentions(
+                    last_hidden_state=hidden_states,
+                    hidden_states=hidden_states,
+                    attentions=attention_mask,
+                )
+                generated = self.model.generate(
+                    encoder_outputs=encoder_outputs,
+                    attention_mask=attention_mask,
+                    max_length=self.code_num + 1,
+                    min_length=self.code_num + 1,
+                    num_beams=num_beams,
+                    num_return_sequences=num_return_sequences,
+                    prefix_allowed_tokens_fn=self._allowed_tokens,
+                    early_stopping=True,
+                    forced_bos_token_id=None,
+                    forced_eos_token_id=None,
+                    decoder_start_token_id=0,
+                    return_dict_in_generate=True,
+                    output_scores=True,
+                )
+                transition_scores = self.model.compute_transition_scores(
+                    generated.sequences,
+                    generated.scores,
+                    getattr(generated, "beam_indices", None),
+                    normalize_logits=True,
+                )
+                flat_tokens = [seq[1:].tolist() for seq in generated.sequences]
+                flat_scores = [row.tolist() for row in transition_scores]
 
         results = []
-        for output_index, sequence in enumerate(generated.sequences):
+        for output_index, (decoder_token_ids, token_logprobs) in enumerate(
+            zip(flat_tokens, flat_scores, strict=True)
+        ):
             query_index = output_index // num_return_sequences
-            decoder_token_ids = sequence[1:].tolist()
             positional_docid = [token_id - 2 for token_id in decoder_token_ids]
             rq_codes = [
                 token_id - 2 - position * self.code_dim
@@ -211,7 +230,7 @@ class SLMv3Retriever:
                     decoder_token_ids=decoder_token_ids,
                     positional_docid=positional_docid,
                     rq_codes=rq_codes,
-                    token_logprobs=transition_scores[output_index].tolist(),
+                    token_logprobs=token_logprobs,
                 )
             )
         if num_beams > 1:

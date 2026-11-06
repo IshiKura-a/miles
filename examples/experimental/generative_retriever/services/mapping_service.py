@@ -23,9 +23,9 @@ from pydantic import BaseModel, Field, StrictInt, field_validator
 
 from examples.experimental.generative_retriever.index.id_text_mapping import (
     PositionalID,
-    _validate_id,
     is_columnar_index_dir,
     pack_docid_u32,
+    validate_docid,
 )
 
 logger = logging.getLogger(__name__)
@@ -36,12 +36,13 @@ _NA_LOCALE_ALIASES = frozenset({"NA", "EN-US", "EN-CA", "ES-US", "FR-CA"})
 class LookupRequest(BaseModel):
     docids: Annotated[list[tuple[StrictInt, StrictInt, StrictInt, StrictInt]], Field(min_length=1, max_length=4096)]
     market: str | None = None
+    use_initial: bool = False
 
     @field_validator("docids")
     @classmethod
     def validate_docids(cls, values: list[PositionalID]) -> list[PositionalID]:
         for value in values:
-            _validate_id(value)
+            validate_docid(value)
         return values
 
 
@@ -63,13 +64,30 @@ class DocidKeywordPair(BaseModel):
     @field_validator("docid")
     @classmethod
     def validate_docid(cls, value: PositionalID) -> PositionalID:
-        _validate_id(value)
+        validate_docid(value)
+        return value
+
+
+class DocidKeywordTextPair(BaseModel):
+    docid: tuple[StrictInt, StrictInt, StrictInt, StrictInt]
+    keywords: Annotated[list[str], Field(min_length=1)]
+
+    @field_validator("docid")
+    @classmethod
+    def validate_docid(cls, value: PositionalID) -> PositionalID:
+        validate_docid(value)
         return value
 
 
 class UpdateMappingRequest(BaseModel):
     entries: Annotated[list[DocidKeywordPair], Field(min_length=1)]
     replace_all: bool = False
+
+
+class DeltaMappingRequest(BaseModel):
+    additions: list[DocidKeywordTextPair] = Field(default_factory=list)
+    removals: list[DocidKeywordTextPair] = Field(default_factory=list)
+    k_max: int = 150
 
 
 class SaveMappingRequest(BaseModel):
@@ -82,6 +100,7 @@ class ResidentMapping:
         self._lock = RLock()
         self._is_columnar = is_columnar_index_dir(path)
         self._keywords: dict[bytes, list[bytes]] = {}
+        self._overlay_texts: dict[PositionalID, list[str]] = {}
         self._kw_array: Any = None
         self._in_na_array: np.ndarray | None = None
         self._markets_array: Any = None
@@ -166,7 +185,7 @@ class ResidentMapping:
                     if len(components) != 4:
                         raise ValueError(f"Official mapping row {line_number} must have four ID components")
                     values = (components[0], components[1], components[2], components[3])
-                    _validate_id(values)
+                    validate_docid(values)
                     canonical_id = " ".join(map(str, values)).encode("ascii")
                     bucket = keywords.setdefault(canonical_id, [])
                     previous_id = raw_id
@@ -209,12 +228,57 @@ class ResidentMapping:
             pos = mkt_str.find(target_market_upper, pos + 1)
         return False
 
-    def lookup(self, docids: list[PositionalID], *, market: str | None = None) -> LookupResponse:
+    def _base_lookup_one(self, docid: PositionalID, target_mkt: str | None) -> list[str] | None:
+        if not self._is_columnar:
+            raw_id = " ".join(map(str, docid)).encode("ascii")
+            values = self._keywords.get(raw_id)
+            if values is None:
+                return None
+            return [value.decode("utf-8") for value in dict.fromkeys(values)]
+        assert (
+            self._unique_docids_u32 is not None
+            and self._csr_offsets is not None
+            and self._csr_kw_ids is not None
+            and self._kw_array is not None
+        )
+        target_u32 = np.uint32(pack_docid_u32(docid))
+        idx = int(np.searchsorted(self._unique_docids_u32, target_u32))
+        n_unique = len(self._unique_docids_u32)
+        if idx >= n_unique or int(self._unique_docids_u32[idx]) != int(target_u32):
+            return None
+        start = int(self._csr_offsets[idx])
+        end = int(self._csr_offsets[idx + 1])
+        kw_ids = self._csr_kw_ids[start:end]
+        texts = []
+        for raw_kid in kw_ids:
+            kid = int(raw_kid)
+            if target_mkt is not None and not self._market_allows(kid, target_mkt):
+                continue
+            raw_bytes: bytes = self._kw_array[kid].as_py()
+            texts.append(raw_bytes.decode("utf-8"))
+        return texts
+
+    def lookup(
+        self,
+        docids: list[PositionalID],
+        *,
+        market: str | None = None,
+        use_initial: bool = False,
+    ) -> LookupResponse:
         target_mkt = market.strip().upper() if market else None
         with self._lock:
             if not self._is_columnar:
                 results = []
                 for docid in docids:
+                    if not use_initial and docid in self._overlay_texts:
+                        results.append(
+                            KeywordResult(
+                                docid=docid,
+                                keywords=list(self._overlay_texts[docid]),
+                                status="ok",
+                            )
+                        )
+                        continue
                     raw_id = " ".join(map(str, docid)).encode("ascii")
                     values = self._keywords.get(raw_id)
                     if values is None:
@@ -236,6 +300,15 @@ class ResidentMapping:
             results = []
             n_unique = len(self._unique_docids_u32)
             for docid, target_u32, pos in zip(docids, packed_targets, positions, strict=True):
+                if not use_initial and docid in self._overlay_texts:
+                    results.append(
+                        KeywordResult(
+                            docid=docid,
+                            keywords=list(self._overlay_texts[docid]),
+                            status="ok",
+                        )
+                    )
+                    continue
                 idx = int(pos)
                 if idx >= n_unique or int(self._unique_docids_u32[idx]) != int(target_u32):
                     logger.warning("Columnar mapping ID not found: %s", docid)
@@ -253,6 +326,57 @@ class ResidentMapping:
                     texts.append(raw_bytes.decode("utf-8"))
                 results.append(KeywordResult(docid=docid, keywords=texts, status="ok"))
             return LookupResponse(mapping_version=self.path.name, results=results)
+
+    def apply_delta(self, request: DeltaMappingRequest) -> dict[str, int]:
+        if request.k_max < 1:
+            raise ValueError("k_max must be at least 1")
+        with self._lock:
+            updated_docids: set[PositionalID] = set()
+            added_edges = 0
+            removed_edges = 0
+            for item in request.removals:
+                docid = item.docid
+                current = self._overlay_texts.get(docid)
+                if current is None:
+                    base = self._base_lookup_one(docid, None)
+                    if not base:
+                        continue
+                    current = list(base)
+                remove_set = {kw for kw in item.keywords if kw.strip()}
+                filtered = [kw for kw in current if kw not in remove_set]
+                if not filtered:
+                    filtered = [current[0]]
+                if len(filtered) < len(current):
+                    removed_edges += len(current) - len(filtered)
+                    self._overlay_texts[docid] = filtered
+                    updated_docids.add(docid)
+            for item in request.additions:
+                docid = item.docid
+                current = self._overlay_texts.get(docid)
+                if current is None:
+                    base = self._base_lookup_one(docid, None)
+                    if not base:
+                        continue
+                    current = list(base)
+                existing = set(current)
+                changed = False
+                for kw in item.keywords:
+                    if len(current) >= request.k_max:
+                        break
+                    if kw.strip() and kw not in existing:
+                        current.append(kw)
+                        existing.add(kw)
+                        added_edges += 1
+                        changed = True
+                if changed:
+                    self._overlay_texts[docid] = current
+                    updated_docids.add(docid)
+            return {
+                "updated_docids": len(updated_docids),
+                "added_edges": added_edges,
+                "removed_edges": removed_edges,
+                "overlay_docids": len(self._overlay_texts),
+            }
 
     def update_docid_mappings(
         self,
@@ -346,7 +470,18 @@ def create_app(mapping: str | Path) -> FastAPI:
 
     @app.post("/lookup", response_model=LookupResponse)
     def lookup(request: LookupRequest) -> LookupResponse:
-        return app.state.mapping.lookup(request.docids, market=request.market)
+        return app.state.mapping.lookup(
+            request.docids,
+            market=request.market,
+            use_initial=request.use_initial,
+        )
+
+    @app.post("/update_delta")
+    def update_delta(request: DeltaMappingRequest) -> dict[str, int]:
+        try:
+            return app.state.mapping.apply_delta(request)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.post("/update")
     def update(request: UpdateMappingRequest) -> dict[str, int]:

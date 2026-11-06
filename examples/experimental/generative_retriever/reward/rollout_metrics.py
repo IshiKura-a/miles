@@ -2,11 +2,79 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from collections import defaultdict
 from typing import Any
 
+import httpx
 import numpy as np
+
+logger = logging.getLogger(__name__)
+
+
+def _mean_top_k(values: list[float], k: int) -> float:
+    if not values:
+        return 0.0
+    if len(values) <= k:
+        return math.fsum(values) / len(values)
+    top_values = sorted(values, reverse=True)[:k]
+    return math.fsum(top_values) / len(top_values)
+
+
+def apply_hierarchical_tree_credit(args: Any, samples: list[Any]) -> None:
+    grouped: dict[int, list[tuple[Any, tuple[int, int, int, int], float]]] = defaultdict(list)
+    for sample in samples:
+        if sample.group_index is None:
+            continue
+        metadata = sample.metadata.get("generative_retriever", {}) if isinstance(sample.metadata, dict) else {}
+        docid = metadata.get("positional_docid")
+        if (
+            isinstance(docid, list)
+            and len(docid) == 4
+            and all(isinstance(v, int) for v in docid)
+        ):
+            raw_val = float(sample.get_reward_value(args))
+            sample.metadata["raw_reward"] = raw_val
+            grouped[int(sample.group_index)].append(
+                (sample, (docid[0], docid[1], docid[2], docid[3]), raw_val)
+            )
+    for items in grouped.values():
+        if len(items) <= 1:
+            continue
+        by_p0: dict[int, list[float]] = defaultdict(list)
+        by_p1: dict[tuple[int, int], list[float]] = defaultdict(list)
+        by_p2: dict[tuple[int, int, int], list[float]] = defaultdict(list)
+        for _, d, r in items:
+            by_p0[d[0]].append(r)
+            by_p1[(d[0], d[1])].append(r)
+            by_p2[(d[0], d[1], d[2])].append(r)
+        v0_map = {k: _mean_top_k(v, 8) for k, v in by_p0.items()}
+        v1_map = {k: _mean_top_k(v, 4) for k, v in by_p1.items()}
+        v2_map = {k: _mean_top_k(v, 2) for k, v in by_p2.items()}
+        for sample, d, r in items:
+            v0 = v0_map[d[0]]
+            v1 = v1_map[(d[0], d[1])]
+            v2 = v2_map[(d[0], d[1], d[2])]
+            sample.reward = 0.25 * (v0 + v1 + v2 + r)
+
+
+def commit_coupled_doc2k_updates(args: Any, output: dict[str, Any]) -> None:
+    reward_url = getattr(args, "generative_retriever_reward_url", None)
+    if not isinstance(reward_url, str) or not reward_url:
+        return
+    commit_url = reward_url.removesuffix("/score") + "/commit_step_updates"
+    try:
+        with httpx.Client(timeout=60.0, trust_env=False) as client:
+            response = client.post(commit_url, json={})
+            response.raise_for_status()
+            payload = response.json()
+        for key in ("updated_docids", "added_edges", "removed_edges", "overlay_docids"):
+            value = payload.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                output[f"rollout/generative_retriever/doc2k/{key}"] = float(value)
+    except Exception as error:
+        logger.warning("Failed to commit step doc2k updates at %s: %s", commit_url, error)
 
 
 def _add_distribution_metrics(
@@ -100,6 +168,8 @@ def log_rollout(
     if rollout_extra_metrics is None:
         return False
     _add_group_reward_metrics(args, samples, rollout_extra_metrics)
+    apply_hierarchical_tree_credit(args, samples)
+    commit_coupled_doc2k_updates(args, rollout_extra_metrics)
     values: dict[str, list[float]] = defaultdict(list)
     for sample in samples:
         metadata = sample.metadata.get("generative_retriever", {})

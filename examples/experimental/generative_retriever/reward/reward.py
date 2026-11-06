@@ -231,58 +231,62 @@ def _store_breakdown(
     cache: dict[str, Any],
     request_metrics: dict[str, Any],
 ) -> None:
-    keywords = detail.get("keywords")
-    if not isinstance(keywords, list) or not keywords:
-        raise ValueError("generative retriever reward detail must contain keyword breakdowns")
-    components = (
-        "pm_score",
-        "sm_score",
-        "pm_pass",
-        "sm_pass",
-        "normalized_pm",
-        "normalized_sm",
-        "pm_relevance",
-        "sm_relevance",
-        "relevance_quality",
-        "pm_unique_bonus",
-        "sm_unique_bonus",
-        "unique_bonus",
-        "discrete_base",
-        "continuous_base",
-        "discrete_total",
-        "continuous_total",
-        "reward",
-    )
-    metrics = {}
-    for component in components:
-        values = [keyword.get(component) for keyword in keywords]
-        if not all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in values):
-            raise ValueError(f"invalid reward component {component!r}")
-        metrics[component] = math.fsum(float(value) for value in values) / len(values)
-    for metric, component in (
-        ("pm_unique_keyword_rate", "is_pm_unique"),
-        ("sm_unique_keyword_rate", "is_sm_unique"),
-        ("unique_keyword_rate", "is_unique"),
-        ("relevance_eligible_rate", "relevance_eligible"),
-        ("pm_unique_eligible_rate", "pm_unique_eligible"),
-        ("sm_unique_eligible_rate", "sm_unique_eligible"),
-        ("unique_eligible_rate", "unique_eligible"),
-    ):
-        values = [keyword.get(component) for keyword in keywords]
-        if not all(isinstance(value, bool) for value in values):
-            raise ValueError(f"invalid reward component {component!r}")
-        metrics[metric] = math.fsum(float(value) for value in values) / len(values)
-    unique_quality = [
-        float(keyword["relevance_quality"])
-        for keyword in keywords
-        if keyword["is_pm_unique"] or keyword["is_sm_unique"]
-    ]
-    metrics["unique_quality"] = (
-        math.fsum(unique_quality) / len(unique_quality)
-        if unique_quality
-        else 0.0
-    )
-    metrics["train_total"] = metrics["reward"]
+    precomputed = detail.get("metrics")
+    if isinstance(precomputed, dict) and precomputed:
+        metrics: dict[str, Any] = dict(precomputed)
+    else:
+        keywords = detail.get("keywords")
+        if not isinstance(keywords, list) or not keywords:
+            raise ValueError("generative retriever reward detail must contain keyword breakdowns")
+        components = (
+            "pm_score",
+            "sm_score",
+            "pm_pass",
+            "sm_pass",
+            "normalized_pm",
+            "normalized_sm",
+            "pm_relevance",
+            "sm_relevance",
+            "relevance_quality",
+            "pm_unique_bonus",
+            "sm_unique_bonus",
+            "unique_bonus",
+            "discrete_base",
+            "continuous_base",
+            "discrete_total",
+            "continuous_total",
+            "reward",
+        )
+        metrics = {}
+        for component in components:
+            values = [keyword.get(component) for keyword in keywords]
+            if not all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in values):
+                raise ValueError(f"invalid reward component {component!r}")
+            metrics[component] = math.fsum(float(value) for value in values) / len(values)
+        for metric, component in (
+            ("pm_unique_keyword_rate", "is_pm_unique"),
+            ("sm_unique_keyword_rate", "is_sm_unique"),
+            ("unique_keyword_rate", "is_unique"),
+            ("relevance_eligible_rate", "relevance_eligible"),
+            ("pm_unique_eligible_rate", "pm_unique_eligible"),
+            ("sm_unique_eligible_rate", "sm_unique_eligible"),
+            ("unique_eligible_rate", "unique_eligible"),
+        ):
+            values = [keyword.get(component) for keyword in keywords]
+            if not all(isinstance(value, bool) for value in values):
+                raise ValueError(f"invalid reward component {component!r}")
+            metrics[metric] = math.fsum(float(value) for value in values) / len(values)
+        unique_quality = [
+            float(keyword["relevance_quality"])
+            for keyword in keywords
+            if keyword["is_pm_unique"] or keyword["is_sm_unique"]
+        ]
+        metrics["unique_quality"] = (
+            math.fsum(unique_quality) / len(unique_quality)
+            if unique_quality
+            else 0.0
+        )
+        metrics["train_total"] = metrics["reward"]
     if "score_latency_seconds" in request_metrics:
         metrics["score/latency_seconds"] = request_metrics["score_latency_seconds"]
         metrics["score/request_count"] = 1.0

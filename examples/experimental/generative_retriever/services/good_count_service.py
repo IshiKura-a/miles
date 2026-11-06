@@ -18,8 +18,8 @@ from pydantic import BaseModel, Field, field_validator
 
 from examples.experimental.generative_retriever.index.id_text_mapping import (
     PositionalID,
-    _validate_id,
     lookup_service,
+    validate_docid,
 )
 from examples.experimental.generative_retriever.reward.relevance_model import (
     RelevanceScorer,
@@ -43,7 +43,7 @@ class GoodCountSample(BaseModel):
     @classmethod
     def validate_docids(cls, docids: list[PositionalID]) -> list[PositionalID]:
         for docid in docids:
-            _validate_id(docid)
+            validate_docid(docid)
         return docids
 
 

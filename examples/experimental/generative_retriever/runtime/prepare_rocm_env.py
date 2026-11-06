@@ -9,11 +9,15 @@ Run on the first host before launching multi-node GRPO training:
 from __future__ import annotations
 
 import argparse
+import math
 import os
 from pathlib import Path
 import shlex
 import shutil
 import subprocess
+import sys
+
+import torch
 
 _REPO = Path(__file__).resolve().parents[4]
 _DIR = Path(__file__).resolve().parent
@@ -69,25 +73,134 @@ def _run(argv: list[str], *, cwd: Path = _REPO, env: dict[str, str] | None = Non
     subprocess.run(argv, cwd=cwd, env=env, check=True)
 
 
-def _rocm_env(venv: Path) -> dict[str, str]:
-    rocm_home = venv / "lib/python3.12/site-packages/_rocm_sdk_devel"
-    env = os.environ.copy()
-    env.update({
-        "VIRTUAL_ENV": str(venv),
-        "ROCM_HOME": str(rocm_home),
-        "ROCM_PATH": str(rocm_home),
-        "PATH": f"{venv / 'bin'}:{rocm_home / 'llvm/bin'}:{rocm_home / 'bin'}:{Path.home() / '.local/bin'}:{env.get('PATH', '')}",
-        "LD_LIBRARY_PATH": f"{rocm_home / 'lib'}:{env.get('LD_LIBRARY_PATH', '')}".rstrip(":"),
-        "LIBRARY_PATH": f"{rocm_home / 'lib'}:{env.get('LIBRARY_PATH', '')}".rstrip(":"),
-        "CPATH": f"{rocm_home / 'include'}:{env.get('CPATH', '')}".rstrip(":"),
-        "CMAKE_PREFIX_PATH": f"{rocm_home}:{env.get('CMAKE_PREFIX_PATH', '')}".rstrip(":"),
+def _next_pow2(value: int) -> int:
+    return 1 << max(0, (int(value) - 1).bit_length())
+
+
+def derive_sglang_mem_fraction(
+    sglang_server_concurrency: int,
+    n_samples_per_prompt: int,
+    rollout_num_gpus: int,
+    *,
+    max_prompt_tokens: int = 64,
+    total_gpu_mem_gib: float | None = None,
+) -> float:
+    if total_gpu_mem_gib is not None:
+        gpu_gib = float(total_gpu_mem_gib)
+    elif torch.cuda.is_available():
+        gpu_gib = float(torch.cuda.get_device_properties(0).total_memory) / float(2**30)
+    else:
+        gpu_gib = 191.45
+    concurrent_queries_per_gpu = max(
+        64,
+        math.ceil(
+            (sglang_server_concurrency / max(1, n_samples_per_prompt))
+            / max(1, rollout_num_gpus)
+        ),
+    )
+    kv_tokens = max(32768, 4 * concurrent_queries_per_gpu * max_prompt_tokens)
+    kv_bytes_per_token = 36 * 2 * 8 * 128 * 2
+    kv_gib = (kv_tokens * kv_bytes_per_token) / (2**30)
+    model_and_workspace_gib = 5.5 + 4.0 + (0.01 * n_samples_per_prompt)
+    fraction = (model_and_workspace_gib + kv_gib) / max(1.0, gpu_gib)
+    return round(min(0.70, max(0.15, fraction)), 3)
+
+
+def derive_reward_cache_sizes(
+    rollout_batch_size: int,
+    n_samples_per_prompt: int,
+    num_workers: int,
+    *,
+    baseline_top_k: int = 64,
+    mean_keywords_per_docid: float = 6.7,
+) -> tuple[int, int, int]:
+    queries_per_worker = max(1, math.ceil(rollout_batch_size / max(1, num_workers)))
+    query_cache = max(16384, _next_pow2(4 * queries_per_worker))
+    pairs_per_worker = int(
+        math.ceil(2.0 * queries_per_worker * (n_samples_per_prompt + baseline_top_k) * mean_keywords_per_docid)
+    )
+    score_cache = min(8388608, max(131072, _next_pow2(pairs_per_worker)))
+    keyword_cache = min(4194304, max(16384, _next_pow2(score_cache // 2)))
+    return query_cache, keyword_cache, score_cache
+
+
+def is_rocm() -> bool:
+    version_mod = getattr(torch, "version", None)
+    return getattr(version_mod, "hip", None) is not None
+
+
+def rocm_runtime_env(venv: Path | None = None) -> dict[str, str]:
+    root = venv if venv is not None else Path(sys.prefix)
+    rocm_home = root / "lib/python3.12/site-packages/_rocm_sdk_devel"
+    if not rocm_home.is_dir():
+        raise FileNotFoundError(
+            f"ROCm SDK devel directory is missing at {rocm_home}; run "
+            "`python3 -m examples.experimental.generative_retriever.runtime.prepare_rocm_env`"
+        )
+    return {
+        "ROCM_HOME": os.fspath(rocm_home),
+        "ROCM_PATH": os.fspath(rocm_home),
+        "PATH": f"{root / 'bin'}:{rocm_home / 'llvm/bin'}:{rocm_home / 'bin'}:{os.environ.get('PATH', '')}",
+        "LD_LIBRARY_PATH": f"{rocm_home / 'lib'}:{os.environ.get('LD_LIBRARY_PATH', '')}".rstrip(":"),
+        "LIBRARY_PATH": f"{rocm_home / 'lib'}:{os.environ.get('LIBRARY_PATH', '')}".rstrip(":"),
+        "CPATH": f"{rocm_home / 'include'}:{os.environ.get('CPATH', '')}".rstrip(":"),
+        "CMAKE_PREFIX_PATH": f"{rocm_home}:{os.environ.get('CMAKE_PREFIX_PATH', '')}".rstrip(":"),
         "HSA_NO_SCRATCH_RECLAIM": "1",
         "PYTORCH_ROCM_ARCH": "gfx942",
         "GPU_ARCHS": "gfx942",
         "GPU_ARCH": "gfx942",
         "AMDGPU_TARGET": "gfx942",
         "AITER_USE_SYSTEM_TRITON": "1",
-    })
+        "MILES_HARDWARE_PLATFORM": "rocm",
+        "RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO": "0",
+        "RAY_ENABLE_UV_RUN_RUNTIME_ENV": "0",
+        "NCCL_NVLS_ENABLE": "0",
+    }
+
+
+def locked_accelerator_env() -> dict[str, str]:
+    if is_rocm():
+        return rocm_runtime_env()
+    cuda_home = Path(sys.prefix) / "cuda"
+    nvcc = cuda_home / "bin" / "nvcc"
+    if not nvcc.is_file():
+        raise FileNotFoundError(
+            "uv CUDA facade is missing; run "
+            "`uv run python -m examples.experimental.generative_retriever.runtime.prepare_uv_cuda`"
+        )
+    lib64 = cuda_home / "lib64"
+    if not lib64.is_dir():
+        raise FileNotFoundError(f"uv-locked CUDA library directory is missing: {lib64}")
+    cudart_link = lib64 / "libcudart.so"
+    if not cudart_link.is_file():
+        raise FileNotFoundError(f"uv-locked CUDA runtime linker input is missing: {cudart_link}")
+    return {
+        "CUDA_HOME": os.fspath(cuda_home),
+        "PATH": f"{cuda_home / 'bin'}:{os.environ.get('PATH', '')}",
+        "LD_LIBRARY_PATH": f"{lib64}:{os.environ.get('LD_LIBRARY_PATH', '')}",
+    }
+
+
+def build_service_env(gpus: str, repo_root: Path = _REPO) -> dict[str, str]:
+    env = os.environ.copy()
+    env.pop("WANDB_API_KEY", None)
+    if is_rocm():
+        env.update(rocm_runtime_env())
+    env["CUDA_VISIBLE_DEVICES"] = gpus
+    env["NVIDIA_VISIBLE_DEVICES"] = gpus
+    env["PYTHONUNBUFFERED"] = "1"
+    clean_py_path = ":".join(
+        p for p in os.environ.get("PYTHONPATH", "").split(":")
+        if p and "/opt/venv" not in p
+    )
+    env["PYTHONPATH"] = f"{repo_root}:{clean_py_path}".rstrip(":")
+    return env
+
+
+def _rocm_env(venv: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    env.update(rocm_runtime_env(venv))
+    env["VIRTUAL_ENV"] = str(venv)
     return env
 
 
@@ -233,6 +346,20 @@ def prepare(*, hosts: list[str], slm_root: Path) -> None:
     python = str(venv / "bin/python")
     if not venv.exists():
         _run([uv, "venv", str(venv), "--python", "/usr/bin/python3.12"])
+    pyvenv_cfg = venv / "pyvenv.cfg"
+    if pyvenv_cfg.is_file():
+        cfg_text = pyvenv_cfg.read_text(encoding="utf-8")
+        if "include-system-site-packages = true" in cfg_text:
+            pyvenv_cfg.write_text(
+                cfg_text.replace(
+                    "include-system-site-packages = true",
+                    "include-system-site-packages = false",
+                ),
+                encoding="utf-8",
+            )
+    stale_pth = venv / "lib/python3.12/site-packages/host-runtime.pth"
+    if stale_pth.is_file():
+        stale_pth.unlink()
 
     _run([uv, "pip", "install", "--python", python, "--index-url", _ROCM_INDEX_URL, *_ROCM_PACKAGES])
     _run([str(venv / "bin/rocm-sdk"), "init"])

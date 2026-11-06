@@ -8,15 +8,107 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 
 import numpy as np
+import torch
+import torch.nn.functional as F
 
 from examples.experimental.generative_retriever.services.lru_cache import LRUCache
 
 EXPECTED_GRAPHENE_COMMIT = "a57cb597de0891c1e0a2612d12366188b96aa0cc"
 _PIPELINE_PATH = Path("graphene/multi_cup/multi_cup_graphene_pipeline.py")
 logger = logging.getLogger(__name__)
+
+
+def fast_causal_conv1d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    activation: str | None = "silu",
+    **kwargs: object,
+) -> torch.Tensor:
+    del kwargs
+    kernel_size = weight.shape[-1]
+    windows = F.pad(x, (kernel_size - 1, 0)).unfold(-1, kernel_size, 1)
+    out = (windows.float() * weight.view(1, -1, 1, kernel_size).float()).sum(dim=-1)
+    if bias is not None:
+        out = out + bias.view(1, -1, 1).float()
+    out_typed = out.to(dtype=x.dtype)
+    return F.silu(out_typed) if activation in ("silu", "swish") else out_typed
+
+
+def make_fast_single_chunk_gated_delta_rule(orig_fn):
+    def _fast_rule(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        chunk_size: int = 64,
+        initial_state: torch.Tensor | None = None,
+        output_final_state: bool = False,
+        use_qk_l2norm_in_kernel: bool = False,
+        **kwargs: object,
+    ):
+        seq_len = key.shape[1]
+        if initial_state is not None or output_final_state or seq_len > chunk_size:
+            return orig_fn(
+                query,
+                key,
+                value,
+                g,
+                beta,
+                chunk_size=chunk_size,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                **kwargs,
+            )
+        initial_dtype = query.dtype
+        if use_qk_l2norm_in_kernel:
+            query = query * torch.rsqrt((query * query).sum(dim=-1, keepdim=True) + 1e-6).to(query.dtype)
+            key = key * torch.rsqrt((key * key).sum(dim=-1, keepdim=True) + 1e-6).to(key.dtype)
+        query, key, value, beta, g = [
+            x.transpose(1, 2).contiguous().to(torch.float32)
+            for x in (query, key, value, beta, g)
+        ]
+        query = query * (query.shape[-1] ** -0.5)
+        v_beta = value * beta.unsqueeze(-1)
+        k_beta = key * beta.unsqueeze(-1)
+        mask0 = torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool, device=query.device), diagonal=0)
+        g = g.cumsum(dim=-1)
+        decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
+        attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask0, 0)
+        for idx in range(1, seq_len):
+            row = attn[..., idx, :idx].clone()
+            sub = attn[..., :idx, :idx].clone()
+            attn[..., idx, :idx] = row + (row.unsqueeze(-1) * sub).sum(-2)
+        attn = attn + torch.eye(seq_len, dtype=attn.dtype, device=attn.device)
+        v_new = attn @ v_beta
+        attn_qk = (query @ key.transpose(-1, -2)) * decay_mask
+        core_attn_out = attn_qk @ v_new
+        return core_attn_out.transpose(1, 2).contiguous().to(initial_dtype), None
+
+    return _fast_rule
+
+
+def optimize_graphene_pipeline(pipeline: object) -> None:
+    for attr in ("query_engine", "keyword_engine"):
+        engine: Any = getattr(pipeline, attr, None)
+        model = getattr(engine, "model", None)
+        if engine is None or model is None:
+            continue
+        cur_batch_size = getattr(engine, "batch_size", None)
+        if isinstance(cur_batch_size, int):
+            engine.batch_size = min(cur_batch_size, 1024)
+        for mod in model.modules():
+            if type(mod).__name__ == "Qwen3_5GatedDeltaNet":
+                if getattr(mod, "causal_conv1d_fn", None) is None:
+                    mod.causal_conv1d_fn = fast_causal_conv1d
+                orig_chunk = getattr(mod, "chunk_gated_delta_rule", None)
+                if callable(orig_chunk) and getattr(orig_chunk, "__name__", "") != "_fast_rule":
+                    mod.chunk_gated_delta_rule = make_fast_single_chunk_gated_delta_rule(orig_chunk)
 
 
 class RelevancePipeline(Protocol):
@@ -57,6 +149,7 @@ class RelevanceScorer:
     ) -> None:
         if pair_batch_size <= 0:
             raise ValueError("Relevance pair batch size must be positive")
+        optimize_graphene_pipeline(pipeline)
         self.pipeline = pipeline
         self.pair_batch_size = pair_batch_size
         self.query_features: LRUCache[str, np.ndarray] = LRUCache(feature_cache_size)
@@ -79,8 +172,9 @@ class RelevanceScorer:
                 resolved[text] = features
         if missing:
             encode = self.pipeline.encode_query if query else self.pipeline.encode_keyword
-            # The tower changes a row's output for batches of 1-3.
-            padded = missing + [missing[-1]] * (-len(missing) % 4)
+            # The tower changes a row's output for batches of 1-3; coarse bucketing avoids MIOpen conv1d retuning.
+            pad_multiple = 256 if (not query and len(missing) >= 64) else (16 if (query and len(missing) >= 16) else 4)
+            padded = missing + [missing[-1]] * (-len(missing) % pad_multiple)
             encoded = encode(padded)
             if (
                 encoded.ndim != 3
@@ -186,7 +280,7 @@ def load_relevance_pipeline_factory(source: str | Path) -> RelevancePipelineFact
     resolved = _validate_source(Path(source))
     source_text = os.fspath(resolved)
     if source_text not in sys.path:
-        sys.path.insert(0, source_text)
+        sys.path.append(source_text)
     module = importlib.import_module("graphene.multi_cup.multi_cup_graphene_pipeline")
     factory = getattr(module, "MultiCupGraphenePipeline", None)
     if not callable(factory):

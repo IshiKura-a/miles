@@ -155,7 +155,7 @@ def aggregate_forward_results(
         # Handle dynamic batch size: restore original order
         if args.use_dynamic_batch_size and hasattr(data_iterator, "micro_batch_indices"):
             origin_values = [None] * len(values)
-            origin_indices = sum(data_iterator.micro_batch_indices, [])
+            origin_indices = [idx for mb in data_iterator.micro_batch_indices for idx in mb]
             for value, origin_index in zip(values, origin_indices, strict=False):
                 origin_values[origin_index] = value
             values = origin_values

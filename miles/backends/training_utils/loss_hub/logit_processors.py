@@ -232,40 +232,62 @@ def get_log_probs_and_entropy(
     parallel_state = get_parallel_state()
     log_probs_list = []
     entropy_list = []
-    response_chunks = _iter_response_chunks(
-        logits,
-        args=args,
-        unconcat_tokens=unconcat_tokens,
-        total_lengths=total_lengths,
-        response_lengths=response_lengths,
-        max_seq_lens=max_seq_lens,
-        include_response_indices=rollout_sampling_mask is not None,
+    response_chunks = list(
+        _iter_response_chunks(
+            logits,
+            args=args,
+            unconcat_tokens=unconcat_tokens,
+            total_lengths=total_lengths,
+            response_lengths=response_lengths,
+            max_seq_lens=max_seq_lens,
+            include_response_indices=rollout_sampling_mask is not None,
+        )
     )
-    for sample_index, (logits_chunk, tokens_chunk, response_indices) in enumerate(response_chunks):
-        sampling_mask = None
-        if rollout_sampling_mask is not None:
-            sampling_mask = build_local_sampling_mask(
-                logits_chunk,
-                rollout_sampling_mask[sample_index],
-                response_indices,
-                tp_rank=parallel_state.tp.rank,
-            )
-        log_prob, entropy = calculate_log_probs_and_entropy(
-            logits_chunk,
-            tokens_chunk,
+    if rollout_sampling_mask is None and response_chunks:
+        chunk_lengths = [tokens_chunk.size(0) for _, tokens_chunk, _ in response_chunks]
+        cat_logits = torch.cat([logits_chunk for logits_chunk, _, _ in response_chunks], dim=0)
+        cat_tokens = torch.cat([tokens_chunk for _, tokens_chunk, _ in response_chunks], dim=0)
+        cat_log_prob, cat_entropy = calculate_log_probs_and_entropy(
+            cat_logits,
+            cat_tokens,
             parallel_state.tp.group,
             with_entropy=with_entropy,
             entropy_requires_grad=entropy_requires_grad,
             chunk_size=args.log_probs_chunk_size,
             true_on_policy=args.true_on_policy_mode,
             vocab_size=getattr(args, "vocab_size", None),
-            sampling_mask=sampling_mask,
+            sampling_mask=None,
             temperature=1.0 if args.true_on_policy_mode else args.rollout_temperature,
         )
+        log_probs_list = list(cat_log_prob.squeeze(-1).split(chunk_lengths, dim=0))
+        if with_entropy and cat_entropy is not None:
+            entropy_list = list(cat_entropy.split(chunk_lengths, dim=0))
+    else:
+        for sample_index, (logits_chunk, tokens_chunk, response_indices) in enumerate(response_chunks):
+            sampling_mask = None
+            if rollout_sampling_mask is not None:
+                sampling_mask = build_local_sampling_mask(
+                    logits_chunk,
+                    rollout_sampling_mask[sample_index],
+                    response_indices,
+                    tp_rank=parallel_state.tp.rank,
+                )
+            log_prob, entropy = calculate_log_probs_and_entropy(
+                logits_chunk,
+                tokens_chunk,
+                parallel_state.tp.group,
+                with_entropy=with_entropy,
+                entropy_requires_grad=entropy_requires_grad,
+                chunk_size=args.log_probs_chunk_size,
+                true_on_policy=args.true_on_policy_mode,
+                vocab_size=getattr(args, "vocab_size", None),
+                sampling_mask=sampling_mask,
+                temperature=1.0 if args.true_on_policy_mode else args.rollout_temperature,
+            )
 
-        log_probs_list.append(log_prob.squeeze(-1))
-        if with_entropy:
-            entropy_list.append(entropy)
+            log_probs_list.append(log_prob.squeeze(-1))
+            if with_entropy:
+                entropy_list.append(entropy)
 
     res = {
         "log_probs": log_probs_list,

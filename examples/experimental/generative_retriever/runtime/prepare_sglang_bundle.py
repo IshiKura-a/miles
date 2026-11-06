@@ -40,8 +40,9 @@ _QWEN_ASSETS = (
 
 
 def _replace_symlink(link: Path, target: Path) -> None:
-    if link.is_symlink() and link.resolve() == target:
-        return
+    if link.is_symlink():
+        if Path(os.readlink(link)) == target or link.resolve() == target:
+            return
     if link.exists() or link.is_symlink():
         raise FileExistsError(f"refusing to replace existing bundle file: {link}")
     link.symlink_to(target)
@@ -63,7 +64,9 @@ def prepare_bundle(
     qwen_path = require_directory(qwen_model, "Qwen model")
     slm_path = require_directory(slm_root, "SLMv3 source")
     mapping_path = Path(id_mapping).expanduser().resolve()
-    if not mapping_path.is_file():
+    if not mapping_path.is_file() and not (
+        mapping_path.is_dir() and (mapping_path / "docid_keywords.parquet").is_file()
+    ):
         raise FileNotFoundError(f"Official ID mapping is missing: {mapping_path}")
     output_path = Path(output).expanduser().resolve()
     output_path.mkdir(parents=True, exist_ok=True)
