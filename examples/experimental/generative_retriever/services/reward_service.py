@@ -14,7 +14,8 @@ import argparse
 import logging
 import math
 import time
-from concurrent.futures import Future
+from collections.abc import Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
@@ -57,13 +58,23 @@ from examples.experimental.generative_retriever.reward.relevance_reward import (
 )
 
 logger = logging.getLogger(__name__)
-REWARD_SERVICE_API_VERSION = 11
+REWARD_SERVICE_API_VERSION = 12
 _SERVICE_API_VERSION = REWARD_SERVICE_API_VERSION
 _QUERY_CACHE_SIZE = DEFAULT_QUERY_CACHE_SIZE
 _KEYWORD_CACHE_SIZE = DEFAULT_KEYWORD_CACHE_SIZE
 _SCORE_CACHE_SIZE = DEFAULT_SCORE_CACHE_SIZE
 _CROSS_BATCH_SIZE = 8192
 _INLINE_KEYWORDS_SAMPLE_LIMIT = 16
+
+
+def _parse_devices(raw_devices: str | Sequence[str]) -> tuple[str, ...]:
+    if isinstance(raw_devices, str):
+        devices = tuple(d.strip() for d in raw_devices.split(",") if d.strip())
+    else:
+        devices = tuple(str(d).strip() for d in raw_devices if str(d).strip())
+    if not devices or len(set(devices)) != len(devices):
+        raise ValueError("Reward devices must be a non-empty tuple of distinct devices")
+    return devices
 
 
 class RewardSample(BaseModel):
@@ -157,7 +168,7 @@ class KeywordRewardEngine:
         mapping_url: str,
         mapping_version: str,
         relevance_model: str,
-        device: str,
+        devices: str | Sequence[str],
         batch_size: int,
         query_cache_size: int,
         score_cache_size: int,
@@ -166,6 +177,7 @@ class KeywordRewardEngine:
         pair_batch_size: int,
         keyword_cache_size: int = _KEYWORD_CACHE_SIZE,
     ) -> None:
+        self.devices = _parse_devices(devices)
         self.mapping_version = mapping_version
         self.mapping_url = mapping_url
         self.baseline_url = baseline_url
@@ -174,19 +186,24 @@ class KeywordRewardEngine:
         self.baselines: LRUCache[str, BaselineSets] = LRUCache(query_cache_size)
         relevance_source = resolve_relevance_source(relevance_model)
         pipeline_factory = load_relevance_pipeline_factory(relevance_source)
-        pipeline = pipeline_factory(
-            relevance_model, cup="large", device=device, dtype="bf16",
-            batch_size=batch_size, cross_batch_size=_CROSS_BATCH_SIZE, show_progress=False,
-        )
+
+        def _load_one(dev: str):
+            return pipeline_factory(
+                relevance_model, cup="large", device=dev, dtype="bf16",
+                batch_size=batch_size, cross_batch_size=_CROSS_BATCH_SIZE, show_progress=False,
+            )
+
+        with ThreadPoolExecutor(max_workers=len(self.devices)) as loader:
+            pipelines = list(loader.map(_load_one, self.devices))
+
         self.scorer = RelevanceScorer(
-            pipeline,
+            pipelines,
             feature_cache_size=query_cache_size,
             score_cache_size=score_cache_size,
             pair_batch_size=pair_batch_size,
             keyword_cache_size=keyword_cache_size,
         )
         self._lock = Lock()
-        self._scorer_lock = Lock()
         self._baseline_inflight: dict[str, Future[BaselineSets]] = {}
         self._client = httpx.Client(
             timeout=300.0,
@@ -202,18 +219,19 @@ class KeywordRewardEngine:
         self,
         pairs: list[tuple[str, str]],
     ) -> tuple[dict[tuple[str, str], tuple[float, float]], dict[str, dict[str, int]]]:
-        with self._scorer_lock:
+        with self._lock:
             before = self._cache_stats()
-            scored = self.scorer.score(pairs)
+        scored = self.scorer.score(pairs)
+        with self._lock:
             after = self._cache_stats()
-            return scored, self._cache_delta(before, after)
+        return scored, self._cache_delta(before, after)
 
     def _cache_stats(self) -> dict[str, Any]:
         return {
             "baseline": asdict(self.baselines.stats()),
             "reward": asdict(self.scorer.scores.stats()),
-            "query_features": asdict(self.scorer.query_features.stats()),
-            "keyword_features": asdict(self.scorer.keyword_features.stats()),
+            "query_features": asdict(self.scorer.query_feature_stats()),
+            "keyword_features": asdict(self.scorer.keyword_feature_stats()),
         }
 
     def _lookup_docids(
@@ -566,6 +584,7 @@ def create_app(
     mapping_version: str,
     relevance_model: str,
     *,
+    devices: str | Sequence[str] = ("cuda:0",),
     batch_size: int = REWARD_TOWER_BATCH_SIZE,
     docids_per_query: int = DEFAULT_TRAIN_GROUP_SIZE,
     pair_batch_size: int = REWARD_PAIR_BATCH_SIZE,
@@ -574,6 +593,7 @@ def create_app(
     keyword_cache_size: int = _KEYWORD_CACHE_SIZE,
     score_cache_size: int = _SCORE_CACHE_SIZE,
 ) -> FastAPI:
+    parsed_devices = _parse_devices(devices)
     if batch_size < 4 or batch_size % 4:
         raise ValueError("batch_size must be a positive multiple of 4")
     if query_cache_size <= 0 or keyword_cache_size <= 0 or score_cache_size <= 0:
@@ -589,7 +609,7 @@ def create_app(
             mapping_url,
             mapping_version,
             relevance_model,
-            "cuda:0",
+            parsed_devices,
             batch_size,
             query_cache_size,
             score_cache_size,
@@ -611,8 +631,8 @@ def create_app(
         return {
             "status": "ready",
             "mode": "worker",
-            "worker_count": 1,
-            "device": "cuda:0",
+            "worker_count": len(parsed_devices),
+            "devices": list(parsed_devices),
             "mapping_version": engine.mapping_version,
             "baseline_queries": len(engine._baseline_queries),
             "cache": engine._cache_stats(),
@@ -623,6 +643,7 @@ def create_app(
                 "mapping_version": mapping_version,
                 "relevance_source": resolved_relevance_source,
                 "relevance_model": resolved_relevance_model,
+                "devices": list(parsed_devices),
                 "query_cache_size": query_cache_size,
                 "keyword_cache_size": keyword_cache_size,
                 "score_cache_size": score_cache_size,
@@ -678,6 +699,7 @@ def main() -> None:
     parser.add_argument("--relevance-model", required=True)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=30489)
+    parser.add_argument("--devices", default="cuda:0")
     parser.add_argument("--batch-size", type=int, default=REWARD_TOWER_BATCH_SIZE)
     parser.add_argument("--pair-batch-size", type=int, default=REWARD_PAIR_BATCH_SIZE)
     parser.add_argument("--docids-per-query", type=int, default=DEFAULT_TRAIN_GROUP_SIZE)
@@ -693,6 +715,7 @@ def main() -> None:
             args.mapping_url,
             mapping_version=args.mapping_version,
             relevance_model=args.relevance_model,
+            devices=_parse_devices(args.devices),
             batch_size=args.batch_size,
             docids_per_query=args.docids_per_query,
             pair_batch_size=args.pair_batch_size,

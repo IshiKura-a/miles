@@ -381,21 +381,19 @@ CUDA_VISIBLE_DEVICES=4,5 uv run python -m \
 - `POST /generate` 每次最多 512 个 query，每个 query 返回 `docids_per_query` 个不同有效 ID
   及四段 token logprob；完整 query group 缓存在 8,192 条 LRU 中。
 
-### 常驻 reward 服务与二级缓存（L1 Score Cache + L2 $q$/$k$ GPU Embedding Tables）
+### 常驻 reward 服务与二级缓存（Per-Node 8 卡显存直连共享：L1 Score Cache + L2 $q$/$k$ GPU Embedding Tables）
 
 [reward_service.py](../../examples/experimental/generative_retriever/services/reward_service.py)
-是单 GPU worker。单机在 GPU 0–7 上运行 8 个隔离进程（端口 `30490..30497`），
-多机在每台服务节点的 GPU 0–7 上运行 8 个隔离进程（端口 `31583..31590`）。
-[reward_router_service.py](../../examples/experimental/generative_retriever/services/reward_router_service.py)
-按 query 做 rendezvous hashing（`q-hash`），将同一 query 的 `/prepare` 和 `/score` 固定路由到同一个所属 worker，并采用 **二级缓存 + $q$–$k$ 解耦架构**：
+是单节点多 GPU 显存直连服务（`--devices cuda:0,cuda:1,cuda:2,cuda:3,cuda:4,cuda:5,cuda:6,cuda:7`，端口 `30490` / 多机 `31583`）。
+单机在单个进程内统一调度本机全部 8 张 GPU（`cuda:0..7`），多机在每台服务节点上运行 1 个管理本机 8 张 GPU 的进程，由 [reward_router_service.py](../../examples/experimental/generative_retriever/services/reward_router_service.py) 按 `q-hash` 将同一 query 的 `/prepare` 和 `/score` 路由到同一节点，并采用 **节点级二级缓存 + 进程内 8 卡 `k-hash` 显存共享架构**：
 
 1. **一级缓存（L1 Score Cache，`--score-cache-size`）**：
-   - 在 `q-hash` 所属 worker 上缓存 `(q, k) -> (pm_score, sm_score)`。
-   - 同一个 query 在 `/prepare`（Baseline 512 个 doc ID 打分）与 `/score`（Rollout 512 个 doc ID 打分）之间重叠的 `(q, k)` 对、同一 query 跨多个 `/score` 批次的重复词、以及数据集中的重复高频 query 直接在 L1 命中返回，零 GPU 计算、零跨卡 RPC。
-2. **二级缓存（L2 纯 GPU 显存 Embedding Tables，`--query-cache-size` + `--keyword-cache-size`）**：
-   - 仅当 `(q, k)` 在 L1 未命中时触发，全部常驻在各 GPU HBM 显存预分配的 `bfloat16` `[capacity, 2, 128]` 张量表（[GpuEmbeddingTable](../../examples/experimental/generative_retriever/reward/relevance_model.py)）中，不使用主机 `/dev/shm` 或跨进程 RPC：
-     - **`query_features`（`--query-cache-size`）**：常驻在所属 worker 显存中（每条仅 `512 Bytes`），Baseline `/prepare` 编码一次 $q$ 后，后续 Rollout `/score` 直接在显存中 $O(1)$ 复用 `q_emb`；
-     - **`keyword_features`（`--keyword-cache-size`）**：每张 GPU 显存独立常驻最高 `8,388,608` 条（仅占 `4.0 GiB` HBM），所有查询、编码与 `cross_model(q_emb, k_emb)` 打分 100% 在本卡显存内闭环完成，零跨进程通信与同步等待。
+   - 节点内全局共享一份 `(q, k) -> (pm_score, sm_score)` 缓存（容量 `8,388,608` 对）。
+   - 同一个 query 在 `/prepare`（Baseline 512 个 doc ID 打分）与 `/score`（Rollout 512 个 doc ID 打分）之间重叠的 `(q, k)` 对、同一 query 跨多个 `/score` 批次的重复词、以及数据集中的重复高频 query 直接在 L1 命中返回，零 GPU 计算。
+2. **二级缓存（L2 Per-Node 8 卡共享 GPU 显存表，`--query-cache-size` + `--keyword-cache-size`）**：
+   - 仅当 `(q, k)` 在 L1 未命中时触发，全部常驻在各 GPU HBM 显存预分配的 `bfloat16` `[capacity, 2, 128]` 张量表（[GpuEmbeddingTable](../../examples/experimental/generative_retriever/reward/relevance_model.py)）中，进程内多线程直连调度 `cuda:0..7`，零跨进程 HTTP RPC、零主机 `mmap`：
+     - **`query_features`（`--query-cache-size`）**：按 `xxhash64(q) % 8` 分片常驻在对应 GPU 显存中（每条仅 `512 Bytes`），Baseline `/prepare` 编码一次 $q$ 后，后续 Rollout `/score` 直接在显存中 $O(1)$ 复用 `q_emb`；
+     - **`keyword_features`（`--keyword-cache-size`）**：按 `xxhash64(k) % 8`（`k-hash`）在节点内 8 张 GPU 显存间全局分片（每卡 `8,388,608` 条仅占 `4.0 GiB` HBM，单节点 8 卡合并不重复常驻 **`6,710 万`条** 唯一 keyword 向量）。同一节点内任何 keyword 最多只编码一次，8 张 GPU 通过进程内线程池并行执行查表/编码与 `cross_model(q_emb, k_emb)` 打分，多机之间节点级独立闭环、零跨机网络通信。
 
 ### 两机 16 GPU 与多机 `2n × 8` GPU 异步 GRPO 配置
 

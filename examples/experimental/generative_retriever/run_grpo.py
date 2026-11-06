@@ -62,10 +62,11 @@ _TRAIN_GPUS = "0,1"
 _ROLLOUT_GPUS = "2,3"
 _BASELINE_GPUS = "4,5"
 _REWARD_GPUS = "0,1,2,3,4,5,6,7"
+_REWARD_DEVICES = tuple(f"cuda:{i}" for i in range(len(_REWARD_GPUS.split(","))))
 _MAPPING_PORT = 30488
 _BASELINE_PORT = 30487
 _REWARD_PORT = 30489
-_REWARD_WORKER_PORTS = (30490, 30491, 30492, 30493, 30494, 30495, 30496, 30497)
+_REWARD_WORKER_PORTS = (30490,)
 _SERVICE_START_TIMEOUT = 1800.0
 _QUERIES_PER_STEP = 4000
 _GLOBAL_BATCH_SIZE = _QUERIES_PER_STEP * DEFAULT_TRAIN_GROUP_SIZE
@@ -121,9 +122,9 @@ class ScriptArgs(U.ExecuteTrainConfig):
     max_tokens_per_gpu: int = 131072
     reward_timeout: float = 1800.0
     reward_batch_size: int = DEFAULT_REWARD_BATCH_SIZE
-    reward_request_concurrency: int = 2 * len(_REWARD_WORKER_PORTS)
+    reward_request_concurrency: int = 2 * len(_REWARD_DEVICES)
     prepare_concurrency: int = 2
-    reward_forward_concurrency: int = 2
+    reward_forward_concurrency: int = len(_REWARD_DEVICES)
     reward_query_cache_size: int = 0
     reward_keyword_cache_size: int = 0
     reward_score_cache_size: int = 0
@@ -366,68 +367,64 @@ def _ensure_resident_services(
                 },
             },
         ),
-    ]
-    for index, (gpu, port) in enumerate(
-        zip(_REWARD_GPUS.split(","), _REWARD_WORKER_PORTS, strict=True)
-    ):
-        specs.append(
-            (
-                f"reward-worker-{index}",
-                [
-                    sys.executable,
-                    "-m",
-                    "examples.experimental.generative_retriever.services.reward_service",
-                    "--baseline-url",
-                    baseline_url,
-                    "--mapping-url",
-                    mapping_url,
-                    "--mapping-version",
-                    mapping.name,
-                    "--relevance-model",
-                    os.fspath(relevance_model),
-                    "--docids-per-query",
-                    str(args.n_samples_per_prompt),
-                    "--batch-size",
-                    str(REWARD_TOWER_BATCH_SIZE),
-                    "--pair-batch-size",
-                    str(REWARD_PAIR_BATCH_SIZE),
-                    "--max-samples-per-request",
-                    str(args.reward_batch_size),
-                    "--query-cache-size",
-                    str(query_cache_size),
-                    "--keyword-cache-size",
-                    str(kw_cache_size),
-                    "--score-cache-size",
-                    str(score_cache_size),
-                    "--port",
-                    str(port),
-                ],
-                build_service_env(gpu),
-                f"http://127.0.0.1:{port}/health",
-                {
-                    "status": "ready",
-                    "mode": "worker",
-                    "worker_count": 1,
+        (
+            "reward-worker-0",
+            [
+                sys.executable,
+                "-m",
+                "examples.experimental.generative_retriever.services.reward_service",
+                "--baseline-url",
+                baseline_url,
+                "--mapping-url",
+                mapping_url,
+                "--mapping-version",
+                mapping.name,
+                "--relevance-model",
+                os.fspath(relevance_model),
+                "--devices",
+                ",".join(_REWARD_DEVICES),
+                "--docids-per-query",
+                str(args.n_samples_per_prompt),
+                "--batch-size",
+                str(REWARD_TOWER_BATCH_SIZE),
+                "--pair-batch-size",
+                str(REWARD_PAIR_BATCH_SIZE),
+                "--max-samples-per-request",
+                str(args.reward_batch_size),
+                "--query-cache-size",
+                str(query_cache_size),
+                "--keyword-cache-size",
+                str(kw_cache_size),
+                "--score-cache-size",
+                str(score_cache_size),
+                "--port",
+                str(_REWARD_WORKER_PORTS[0]),
+            ],
+            build_service_env(_REWARD_GPUS),
+            f"http://127.0.0.1:{_REWARD_WORKER_PORTS[0]}/health",
+            {
+                "status": "ready",
+                "mode": "worker",
+                "worker_count": len(_REWARD_DEVICES),
+                "mapping_version": mapping.name,
+                "service_config": {
+                    "api_version": REWARD_SERVICE_API_VERSION,
+                    "baseline_url": baseline_url,
+                    "mapping_url": mapping_url,
                     "mapping_version": mapping.name,
-                    "service_config": {
-                        "api_version": REWARD_SERVICE_API_VERSION,
-                        "baseline_url": baseline_url,
-                        "mapping_url": mapping_url,
-                        "mapping_version": mapping.name,
-                        "relevance_source": str(relevance_source),
-                        "relevance_model": str(relevance_model),
-                        "query_cache_size": query_cache_size,
-                        "keyword_cache_size": kw_cache_size,
-                        "score_cache_size": score_cache_size,
-                        "batch_size": REWARD_TOWER_BATCH_SIZE,
-                        "pair_batch_size": REWARD_PAIR_BATCH_SIZE,
-                        "docids_per_query": args.n_samples_per_prompt,
-                        "max_samples_per_request": args.reward_batch_size,
-                    },
+                    "relevance_source": str(relevance_source),
+                    "relevance_model": str(relevance_model),
+                    "devices": list(_REWARD_DEVICES),
+                    "query_cache_size": query_cache_size,
+                    "keyword_cache_size": kw_cache_size,
+                    "score_cache_size": score_cache_size,
+                    "batch_size": REWARD_TOWER_BATCH_SIZE,
+                    "pair_batch_size": REWARD_PAIR_BATCH_SIZE,
+                    "docids_per_query": args.n_samples_per_prompt,
+                    "max_samples_per_request": args.reward_batch_size,
                 },
-            )
-        )
-    specs.append(
+            },
+        ),
         (
             "reward-router",
             [
@@ -457,8 +454,8 @@ def _ensure_resident_services(
                     "forward_concurrency": args.reward_forward_concurrency,
                 },
             },
-        )
-    )
+        ),
+    ]
     started: list[
         tuple[
             str,

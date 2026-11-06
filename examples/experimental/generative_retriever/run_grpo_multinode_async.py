@@ -67,7 +67,9 @@ _MODULE = "examples.experimental.generative_retriever.run_grpo_multinode_async"
 _RESIDENT_MAPPING_PORT = 31480
 _MAPPING_PORT = 31580
 _BASELINE_PORT = 31581
-_REWARD_PORTS = tuple(range(31583, 31591))
+_REWARD_PORTS = (31583,)
+_REWARD_GPUS_PER_NODE = 8
+_REWARD_DEVICES = tuple(f"cuda:{i}" for i in range(_REWARD_GPUS_PER_NODE))
 _ROUTER_PORT = 31593
 _RAY_PORT = 16380
 _SERVICE_TIMEOUT = 3600
@@ -76,7 +78,7 @@ _PROMPT_DATASET_ROWS = PROMPT_DATASET_ROWS
 _QUERIES_PER_STEP_PER_PAIR = 8000
 _SAMPLES_PER_PROMPT = DEFAULT_TRAIN_GROUP_SIZE
 _GLOBAL_BATCH_SIZE_PER_PAIR = _QUERIES_PER_STEP_PER_PAIR * _SAMPLES_PER_PROMPT
-_REWARD_WORKERS_PER_PAIR = len(_REWARD_PORTS)
+_REWARD_WORKERS_PER_PAIR = _REWARD_GPUS_PER_NODE
 _ROLLOUT_GPUS_PER_PAIR = 4
 _LEARNER_GPUS_PER_NODE = 8
 _SGLANG_CONCURRENCY_PER_PAIR = 16384
@@ -589,37 +591,40 @@ def _service_node(manifest: Manifest, index: int) -> None:
         query_cache, kw_cache, score_cache = derive_reward_cache_sizes(
             _QUERIES_PER_STEP_PER_PAIR * pairs,
             _SAMPLES_PER_PROMPT,
-            _REWARD_WORKERS_PER_PAIR * pairs,
+            pairs,
         )
-        for gpu, port in enumerate(_REWARD_PORTS):
-            name = f"reward-{gpu}"
-            _start_service(
-                processes, name, "reward_service", host, port,
-                [
-                    "--baseline-url", f"http://{host}:{_BASELINE_PORT}/generate",
-                    "--mapping-url", manifest["mapping_url"],
-                    "--mapping-version", Path(mapping).name,
-                    "--relevance-model", manifest["relevance_model"],
-                    "--batch-size", str(REWARD_TOWER_BATCH_SIZE),
-                    "--pair-batch-size", str(REWARD_PAIR_BATCH_SIZE),
-                    "--docids-per-query", str(_SAMPLES_PER_PROMPT),
-                    "--max-samples-per-request", str(DEFAULT_REWARD_BATCH_SIZE),
-                    "--query-cache-size", str(query_cache),
-                    "--keyword-cache-size", str(kw_cache),
-                    "--score-cache-size", str(score_cache),
-                ],
-                gpus=str(gpu),
-            )
-            reward_health.append((name, port, {
-                "worker_count": 1, "mapping_version": Path(mapping).name,
-                "service_config": {
-                    "baseline_url": f"http://{host}:{_BASELINE_PORT}/generate",
-                    "mapping_url": manifest["mapping_url"],
-                    "relevance_model": manifest["relevance_model"],
-                    "docids_per_query": _SAMPLES_PER_PROMPT,
-                    "max_samples_per_request": DEFAULT_REWARD_BATCH_SIZE,
-                },
-            }))
+        port = _REWARD_PORTS[0]
+        name = "reward-0"
+        _start_service(
+            processes, name, "reward_service", host, port,
+            [
+                "--baseline-url", f"http://{host}:{_BASELINE_PORT}/generate",
+                "--mapping-url", manifest["mapping_url"],
+                "--mapping-version", Path(mapping).name,
+                "--relevance-model", manifest["relevance_model"],
+                "--devices", ",".join(_REWARD_DEVICES),
+                "--batch-size", str(REWARD_TOWER_BATCH_SIZE),
+                "--pair-batch-size", str(REWARD_PAIR_BATCH_SIZE),
+                "--docids-per-query", str(_SAMPLES_PER_PROMPT),
+                "--max-samples-per-request", str(DEFAULT_REWARD_BATCH_SIZE),
+                "--query-cache-size", str(query_cache),
+                "--keyword-cache-size", str(kw_cache),
+                "--score-cache-size", str(score_cache),
+            ],
+            gpus=",".join(str(g) for g in range(_REWARD_GPUS_PER_NODE)),
+        )
+        reward_health.append((name, port, {
+            "worker_count": _REWARD_GPUS_PER_NODE,
+            "mapping_version": Path(mapping).name,
+            "service_config": {
+                "baseline_url": f"http://{host}:{_BASELINE_PORT}/generate",
+                "mapping_url": manifest["mapping_url"],
+                "relevance_model": manifest["relevance_model"],
+                "devices": list(_REWARD_DEVICES),
+                "docids_per_query": _SAMPLES_PER_PROMPT,
+                "max_samples_per_request": DEFAULT_REWARD_BATCH_SIZE,
+            },
+        }))
         if baseline is not None:
             _wait_health(processes, host, "baseline", _BASELINE_PORT, baseline[1])
             print(
@@ -881,7 +886,7 @@ def _run(manifest: Manifest) -> None:
             manifest["head_ip"], _ROUTER_PORT,
             ["--worker-urls", ",".join(worker_urls),
              "--max-samples-per-request", str(DEFAULT_REWARD_BATCH_SIZE),
-             "--forward-concurrency", "1"],
+             "--forward-concurrency", str(_REWARD_GPUS_PER_NODE)],
         )
         os.environ.update(manifest["runtime_env"])
         head = Node(
@@ -937,11 +942,11 @@ def _run(manifest: Manifest) -> None:
             for port in _REWARD_PORTS:
                 _wait_health(
                     processes, host, f"reward-{index}-{port}", port,
-                    {"worker_count": 1, "mapping_version": Path(manifest["mapping"]).name},
+                    {"worker_count": _REWARD_GPUS_PER_NODE, "mapping_version": Path(manifest["mapping"]).name},
                 )
         _wait_health(
             processes, manifest["head_ip"], "reward-router", _ROUTER_PORT,
-            {"worker_count": 8 * (len(manifest["hosts"]) // 2),
+            {"worker_count": len(manifest["hosts"]) // 2,
              "mapping_version": Path(manifest["mapping"]).name,
              "service_config": {"worker_urls": worker_urls}},
         )
