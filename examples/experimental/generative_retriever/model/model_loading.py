@@ -15,7 +15,6 @@ import torch
 from torch.distributed.checkpoint.filesystem import FileSystemReader
 from torch.distributed.checkpoint.metadata import TensorStorageMetadata
 from torch.distributed.checkpoint.state_dict_loader import load
-import transformers
 
 _POLICY_HEAD_PREFIXES = ("docEnc2decoder.", "decoder.", "lm_head.")
 
@@ -35,10 +34,10 @@ def import_slmv3(slm_root: Path) -> dict[str, Any]:
     model_module = importlib.import_module("model")
 
     # Model imports can replace Transformers' lazy module; patch the active module before utils.
-    transformers_dynamic: Any = transformers
-    if not hasattr(transformers, "MT5Tokenizer"):
-        transformers_dynamic.MT5Tokenizer = transformers.T5Tokenizer
-    if not hasattr(transformers, "MT5TokenizerFast"):
+    transformers_dynamic: Any = importlib.import_module("transformers")
+    if not hasattr(transformers_dynamic, "MT5Tokenizer"):
+        transformers_dynamic.MT5Tokenizer = transformers_dynamic.T5Tokenizer
+    if not hasattr(transformers_dynamic, "MT5TokenizerFast"):
         transformers_dynamic.MT5TokenizerFast = transformers_dynamic.T5TokenizerFast
 
     utils_module = importlib.import_module("utils")
