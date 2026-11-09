@@ -21,7 +21,7 @@ from examples.experimental.generative_retriever.model.model_loading import load_
 from examples.experimental.generative_retriever.model.transformers_infer import GenerationResult, SLMv3Retriever
 from examples.experimental.generative_retriever.reward.relevance_reward import (
     DEFAULT_TRAIN_GROUP_SIZE,
-    MAX_DOCIDS_PER_QUERY,
+    MAX_EVAL_BATCH_SIZE,
 )
 
 logger = logging.getLogger(__name__)
@@ -32,7 +32,7 @@ _CACHE_SIZE = BASELINE_CACHE_SIZE
 
 
 class BaselineRequest(BaseModel):
-    queries: Annotated[list[str], Field(min_length=1, max_length=MAX_DOCIDS_PER_QUERY)]
+    queries: Annotated[list[str], Field(min_length=1, max_length=MAX_EVAL_BATCH_SIZE)]
 
     @field_validator("queries")
     @classmethod
@@ -40,6 +40,10 @@ class BaselineRequest(BaseModel):
         if any(not query.strip() for query in queries):
             raise ValueError("Baseline queries must be non-empty")
         return queries
+
+
+class LoadPolicyHeadRequest(BaseModel):
+    policy_checkpoint: str
 
 
 class _Worker:
@@ -74,18 +78,36 @@ class BaselinePool:
         self.docids_per_query = docids_per_query
         self._cache_lock = Lock()
         self.workers = []
+        first_retriever: SLMv3Retriever | None = None
         for device in devices:
-            retriever = SLMv3Retriever(
-                checkpoint=checkpoint,
-                qwen_model=qwen_model,
-                slm_root=slm_root,
-                id_mapping=id_mapping,
-                device=device,
-            )
-            if policy_checkpoint is not None:
-                load_policy_head_checkpoint(retriever.model, policy_checkpoint)
+            if first_retriever is None:
+                first_retriever = SLMv3Retriever(
+                    checkpoint=checkpoint,
+                    qwen_model=qwen_model,
+                    slm_root=slm_root,
+                    id_mapping=id_mapping,
+                    device=device,
+                )
+                if policy_checkpoint is not None:
+                    load_policy_head_checkpoint(first_retriever.model, policy_checkpoint)
+                retriever = first_retriever
+            else:
+                retriever = first_retriever.clone_to_device(device)
             self.workers.append(_Worker(retriever))
         self._executor = ThreadPoolExecutor(max_workers=len(self.workers))
+
+    def load_policy_head(self, policy_checkpoint: str) -> int:
+        tensor_count = 0
+        with self._cache_lock:
+            for worker in self.workers:
+                with worker.lock:
+                    tensor_count = load_policy_head_checkpoint(
+                        worker.retriever.model,
+                        policy_checkpoint,
+                    )
+                    worker.retriever.model.eval()
+            self.cache = LRUCache(self.cache.capacity)
+        return tensor_count
 
     @staticmethod
     def _serialize(results: list[GenerationResult]) -> list[dict[str, Any]]:
@@ -223,6 +245,14 @@ def create_app(
     @app.post("/generate")
     def generate(request: BaselineRequest) -> dict[str, Any]:
         return app.state.pool.generate(request)
+
+    @app.post("/load_policy_head")
+    def load_policy_head(request: LoadPolicyHeadRequest) -> dict[str, Any]:
+        count = app.state.pool.load_policy_head(request.policy_checkpoint)
+        resolved_service_config["policy_checkpoint"] = str(
+            Path(request.policy_checkpoint).expanduser().resolve()
+        )
+        return {"status": "ok", "tensors_loaded": count}
 
     return app
 

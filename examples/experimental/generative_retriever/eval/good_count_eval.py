@@ -13,8 +13,10 @@ import httpx
 import numpy as np
 
 from examples.experimental.generative_retriever.reward.relevance_reward import (
+    DEFAULT_EVAL_BATCH_SIZE,
     DEFAULT_EVAL_GROUP_SIZE,
     MAX_DOCIDS_PER_QUERY,
+    MAX_EVAL_BATCH_SIZE,
     PM_THRESHOLD,
     SM_THRESHOLD,
 )
@@ -136,12 +138,23 @@ def _head_metrics(
 
     overall: dict[str, Any] = {}
     unique: dict[str, Any] = {}
+    u_kw_counts: list[int] = []
+    u_kw_rates: list[float] = []
+    if baseline_by_query is not None:
+        for row in rows:
+            p_all = {k["keyword"] for k in row["keyword_scores"]}
+            b_all = {k["keyword"] for k in baseline_by_query[row["query"]]["keyword_scores"]}
+            p_n = len(p_all)
+            u_n = len(p_all - b_all)
+            u_kw_counts.append(u_n)
+            u_kw_rates.append((u_n / p_n) if p_n > 0 else 0.0)
     for mode in ("pm", "sm", "pm_or_sm"):
         p_counts, p_qgood, p_kwgood = [], [], []
         b_counts, b_qgood, b_kwgood = [], [], []
-        u_counts, u_qgood, u_kwgood = [], [], []
+        u_counts, u_qgood, u_kwgood, u_only_kwgood = [], [], [], []
         for row in rows:
             p_scores = row["keyword_scores"]
+            p_all = {k["keyword"] for k in p_scores}
             p_set = {k["keyword"] for k in p_scores if _passes(k, mode)}
             p_n = len(p_scores)
             p_c = len(p_set)
@@ -151,6 +164,7 @@ def _head_metrics(
             if baseline_by_query is not None:
                 b_row = baseline_by_query[row["query"]]
                 b_scores = b_row["keyword_scores"]
+                b_all = {k["keyword"] for k in b_scores}
                 b_set = {k["keyword"] for k in b_scores if _passes(k, mode)}
                 b_n = len(b_scores)
                 b_c = len(b_set)
@@ -158,9 +172,11 @@ def _head_metrics(
                 b_qgood.append(1.0 if b_c > 0 else 0.0)
                 b_kwgood.append((b_c / b_n) if b_n > 0 else 0.0)
                 u_c = len(p_set - b_set)
+                u_all_n = len(p_all - b_all)
                 u_counts.append(u_c)
                 u_qgood.append(1.0 if u_c > 0 else 0.0)
                 u_kwgood.append((u_c / p_n) if p_n > 0 else 0.0)
+                u_only_kwgood.append((len(p_set - b_all) / u_all_n) if u_all_n > 0 else 0.0)
         entry: dict[str, Any] = {
             "policy_good_density": float(np.mean(p_counts)),
             "policy_query_good_rate": float(np.mean(p_qgood)),
@@ -177,6 +193,7 @@ def _head_metrics(
                 "unique_good_density": float(np.mean(u_counts)),
                 "unique_query_good_rate": float(np.mean(u_qgood)),
                 "unique_keyword_good_rate": float(np.mean(u_kwgood)),
+                "unique_only_keyword_good_rate": float(np.mean(u_only_kwgood)),
             }
         overall[mode] = entry
     return {
@@ -185,7 +202,9 @@ def _head_metrics(
             {
                 "baseline_keywords_per_query": float(
                     np.mean([len(baseline_by_query[r["query"]]["keyword_scores"]) for r in rows])
-                )
+                ),
+                "unique_keywords_per_query": float(np.mean(u_kw_counts)),
+                "unique_keyword_rate": float(np.mean(u_kw_rates)),
             }
             if baseline_by_query is not None
             else {}
@@ -229,7 +248,9 @@ def format_summary_table(summary: dict[str, Any]) -> str:
         (
             f"Queries: {summary['queries']} | "
             f"Baseline #KW/Q: {summary.get('baseline_keywords_per_query', 0.0):.2f} | "
-            f"Policy #KW/Q: {summary.get('policy_keywords_per_query', 0.0):.2f}"
+            f"Policy #KW/Q: {summary.get('policy_keywords_per_query', 0.0):.2f} | "
+            f"Unique #KW/Q: {summary.get('unique_keywords_per_query', 0.0):.2f} "
+            f"({summary.get('unique_keyword_rate', 0.0) * 100.0:.2f}%)"
         ),
         "",
         "=== (a) Overall Generation Quality (Baseline -> Policy) ===",
@@ -264,11 +285,12 @@ def format_summary_table(summary: dict[str, Any]) -> str:
         ugd = float(entry.get("unique_good_density", 0.0))
         uqg = float(entry.get("unique_query_good_rate", 0.0)) * 100.0
         ukg = float(entry.get("unique_keyword_good_rate", 0.0)) * 100.0
+        uokg = float(entry.get("unique_only_keyword_good_rate", 0.0)) * 100.0
         lines.append(
             f"{label:26s} | "
             f"Unique Good Density: {ugd:.2f} | "
             f"Unique Query Good Rate: {uqg:.2f}% | "
-            f"Unique Keyword Good Rate: {ukg:.2f}%"
+            f"Unique Keyword Good Rate: {ukg:.2f}% (of Unique KW: {uokg:.2f}%)"
         )
     return "\n".join(lines)
 
@@ -281,15 +303,15 @@ def run(
     generate_url: str,
     score_url: str,
     baseline_results: Path | None,
-    batch_size: int = DEFAULT_EVAL_GROUP_SIZE,
+    batch_size: int = DEFAULT_EVAL_BATCH_SIZE,
     docids_per_query: int = DEFAULT_EVAL_GROUP_SIZE,
     score_head: Literal["sm", "pm"] = "sm",
     summary_output: Path | None = None,
 ) -> dict[str, Any] | None:
     if mode not in ("baseline", "policy"):
         raise ValueError(f"Unknown evaluation mode: {mode!r}")
-    if not 1 <= batch_size <= MAX_DOCIDS_PER_QUERY:
-        raise ValueError(f"batch_size must be between 1 and {MAX_DOCIDS_PER_QUERY}")
+    if not 1 <= batch_size <= MAX_EVAL_BATCH_SIZE:
+        raise ValueError(f"batch_size must be between 1 and {MAX_EVAL_BATCH_SIZE}")
     if not 1 <= docids_per_query <= MAX_DOCIDS_PER_QUERY:
         raise ValueError(f"docids_per_query must be between 1 and {MAX_DOCIDS_PER_QUERY}")
     if score_head not in ("sm", "pm"):
@@ -338,51 +360,58 @@ def run(
     if any(any(field not in row for field in required_fields) for row in processed.values()):
         raise ValueError("Existing output does not match the evaluation mode")
     pending = [row for row in manifest_rows if row["query"] not in processed]
-    with httpx.Client(timeout=900.0) as client, ThreadPoolExecutor(max_workers=1) as executor:
+    with httpx.Client(timeout=900.0, trust_env=False) as client, ThreadPoolExecutor(max_workers=1) as executor:
         if pending:
-            generation_future = executor.submit(
-                _generate, client, generate_url,
-                [row["query"] for row in pending[:batch_size]],
-            )
-            for start in range(0, len(pending), batch_size):
-                batch = pending[start:start + batch_size]
-                queries = [row["query"] for row in batch]
-                generated = generation_future.result()
-                next_batch = pending[start + batch_size:start + 2 * batch_size]
-                if next_batch:
-                    generation_future = executor.submit(
-                        _generate, client, generate_url, [row["query"] for row in next_batch],
-                    )
-                scored = _score(
-                    client, score_url, queries, generated,
-                    docids_per_query=docids_per_query,
+            output.parent.mkdir(parents=True, exist_ok=True)
+            with output.open("a", encoding="utf-8") as out_stream:
+                generation_future = executor.submit(
+                    _generate, client, generate_url,
+                    [row["query"] for row in pending[:batch_size]],
                 )
-                output_rows = []
-                for manifest_row, generation, score in zip(batch, generated, scored, strict=True):
-                    query = manifest_row["query"]
-                    row = {
-                        **manifest_row,
-                        "docids": [item["positional_docid"] for item in generation["docids"]],
-                        "keyword_scores": score["keyword_scores"],
-                        "mapping_version": score["mapping_version"],
-                        "relevance_model": score["relevance_model"],
-                    }
-                    if mode == "baseline":
-                        for head in ("pm", "sm"):
-                            row[f"baseline_{head}_keywords"] = sorted(score[f"{head}_keywords"])
-                    else:
-                        baseline = baseline_by_query[query]
-                        for head in ("pm", "sm"):
-                            qualified = frozenset(score[f"{head}_keywords"])
-                            good = sorted(qualified - frozenset(baseline[f"baseline_{head}_keywords"]))
-                            row[f"policy_{head}_keywords"] = sorted(qualified)
-                            row[f"{head}_good_keywords"] = good
-                            row[f"{head}_good_count"] = len(good)
-                        row["good_keywords"] = row[f"{score_head}_good_keywords"]
-                        row["good_count"] = row[f"{score_head}_good_count"]
-                    output_rows.append(row)
-                _write_rows(output, output_rows)
-                print(json.dumps({"completed": len(processed) + start + len(output_rows), "total": len(manifest_rows)}))
+                for start in range(0, len(pending), batch_size):
+                    batch = pending[start:start + batch_size]
+                    queries = [row["query"] for row in batch]
+                    generated = generation_future.result()
+                    next_batch = pending[start + batch_size:start + 2 * batch_size]
+                    if next_batch:
+                        generation_future = executor.submit(
+                            _generate, client, generate_url, [row["query"] for row in next_batch],
+                        )
+                    scored = _score(
+                        client, score_url, queries, generated,
+                        docids_per_query=docids_per_query,
+                    )
+                    output_rows = []
+                    for manifest_row, generation, score in zip(batch, generated, scored, strict=True):
+                        query = manifest_row["query"]
+                        row = {
+                            **manifest_row,
+                            "docids": [item["positional_docid"] for item in generation["docids"]],
+                            "keyword_scores": score["keyword_scores"],
+                            "mapping_version": score["mapping_version"],
+                            "relevance_model": score["relevance_model"],
+                        }
+                        if mode == "baseline":
+                            for head in ("pm", "sm"):
+                                row[f"baseline_{head}_keywords"] = sorted(score[f"{head}_keywords"])
+                        else:
+                            baseline = baseline_by_query[query]
+                            for head in ("pm", "sm"):
+                                qualified = frozenset(score[f"{head}_keywords"])
+                                good = sorted(qualified - frozenset(baseline[f"baseline_{head}_keywords"]))
+                                row[f"policy_{head}_keywords"] = sorted(qualified)
+                                row[f"{head}_good_keywords"] = good
+                                row[f"{head}_good_count"] = len(good)
+                            row["good_keywords"] = row[f"{score_head}_good_keywords"]
+                            row["good_count"] = row[f"{score_head}_good_count"]
+                        output_rows.append(row)
+                    for row in output_rows:
+                        out_stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    out_stream.flush()
+                    print(
+                        json.dumps({"completed": len(processed) + start + len(output_rows), "total": len(manifest_rows)}),
+                        flush=True,
+                    )
     if mode == "policy":
         summary = _summary(output, baseline_by_query)
         if summary_output is not None:
@@ -405,7 +434,7 @@ def main() -> None:
     parser.add_argument("--generate-url", required=True)
     parser.add_argument("--score-url", required=True)
     parser.add_argument("--baseline-results", type=Path)
-    parser.add_argument("--batch-size", type=int, default=DEFAULT_EVAL_GROUP_SIZE)
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_EVAL_BATCH_SIZE)
     parser.add_argument("--docids-per-query", type=int, default=DEFAULT_EVAL_GROUP_SIZE)
     parser.add_argument("--score-head", choices=("sm", "pm"), default="sm")
     parser.add_argument("--summary-output", type=Path)

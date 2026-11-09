@@ -102,15 +102,22 @@ class ResidentMapping:
         if not is_columnar_index_dir(path):
             raise ValueError(f"Mapping path must be a columnar index directory: {path}")
         self.path = path
+        self.version = (
+            (path / "keywords.parquet").resolve().parent.name
+            if path.name == "mapping"
+            else path.name
+        )
         self._lock = RLock()
         self._overlay_kw_ids: dict[int, tuple[int, ...]] = {}
         self._text_to_kid: dict[str, int] = {}
+        self._decoded_kws: list[str | None] = []
         self._kw_array: Any = None
         self._in_na_array: np.ndarray = np.empty(0, dtype=np.bool_)
         self._markets_array: Any = None
         self._unique_docids_u32: np.ndarray = np.empty(0, dtype=np.uint32)
         self._csr_offsets: np.ndarray = np.empty(0, dtype=np.int64)
         self._csr_kw_ids: np.ndarray = np.empty(0, dtype=np.uint32)
+        self._kw_degree: np.ndarray = np.empty(0, dtype=np.int32)
         self._load_columnar(path)
 
     def _load_columnar(self, directory: Path) -> None:
@@ -120,6 +127,7 @@ class ResidentMapping:
         kw_table = pq.read_table(kw_path, columns=["keyword_id", "keyword", "in_na", "markets"])
         self._kw_array = kw_table.column("keyword").combine_chunks()
         n_kw = len(self._kw_array)
+        self._decoded_kws = [None] * n_kw
         if n_kw > 0:
             kid_col = kw_table.column("keyword_id")
             if int(kid_col[0].as_py()) != 0 or int(kid_col[n_kw - 1].as_py()) != n_kw - 1:
@@ -141,6 +149,7 @@ class ResidentMapping:
             self._rebuild_csr(docid_u32, kw_id)
 
         self.rows = int(len(self._csr_kw_ids))
+        self._kw_degree = np.bincount(self._csr_kw_ids, minlength=n_kw).astype(np.int32)
         self.byte_count = int(kw_path.stat().st_size + pairs_path.stat().st_size)
         logger.info(
             "Columnar mapping ready: %d IDs, %d keywords, %d pairs",
@@ -202,8 +211,12 @@ class ResidentMapping:
         return tuple(int(k) for k in self._csr_kw_ids[start:end])
 
     def _decode_kid(self, kid: int) -> str:
+        cached = self._decoded_kws[kid]
+        if cached is not None:
+            return cached
         raw_bytes: bytes = self._kw_array[kid].as_py()
         text = raw_bytes.decode("utf-8")
+        self._decoded_kws[kid] = text
         self._text_to_kid[text] = kid
         return text
 
@@ -215,33 +228,33 @@ class ResidentMapping:
         use_initial: bool = False,
     ) -> LookupResponse:
         target_mkt = market.strip().upper() if market else None
-        with self._lock:
-            packed_targets = np.asarray([pack_docid_u32(d) for d in docids], dtype=np.uint32)
-            positions = np.searchsorted(self._unique_docids_u32, packed_targets)
-            results = []
-            n_unique = len(self._unique_docids_u32)
-            for docid, target_u32, pos in zip(docids, packed_targets, positions, strict=True):
-                u32_int = int(target_u32)
-                overlay_kids = None if use_initial else self._overlay_kw_ids.get(u32_int)
-                if overlay_kids is not None:
-                    kw_ids_iter: Any = overlay_kids
-                else:
-                    idx = int(pos)
-                    if idx >= n_unique or int(self._unique_docids_u32[idx]) != u32_int:
-                        logger.warning("Columnar mapping ID not found: %s", docid)
-                        results.append(KeywordResult(docid=docid, keywords=[], status="not_found"))
-                        continue
-                    start = int(self._csr_offsets[idx])
-                    end = int(self._csr_offsets[idx + 1])
-                    kw_ids_iter = self._csr_kw_ids[start:end]
-                texts = []
-                for raw_kid in kw_ids_iter:
-                    kid = int(raw_kid)
-                    if target_mkt is not None and not self._market_allows(kid, target_mkt):
-                        continue
-                    texts.append(self._decode_kid(kid))
-                results.append(KeywordResult(docid=docid, keywords=texts, status="ok"))
-            return LookupResponse(mapping_version=self.path.name, results=results)
+        packed_targets = np.asarray([pack_docid_u32(d) for d in docids], dtype=np.uint32)
+        positions = np.searchsorted(self._unique_docids_u32, packed_targets)
+        results = []
+        n_unique = len(self._unique_docids_u32)
+        overlay_map = None if use_initial else self._overlay_kw_ids
+        for docid, target_u32, pos in zip(docids, packed_targets, positions, strict=True):
+            u32_int = int(target_u32)
+            overlay_kids = None if overlay_map is None else overlay_map.get(u32_int)
+            if overlay_kids is not None:
+                kw_ids_iter: Any = overlay_kids
+            else:
+                idx = int(pos)
+                if idx >= n_unique or int(self._unique_docids_u32[idx]) != u32_int:
+                    logger.warning("Columnar mapping ID not found: %s", docid)
+                    results.append(KeywordResult(docid=docid, keywords=[], status="not_found"))
+                    continue
+                start = int(self._csr_offsets[idx])
+                end = int(self._csr_offsets[idx + 1])
+                kw_ids_iter = self._csr_kw_ids[start:end]
+            texts = []
+            for raw_kid in kw_ids_iter:
+                kid = int(raw_kid)
+                if target_mkt is not None and not self._market_allows(kid, target_mkt):
+                    continue
+                texts.append(self._decode_kid(kid))
+            results.append(KeywordResult(docid=docid, keywords=texts, status="ok"))
+        return LookupResponse(mapping_version=self.version, results=results)
 
     def apply_delta(self, request: DeltaMappingRequest) -> dict[str, int]:
         if request.k_max < 1:
@@ -262,14 +275,23 @@ class ResidentMapping:
                     for kw in item.keywords
                     if kw in self._text_to_kid
                 }
-                if not remove_kids:
+                if not remove_kids or len(current_kids) <= 1:
                     continue
-                filtered_kids = tuple(kid for kid in current_kids if kid not in remove_kids)
-                if not filtered_kids:
-                    filtered_kids = (current_kids[0],)
-                if len(filtered_kids) < len(current_kids):
-                    removed_edges += len(current_kids) - len(filtered_kids)
-                    self._overlay_kw_ids[u32] = filtered_kids
+                filtered_list: list[int] = []
+                for idx_k, kid in enumerate(current_kids):
+                    remaining_slots = len(current_kids) - idx_k
+                    can_remove = (len(filtered_list) + remaining_slots) > 1
+                    if (
+                        can_remove
+                        and kid in remove_kids
+                        and int(self._kw_degree[kid]) > 1
+                    ):
+                        self._kw_degree[kid] -= 1
+                        removed_edges += 1
+                    else:
+                        filtered_list.append(kid)
+                if len(filtered_list) < len(current_kids):
+                    self._overlay_kw_ids[u32] = tuple(filtered_list)
                     updated_u32.add(u32)
             for item in request.additions:
                 u32 = pack_docid_u32(item.docid)
@@ -288,6 +310,7 @@ class ResidentMapping:
                     if kid is not None and kid not in existing_kids:
                         kid_list.append(kid)
                         existing_kids.add(kid)
+                        self._kw_degree[kid] += 1
                         added_edges += 1
                         changed = True
                 if changed:
@@ -328,68 +351,70 @@ class ResidentMapping:
 
     def save_docid_mappings(self, output_dir: str | Path) -> dict[str, Any]:
         with self._lock:
-            target_dir = Path(output_dir).expanduser().resolve()
-            target_dir.mkdir(parents=True, exist_ok=True)
-            counts = np.diff(self._csr_offsets)
-            base_docids = np.repeat(self._unique_docids_u32, counts)
-            if self._overlay_kw_ids:
-                overlay_u32 = np.asarray(list(self._overlay_kw_ids.keys()), dtype=np.uint32)
-                keep_mask = ~np.isin(base_docids, overlay_u32)
-                ov_docids_list: list[int] = []
-                ov_kids_list: list[int] = []
-                for u32, kids in self._overlay_kw_ids.items():
-                    ov_docids_list.extend([u32] * len(kids))
-                    ov_kids_list.extend(kids)
-                merged_docids = np.concatenate([
-                    base_docids[keep_mask],
-                    np.asarray(ov_docids_list, dtype=np.uint32),
-                ])
-                merged_kids = np.concatenate([
-                    self._csr_kw_ids[keep_mask],
-                    np.asarray(ov_kids_list, dtype=np.uint32),
-                ])
-                packed = (merged_docids.astype(np.uint64) << np.uint64(32)) | merged_kids.astype(np.uint64)
-                packed = np.unique(packed)
-                expanded_docids = (packed >> np.uint64(32)).astype(np.uint32)
-                csr_kw_ids = (packed & np.uint64(0xFFFFFFFF)).astype(np.uint32)
-                change_idx = np.flatnonzero(expanded_docids[1:] != expanded_docids[:-1]) + 1
-                unique_docids = np.empty(len(change_idx) + 1, dtype=np.uint32)
-                unique_docids[0] = expanded_docids[0]
-                unique_docids[1:] = expanded_docids[change_idx]
-                csr_offsets = np.empty(len(unique_docids) + 1, dtype=np.int64)
-                csr_offsets[0] = 0
-                csr_offsets[1:-1] = change_idx
-                csr_offsets[-1] = len(expanded_docids)
-            else:
-                expanded_docids = base_docids
-                unique_docids = self._unique_docids_u32
-                csr_offsets = self._csr_offsets
-                csr_kw_ids = self._csr_kw_ids
-            pairs_schema = pa.schema([
-                ("docid_u32", pa.uint32()),
-                ("keyword_id", pa.uint32()),
+            overlay_snapshot = dict(self._overlay_kw_ids)
+        target_dir = Path(output_dir).expanduser().resolve()
+        target_dir.mkdir(parents=True, exist_ok=True)
+        counts = np.diff(self._csr_offsets)
+        base_docids = np.repeat(self._unique_docids_u32, counts)
+        if overlay_snapshot:
+            overlay_u32 = np.asarray(list(overlay_snapshot.keys()), dtype=np.uint32)
+            docid_in_overlay = np.isin(self._unique_docids_u32, overlay_u32, assume_unique=False)
+            keep_mask = np.repeat(~docid_in_overlay, counts)
+            ov_docids_list: list[int] = []
+            ov_kids_list: list[int] = []
+            for u32, kids in overlay_snapshot.items():
+                ov_docids_list.extend([u32] * len(kids))
+                ov_kids_list.extend(kids)
+            merged_docids = np.concatenate([
+                base_docids[keep_mask],
+                np.asarray(ov_docids_list, dtype=np.uint32),
             ])
-            pairs_path = target_dir / "docid_keywords.parquet"
-            pq.write_table(
-                pa.Table.from_arrays(
-                    [pa.array(expanded_docids, type=pa.uint32()), pa.array(csr_kw_ids, type=pa.uint32())],
-                    schema=pairs_schema,
-                ),
-                pairs_path,
-                compression="zstd",
-            )
-            np.save(target_dir / "docid_unique.u32.npy", unique_docids)
-            np.save(target_dir / "docid_offsets.i64.npy", csr_offsets)
-            np.save(target_dir / "docid_kw_ids.u32.npy", csr_kw_ids)
-            src_kw = self.path / "keywords.parquet"
-            dst_kw = target_dir / "keywords.parquet"
-            if not dst_kw.exists() and src_kw.is_file():
-                dst_kw.symlink_to(src_kw)
-            return {
-                "output_dir": str(target_dir),
-                "id_count": int(len(unique_docids)),
-                "rows": int(len(csr_kw_ids)),
-            }
+            merged_kids = np.concatenate([
+                self._csr_kw_ids[keep_mask],
+                np.asarray(ov_kids_list, dtype=np.uint32),
+            ])
+            packed = (merged_docids.astype(np.uint64) << np.uint64(32)) | merged_kids.astype(np.uint64)
+            packed = np.unique(packed)
+            expanded_docids = (packed >> np.uint64(32)).astype(np.uint32)
+            csr_kw_ids = (packed & np.uint64(0xFFFFFFFF)).astype(np.uint32)
+            change_idx = np.flatnonzero(expanded_docids[1:] != expanded_docids[:-1]) + 1
+            unique_docids = np.empty(len(change_idx) + 1, dtype=np.uint32)
+            unique_docids[0] = expanded_docids[0]
+            unique_docids[1:] = expanded_docids[change_idx]
+            csr_offsets = np.empty(len(unique_docids) + 1, dtype=np.int64)
+            csr_offsets[0] = 0
+            csr_offsets[1:-1] = change_idx
+            csr_offsets[-1] = len(expanded_docids)
+        else:
+            expanded_docids = base_docids
+            unique_docids = self._unique_docids_u32
+            csr_offsets = self._csr_offsets
+            csr_kw_ids = self._csr_kw_ids
+        pairs_schema = pa.schema([
+            ("docid_u32", pa.uint32()),
+            ("keyword_id", pa.uint32()),
+        ])
+        pairs_path = target_dir / "docid_keywords.parquet"
+        pq.write_table(
+            pa.Table.from_arrays(
+                [pa.array(expanded_docids, type=pa.uint32()), pa.array(csr_kw_ids, type=pa.uint32())],
+                schema=pairs_schema,
+            ),
+            pairs_path,
+            compression="zstd",
+        )
+        np.save(target_dir / "docid_unique.u32.npy", unique_docids)
+        np.save(target_dir / "docid_offsets.i64.npy", csr_offsets)
+        np.save(target_dir / "docid_kw_ids.u32.npy", csr_kw_ids)
+        src_kw = self.path / "keywords.parquet"
+        dst_kw = target_dir / "keywords.parquet"
+        if not dst_kw.exists() and src_kw.is_file():
+            dst_kw.symlink_to(src_kw)
+        return {
+            "output_dir": str(target_dir),
+            "id_count": int(len(unique_docids)),
+            "rows": int(len(csr_kw_ids)),
+        }
 
 
 def create_app(mapping: str | Path) -> FastAPI:
@@ -409,7 +434,7 @@ def create_app(mapping: str | Path) -> FastAPI:
     @app.get("/health")
     def health() -> dict[str, Any]:
         loaded = app.state.mapping
-        return {"status": "ready", "mapping_version": path.name,
+        return {"status": "ready", "mapping_version": loaded.version,
                 "id_count": loaded.id_count, "rows": loaded.rows, "bytes": loaded.byte_count,
                 "service_config": {
                     "api_version": _SERVICE_API_VERSION,

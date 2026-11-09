@@ -3,16 +3,12 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from pathlib import Path
-from threading import Lock
 from typing import Annotated, Any
 
 import httpx
 import uvicorn
-import xxhash
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
@@ -22,13 +18,13 @@ from examples.experimental.generative_retriever.index.id_text_mapping import (
     validate_docid,
 )
 from examples.experimental.generative_retriever.reward.relevance_model import (
-    RelevanceScorer,
-    load_relevance_pipeline_factory,
-    resolve_relevance_source,
+    MultiGpuRelevanceScorer,
 )
 from examples.experimental.generative_retriever.reward.relevance_reward import (
     MAX_DOCIDS_PER_QUERY,
+    MAX_EVAL_BATCH_SIZE,
     PM_THRESHOLD,
+    REWARD_PAIR_BATCH_SIZE,
     SM_THRESHOLD,
 )
 
@@ -52,13 +48,7 @@ class GoodCountSample(BaseModel):
 
 
 class GoodCountRequest(BaseModel):
-    samples: Annotated[list[GoodCountSample], Field(min_length=1, max_length=512)]
-
-
-@dataclass
-class _Worker:
-    scorer: RelevanceScorer
-    lock: Lock
+    samples: Annotated[list[GoodCountSample], Field(min_length=1, max_length=MAX_EVAL_BATCH_SIZE)]
 
 
 class GoodCountPool:
@@ -70,6 +60,7 @@ class GoodCountPool:
         relevance_model: str,
         devices: tuple[str, ...],
         batch_size: int,
+        use_initial: bool = False,
     ) -> None:
         if not devices or len(set(devices)) != len(devices):
             raise ValueError("Good-count devices must be distinct and non-empty")
@@ -77,46 +68,38 @@ class GoodCountPool:
             raise ValueError("Good-count batch size must be a positive multiple of 4")
         self.mapping_url = mapping_url
         self.mapping_version = mapping_version
+        self.use_initial = use_initial
+        self.devices = devices
         self.relevance_model = str(Path(relevance_model).expanduser().resolve())
-        relevance_source = resolve_relevance_source(relevance_model)
-        factory = load_relevance_pipeline_factory(relevance_source)
-        self.workers = [
-            _Worker(
-                scorer=RelevanceScorer(factory(
-                    relevance_model,
-                    cup="large",
-                    device=device,
-                    dtype="bf16",
-                    batch_size=batch_size,
-                    cross_batch_size=8192,
-                    show_progress=False,
-                )),
-                lock=Lock(),
-            )
-            for device in devices
-        ]
-        self._executor = ThreadPoolExecutor(max_workers=len(self.workers))
-        self._client = httpx.Client()
+        self.scorer = MultiGpuRelevanceScorer(
+            self.relevance_model,
+            devices,
+            batch_size=batch_size,
+            score_cache_size=4_194_304,
+            pair_batch_size=REWARD_PAIR_BATCH_SIZE,
+        )
+        self._client = httpx.Client(timeout=300.0, trust_env=False)
 
-    @staticmethod
-    def _score(
-        worker: _Worker,
-        samples: list[GoodCountSample],
-        mapping: dict[PositionalID, tuple[str, ...]],
-    ):
+    def score(self, request: GoodCountRequest) -> dict[str, Any]:
+        mapping = lookup_service(
+            self.mapping_url,
+            (docid for sample in request.samples for docid in sample.docids),
+
+            use_initial=self.use_initial,
+            client=self._client,
+        )
         keywords_by_sample = [
             list(dict.fromkeys(keyword for docid in sample.docids for keyword in mapping[docid]))
-            for sample in samples
+            for sample in request.samples
         ]
         pairs = [
             (sample.query, keyword)
-            for sample, keywords in zip(samples, keywords_by_sample, strict=True)
+            for sample, keywords in zip(request.samples, keywords_by_sample, strict=True)
             for keyword in keywords
         ]
-        with worker.lock:
-            pair_scores = worker.scorer.score(pairs)
+        pair_scores = self.scorer.score(pairs)
         results = []
-        for sample, keywords in zip(samples, keywords_by_sample, strict=True):
+        for sample, keywords in zip(request.samples, keywords_by_sample, strict=True):
             scores = [
                 {
                     "keyword": keyword,
@@ -136,47 +119,18 @@ class GoodCountPool:
                     row["keyword"] for row in scores if row["sm_score"] >= SM_THRESHOLD
                 ],
             })
-        return results
-
-    def score(self, request: GoodCountRequest) -> dict[str, Any]:
-        mapping = lookup_service(
-            self.mapping_url,
-            (docid for sample in request.samples for docid in sample.docids),
-            expected_mapping_version=self.mapping_version, client=self._client,
-        )
-        buckets: list[list[tuple[int, GoodCountSample]]] = [[] for _ in self.workers]
-        for index, sample in enumerate(request.samples):
-            worker_index = max(
-                range(len(self.workers)),
-                key=lambda i: xxhash.xxh64_intdigest(f"{sample.query}\0{i}"),
-            )
-            buckets[worker_index].append((index, sample))
-        futures = [
-            (bucket, self._executor.submit(
-                self._score,
-                worker,
-                [sample for _, sample in bucket],
-                mapping,
-            ))
-            for worker, bucket in zip(self.workers, buckets, strict=True)
-            if bucket
-        ]
-        results: dict[int, dict[str, Any]] = {}
-        for bucket, future in futures:
-            for (index, _), result in zip(bucket, future.result(), strict=True):
-                results[index] = result
         return {
-            "results": [results[index] for index in range(len(request.samples))],
+            "results": results,
             "mapping_version": self.mapping_version,
             "relevance_model": self.relevance_model,
             "routed_samples": {
-                f"worker_{index}": len(bucket)
-                for index, bucket in enumerate(buckets)
+                f"worker_{index}": len(request.samples) if index == 0 else 0
+                for index in range(len(self.devices))
             },
         }
 
     def close(self) -> None:
-        self._executor.shutdown(wait=True)
+        self.scorer.close()
         self._client.close()
 
 
@@ -186,7 +140,8 @@ def create_app(
     mapping_version: str,
     relevance_model: str,
     devices: tuple[str, ...],
-    batch_size: int = 32,
+    batch_size: int = 8192,
+    use_initial: bool = False,
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -196,6 +151,7 @@ def create_app(
             relevance_model=relevance_model,
             devices=devices,
             batch_size=batch_size,
+            use_initial=use_initial,
         )
         try:
             yield
@@ -209,7 +165,7 @@ def create_app(
     def health() -> dict[str, Any]:
         return {
             "status": "ready",
-            "worker_count": len(app.state.pool.workers),
+            "worker_count": len(app.state.pool.devices),
             "mapping_version": mapping_version,
             "relevance_model": app.state.pool.relevance_model,
         }
@@ -230,7 +186,8 @@ def main() -> None:
     parser.add_argument("--mapping-version", required=True)
     parser.add_argument("--relevance-model", required=True)
     parser.add_argument("--devices", default="cuda:0,cuda:1,cuda:2,cuda:3")
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--batch-size", type=int, default=8192)
+    parser.add_argument("--use-initial", action="store_true")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=30589)
     args = parser.parse_args()
@@ -242,6 +199,7 @@ def main() -> None:
             relevance_model=args.relevance_model,
             devices=devices,
             batch_size=args.batch_size,
+            use_initial=args.use_initial,
         ),
         host=args.host,
         port=args.port,

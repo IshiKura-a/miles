@@ -75,7 +75,7 @@ _MAX_MEM_FRACTION = 0.70
 MIN_QUERY_CACHE_SIZE = 16384
 MIN_SCORE_CACHE_SIZE = 1048576
 MAX_SCORE_CACHE_SIZE = 8388608
-MAX_KEYWORD_CACHE_SIZE = 8388608
+MAX_KEYWORD_CACHE_SIZE = 16777216
 
 
 def _run(argv: list[str], *, cwd: Path = _REPO, env: dict[str, str] | None = None) -> None:
@@ -192,13 +192,17 @@ def locked_accelerator_env() -> dict[str, str]:
     }
 
 
-def build_service_env(gpus: str, repo_root: Path = _REPO) -> dict[str, str]:
+def build_service_env(gpus: str | None = None, repo_root: Path = _REPO) -> dict[str, str]:
     env = os.environ.copy()
     env.pop("WANDB_API_KEY", None)
     if is_rocm():
         env.update(rocm_runtime_env())
-    env["CUDA_VISIBLE_DEVICES"] = gpus
-    env["NVIDIA_VISIBLE_DEVICES"] = gpus
+    if gpus is None:
+        env.pop("CUDA_VISIBLE_DEVICES", None)
+        env.pop("NVIDIA_VISIBLE_DEVICES", None)
+    else:
+        env["CUDA_VISIBLE_DEVICES"] = gpus
+        env["NVIDIA_VISIBLE_DEVICES"] = gpus
     env["PYTHONUNBUFFERED"] = "1"
     clean_py_path = ":".join(
         p for p in os.environ.get("PYTHONPATH", "").split(":")

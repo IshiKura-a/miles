@@ -16,6 +16,7 @@ import uvicorn
 import xxhash
 from fastapi import FastAPI, HTTPException
 
+from examples.experimental.generative_retriever.services.mapping_service import SaveMappingRequest
 from examples.experimental.generative_retriever.services.reward_service import (
     BaselinePrepareRequest,
     RewardRequest,
@@ -178,10 +179,11 @@ class RewardRouter:
             for url in self.worker_urls
         ]
         harvested = [future.result() for future in futures]
-        mapping_url = next(
-            (item.get("mapping_url") for item in harvested if isinstance(item.get("mapping_url"), str)),
-            None,
-        )
+        mapping_urls = list(dict.fromkeys(
+            item["mapping_url"].rstrip("/")
+            for item in harvested
+            if isinstance(item.get("mapping_url"), str) and item["mapping_url"].strip()
+        ))
         merged_adds: dict[tuple[int, int, int, int], list[str]] = {}
         merged_rems: dict[tuple[int, int, int, int], list[str]] = {}
         for item in harvested:
@@ -201,7 +203,7 @@ class RewardRouter:
                     if kw not in seen:
                         bucket.append(kw)
                         seen.add(kw)
-        if not mapping_url or (not merged_adds and not merged_rems):
+        if not mapping_urls or (not merged_adds and not merged_rems):
             return {
                 "updated_docids": 0,
                 "added_edges": 0,
@@ -214,10 +216,36 @@ class RewardRouter:
             "removals": [{"docid": list(k), "keywords": v} for k, v in merged_rems.items()],
             "k_max": DOCID_MAX_KEYWORDS,
         }
+        update_futures = [
+            self._executor.submit(
+                post_json_sync,
+                self._client,
+                f"{m_url}/update_delta",
+                delta_payload,
+            )
+            for m_url in mapping_urls
+        ]
+        results = [future.result() for future in update_futures]
+        return {
+            **results[0],
+            "latency_seconds": time.perf_counter() - started,
+        }
+
+    def save_mapping(self, output_dir: str) -> dict[str, Any]:
+        started = time.perf_counter()
+        response = self._client.get(
+            self.worker_urls[0].removesuffix("/score") + "/health",
+            timeout=10.0,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        mapping_url = payload.get("service_config", {}).get("mapping_url")
+        if not isinstance(mapping_url, str) or not mapping_url.strip():
+            raise RuntimeError("Primary reward worker did not report a valid mapping_url")
         result = post_json_sync(
             self._client,
-            mapping_url.rstrip("/") + "/update_delta",
-            delta_payload,
+            mapping_url.rstrip("/") + "/save",
+            {"output_dir": output_dir},
         )
         return {
             **result,
@@ -343,6 +371,13 @@ def create_app(
     def commit_step_updates() -> dict[str, Any]:
         try:
             return app.state.router.commit_step_updates()
+        except (httpx.HTTPError, RuntimeError, ValueError) as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+
+    @app.post("/save_mapping")
+    def save_mapping(request: SaveMappingRequest) -> dict[str, Any]:
+        try:
+            return app.state.router.save_mapping(request.output_dir)
         except (httpx.HTTPError, RuntimeError, ValueError) as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
 

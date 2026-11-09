@@ -12,6 +12,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import socket
@@ -26,12 +27,15 @@ import httpx
 
 from examples.experimental.generative_retriever.eval.good_count_eval import run as run_good_count_eval
 from examples.experimental.generative_retriever.model.model_loading import export_policy_head_checkpoint
-from examples.experimental.generative_retriever.reward.relevance_reward import DEFAULT_EVAL_GROUP_SIZE
+from examples.experimental.generative_retriever.reward.relevance_reward import (
+    DEFAULT_EVAL_BATCH_SIZE,
+    DEFAULT_EVAL_GROUP_SIZE,
+)
 from examples.experimental.generative_retriever.runtime.prepare_rocm_env import build_service_env
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _DEFAULT_GENERATOR_DEVICES = "cuda:0,cuda:1,cuda:2,cuda:3"
-_DEFAULT_SCORER_DEVICES = "cuda:4,cuda:5,cuda:6,cuda:7"
+_DEFAULT_SCORER_DEVICES = "cuda:0,cuda:1,cuda:2,cuda:3,cuda:4,cuda:5,cuda:6,cuda:7"
 _MAPPING_PORT = 30488
 _GENERATOR_PORT = 30588
 _SCORER_PORT = 30689
@@ -64,8 +68,8 @@ class EvalConfig:
     )
     generator_devices: str = _DEFAULT_GENERATOR_DEVICES
     scorer_devices: str = _DEFAULT_SCORER_DEVICES
-    batch_size: int = DEFAULT_EVAL_GROUP_SIZE
-    scorer_batch_size: int = 256
+    batch_size: int = DEFAULT_EVAL_BATCH_SIZE
+    scorer_batch_size: int = 8192
     docids_per_query: int = DEFAULT_EVAL_GROUP_SIZE
     score_head: Literal["sm", "pm"] = "pm"
     mapping_port: int = _MAPPING_PORT
@@ -115,28 +119,80 @@ def _resolve_step(run_dir: Path, requested_step: int | None) -> int:
     return candidates[-1]
 
 
+def _baseline_has_version(baseline_path: Path, expected_version: str) -> bool:
+    if not baseline_path.is_file():
+        return False
+    try:
+        with baseline_path.open(encoding="utf-8") as stream:
+            for line in stream:
+                if line.strip():
+                    return json.loads(line).get("mapping_version") == expected_version
+        return False
+    except Exception:
+        return False
+
+
+def _baseline_matches_mapping(baseline_path: Path, expected_version: str, expected_queries: int) -> bool:
+    if not _baseline_has_version(baseline_path, expected_version):
+        return False
+    try:
+        with baseline_path.open(encoding="utf-8") as stream:
+            return sum(1 for line in stream if line.strip()) == expected_queries
+    except Exception:
+        return False
+
+
 def _prepare_eval_directory(
     *,
     eval_root: Path,
     base_eval_root: Path,
     dcp_model_dir: Path,
     step: int,
-) -> Path:
+    initial_mapping_version: str,
+    cached_baseline_path: Path,
+) -> tuple[Path, int]:
     eval_root.mkdir(parents=True, exist_ok=True)
-    for filename in ("queries.jsonl", "evaluation.json", "baseline.jsonl"):
+    for filename in ("queries.jsonl", "evaluation.json"):
         target = eval_root / filename
         source = base_eval_root / filename
         if not target.is_file() and source.is_file():
             shutil.copy2(source, target)
-    for required in ("queries.jsonl", "baseline.jsonl"):
-        if not (eval_root / required).is_file():
-            raise FileNotFoundError(f"Missing required evaluation input: {eval_root / required}")
+    if not (eval_root / "queries.jsonl").is_file():
+        raise FileNotFoundError(f"Missing required evaluation input: {eval_root / 'queries.jsonl'}")
+    with (eval_root / "queries.jsonl").open(encoding="utf-8") as q_stream:
+        expected_queries = sum(1 for line in q_stream if line.strip())
+
+    target_baseline = eval_root / "baseline.jsonl"
+    if not _baseline_matches_mapping(target_baseline, initial_mapping_version, expected_queries):
+        if target_baseline.is_file() and not _baseline_has_version(target_baseline, initial_mapping_version):
+            target_baseline.unlink()
+        if not target_baseline.is_file():
+            if _baseline_matches_mapping(cached_baseline_path, initial_mapping_version, expected_queries):
+                shutil.copy2(cached_baseline_path, target_baseline)
+            elif _baseline_matches_mapping(base_eval_root / "baseline.jsonl", initial_mapping_version, expected_queries):
+                shutil.copy2(base_eval_root / "baseline.jsonl", target_baseline)
 
     policy_pt = eval_root / f"policy-head-step{step}.pt"
     if not policy_pt.is_file() or policy_pt.stat().st_size == 0:
         tensor_count = export_policy_head_checkpoint(dcp_model_dir, policy_pt)
         print(f"Exported {tensor_count} policy-head tensors -> {policy_pt}", flush=True)
-    return policy_pt
+    return policy_pt, expected_queries
+
+
+def _scorer_already_ready(port: int, mapping_version: str, relevance_model: str) -> bool:
+    try:
+        resp = httpx.get(f"http://127.0.0.1:{port}/health", timeout=3.0)
+        if resp.status_code != 200:
+            return False
+        data = resp.json()
+        return (
+            isinstance(data, dict)
+            and data.get("status") == "ready"
+            and data.get("mapping_version") == mapping_version
+            and data.get("relevance_model") == relevance_model
+        )
+    except Exception:
+        return False
 
 
 def _assert_port_free(port: int) -> None:
@@ -152,9 +208,10 @@ def _start_service(
     argv: list[str],
     port: int,
     log_path: Path,
+    gpus: str | None = None,
 ) -> _ManagedService:
     _assert_port_free(port)
-    env = build_service_env("", _REPO_ROOT)
+    env = build_service_env(gpus, _REPO_ROOT)
     log_handle = log_path.open("a", encoding="utf-8")
     command = [
         sys.executable,
@@ -202,7 +259,7 @@ def _stop_services(services: list[_ManagedService]) -> None:
         if service.process.poll() is None:
             service.process.terminate()
             try:
-                service.process.wait(timeout=30.0)
+                service.process.wait(timeout=15.0)
             except subprocess.TimeoutExpired:
                 service.process.kill()
                 service.process.wait(timeout=15.0)
@@ -229,75 +286,137 @@ def run_evaluation(config: EvalConfig) -> dict[str, Any] | None:
     id_mapping = _expand_path(config.id_mapping, "id_mapping")
     if not id_mapping.exists():
         raise FileNotFoundError(f"id_mapping does not exist: {id_mapping}")
+    ckpt_mapping_dir = run_dir / "checkpoints" / f"iter_{step_pad}" / "mapping"
+    policy_mapping = (
+        ckpt_mapping_dir
+        if (ckpt_mapping_dir / "docid_keywords.parquet").is_file()
+        else id_mapping
+    )
     relevance_model = _expand_path(config.relevance_model, "relevance_model", expect_dir=True)
+    cached_baseline_path = (
+        output_root
+        / "eval_cache"
+        / f"baseline_top{config.docids_per_query}_{id_mapping.name}.jsonl"
+    )
 
-    policy_pt = _prepare_eval_directory(
+    policy_pt, expected_queries = _prepare_eval_directory(
         eval_root=eval_root,
         base_eval_root=base_eval_root,
         dcp_model_dir=dcp_model_dir,
         step=step,
+        initial_mapping_version=id_mapping.name,
+        cached_baseline_path=cached_baseline_path,
     )
 
-    services: list[_ManagedService] = []
     pkg = "examples.experimental.generative_retriever.services."
+    target_baseline = eval_root / "baseline.jsonl"
+    need_baseline = not _baseline_matches_mapping(target_baseline, id_mapping.name, expected_queries)
+    services: list[_ManagedService] = []
     try:
-        mapping_svc = _start_service(
-            name="mapping",
-            module=pkg + "mapping_service",
-            argv=["--mapping", str(id_mapping)],
-            port=config.mapping_port,
-            log_path=eval_root / "mapping.log",
-        )
-        services.append(mapping_svc)
-        mapping_health = _wait_health(mapping_svc)
-        mapping_version = str(mapping_health["mapping_version"])
+        scorer_svc: _ManagedService | None = None
+        if not _scorer_already_ready(config.scorer_port, id_mapping.name, str(relevance_model)):
+            scorer_svc = _start_service(
+                name="good_count",
+                module=pkg + "good_count_service",
+                argv=[
+                    "--mapping-url",
+                    f"http://127.0.0.1:{config.mapping_port}",
+                    "--mapping-version",
+                    id_mapping.name,
+                    "--relevance-model",
+                    str(relevance_model),
+                    "--devices",
+                    config.scorer_devices,
+                    "--batch-size",
+                    str(config.scorer_batch_size),
+                ],
+                port=config.scorer_port,
+                log_path=eval_root / "good_count.log",
+            )
+            services.append(scorer_svc)
 
+        generator_argv = [
+            "--checkpoint",
+            str(stage5_ckpt),
+            "--qwen-model",
+            str(qwen_model),
+            "--slm-root",
+            str(slm_root),
+            "--id-mapping",
+            str(policy_mapping),
+            "--docids-per-query",
+            str(config.docids_per_query),
+            "--devices",
+            config.generator_devices,
+        ]
+        if not need_baseline:
+            generator_argv.extend(["--policy-checkpoint", str(policy_pt)])
         generator_svc = _start_service(
             name="policy_gen",
             module=pkg + "baseline_service",
-            argv=[
-                "--checkpoint",
-                str(stage5_ckpt),
-                "--policy-checkpoint",
-                str(policy_pt),
-                "--qwen-model",
-                str(qwen_model),
-                "--slm-root",
-                str(slm_root),
-                "--id-mapping",
-                str(id_mapping),
-                "--docids-per-query",
-                str(config.docids_per_query),
-                "--devices",
-                config.generator_devices,
-            ],
+            argv=generator_argv,
             port=config.generator_port,
             log_path=eval_root / "policy_gen.log",
         )
         services.append(generator_svc)
 
-        scorer_svc = _start_service(
-            name="good_count",
-            module=pkg + "good_count_service",
-            argv=[
-                "--mapping-url",
-                f"http://127.0.0.1:{config.mapping_port}",
-                "--mapping-version",
-                mapping_version,
-                "--relevance-model",
-                str(relevance_model),
-                "--devices",
-                config.scorer_devices,
-                "--batch-size",
-                str(config.scorer_batch_size),
-            ],
-            port=config.scorer_port,
-            log_path=eval_root / "good_count.log",
-        )
-        services.append(scorer_svc)
+        if need_baseline:
+            print(
+                f"Generating fresh baseline.jsonl for mapping {id_mapping.name} -> {target_baseline}",
+                flush=True,
+            )
+            base_map_svc = _start_service(
+                name="baseline_mapping",
+                module=pkg + "mapping_service",
+                argv=["--mapping", str(id_mapping)],
+                port=config.mapping_port,
+                log_path=eval_root / "baseline_mapping.log",
+                gpus="",
+            )
+            try:
+                _wait_health(base_map_svc)
+                _wait_health(generator_svc)
+                if scorer_svc is not None:
+                    _wait_health(scorer_svc)
 
+                run_good_count_eval(
+                    mode="baseline",
+                    manifest=eval_root / "queries.jsonl",
+                    baseline_results=None,
+                    output=target_baseline,
+                    summary_output=eval_root / "baseline_summary.json",
+                    generate_url=f"http://127.0.0.1:{config.generator_port}/generate",
+                    score_url=f"http://127.0.0.1:{config.scorer_port}/score",
+                    batch_size=config.batch_size,
+                    docids_per_query=config.docids_per_query,
+                    score_head=config.score_head,
+                )
+                cached_baseline_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(target_baseline, cached_baseline_path)
+            finally:
+                _stop_services([base_map_svc])
+
+            resp = httpx.post(
+                f"http://127.0.0.1:{config.generator_port}/load_policy_head",
+                json={"policy_checkpoint": str(policy_pt)},
+                timeout=120.0,
+            )
+            resp.raise_for_status()
+
+        mapping_svc = _start_service(
+            name="mapping",
+            module=pkg + "mapping_service",
+            argv=["--mapping", str(policy_mapping)],
+            port=config.mapping_port,
+            log_path=eval_root / "mapping.log",
+            gpus="",
+        )
+        services.append(mapping_svc)
+
+        _wait_health(mapping_svc)
         _wait_health(generator_svc)
-        _wait_health(scorer_svc)
+        if scorer_svc is not None:
+            _wait_health(scorer_svc)
 
         return run_good_count_eval(
             mode="policy",
@@ -359,8 +478,8 @@ def main() -> None:
     )
     parser.add_argument("--generator-devices", default=_DEFAULT_GENERATOR_DEVICES)
     parser.add_argument("--scorer-devices", default=_DEFAULT_SCORER_DEVICES)
-    parser.add_argument("--batch-size", type=int, default=DEFAULT_EVAL_GROUP_SIZE)
-    parser.add_argument("--scorer-batch-size", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_EVAL_BATCH_SIZE)
+    parser.add_argument("--scorer-batch-size", type=int, default=8192)
     parser.add_argument("--docids-per-query", type=int, default=DEFAULT_EVAL_GROUP_SIZE)
     parser.add_argument("--score-head", choices=("sm", "pm"), default="pm")
     parser.add_argument("--mapping-port", type=int, default=_MAPPING_PORT)

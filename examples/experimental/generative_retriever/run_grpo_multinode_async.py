@@ -78,7 +78,8 @@ _PROMPT_DATASET_ROWS = PROMPT_DATASET_ROWS
 _QUERIES_PER_STEP_PER_PAIR = 8000
 _SAMPLES_PER_PROMPT = DEFAULT_TRAIN_GROUP_SIZE
 _GLOBAL_BATCH_SIZE_PER_PAIR = _QUERIES_PER_STEP_PER_PAIR * _SAMPLES_PER_PROMPT
-_REWARD_WORKERS_PER_PAIR = _REWARD_GPUS_PER_NODE
+_REWARD_NODES_PER_PAIR = 2
+_REWARD_WORKERS_PER_PAIR = _REWARD_NODES_PER_PAIR * _REWARD_GPUS_PER_NODE
 _ROLLOUT_GPUS_PER_PAIR = 4
 _LEARNER_GPUS_PER_NODE = 8
 _SGLANG_CONCURRENCY_PER_PAIR = 16384
@@ -209,18 +210,15 @@ def _hosts(text: str) -> tuple[list[str], list[str]]:
 def _recipe(run_id: str, pairs: int, num_rollout: int) -> run_grpo.ScriptArgs:
     if not run_id or "/" in run_id or run_id in {".", ".."}:
         raise ValueError("run-id must be a nonempty directory name without slashes")
-    if _MAX_STEPS_PER_PAIR % pairs:
-        raise ValueError(
-            f"Cannot cover {_PROMPT_DATASET_ROWS} rows exactly with {pairs} pairs "
-            f"at {_QUERIES_PER_STEP_PER_PAIR}n queries/step"
-        )
+    if pairs <= 0:
+        raise ValueError("pairs must be positive")
     max_rollouts = _MAX_STEPS_PER_PAIR // pairs
-    if not 1 <= num_rollout <= max_rollouts:
+    if max_rollouts < 1 or not 1 <= num_rollout <= max_rollouts:
         raise ValueError(f"num-rollout must be between 1 and {max_rollouts}")
     query_cache, kw_cache, score_cache = derive_reward_cache_sizes(
         _QUERIES_PER_STEP_PER_PAIR * pairs,
         _SAMPLES_PER_PROMPT,
-        _REWARD_WORKERS_PER_PAIR * pairs,
+        _REWARD_NODES_PER_PAIR * pairs,
     )
     mem_fraction = derive_sglang_mem_fraction(
         _SGLANG_CONCURRENCY_PER_PAIR * pairs,
@@ -240,8 +238,8 @@ def _recipe(run_id: str, pairs: int, num_rollout: int) -> run_grpo.ScriptArgs:
         sglang_mem_fraction_static=mem_fraction,
         sglang_server_concurrency=_SGLANG_CONCURRENCY_PER_PAIR * pairs,
         reward_timeout=1800,
-        reward_request_concurrency=_REWARD_WORKERS_PER_PAIR * pairs,
-        prepare_concurrency=pairs,
+        reward_request_concurrency=2 * _REWARD_WORKERS_PER_PAIR * pairs,
+        prepare_concurrency=2 * _REWARD_NODES_PER_PAIR * pairs,
         reward_query_cache_size=query_cache,
         reward_keyword_cache_size=kw_cache,
         reward_score_cache_size=score_cache,
@@ -580,26 +578,37 @@ def _exit_on_sigterm(signum: int, _frame: object) -> None:
 def _service_node(manifest: Manifest, index: int) -> None:
     os.environ.update(manifest["runtime_env"])
     host = manifest["addresses"][index]
+    baseline_host = manifest["addresses"][(index // 2) * 2]
+    baseline_url = f"http://{baseline_host}:{_BASELINE_PORT}/generate"
     mapping = manifest["mapping"]
     processes = _Processes(Path(manifest["run_dir"]) / f"services-{index}")
     previous_handler = signal.signal(signal.SIGTERM, _exit_on_sigterm)
     baseline: tuple[subprocess.Popen[str], dict[str, object]] | None = None
     try:
-        baseline = _start_baseline(processes, manifest, host)
+        local_mapping_url, local_mapping_owned = _mapping_service(Path(mapping), host)
+        if local_mapping_owned:
+            _available_ports(host, (_MAPPING_PORT,))
+            _start_service(
+                processes, "mapping", "mapping_service", host, _MAPPING_PORT,
+                ["--mapping", mapping],
+            )
+        if index % 2 == 0:
+            baseline = _start_baseline(processes, manifest, host)
         reward_health = []
         pairs = len(manifest["hosts"]) // 2
         query_cache, kw_cache, score_cache = derive_reward_cache_sizes(
             _QUERIES_PER_STEP_PER_PAIR * pairs,
             _SAMPLES_PER_PROMPT,
-            pairs,
+            _REWARD_NODES_PER_PAIR * pairs,
         )
+        _available_ports(host, _REWARD_PORTS)
         port = _REWARD_PORTS[0]
         name = "reward-0"
         _start_service(
             processes, name, "reward_service", host, port,
             [
-                "--baseline-url", f"http://{host}:{_BASELINE_PORT}/generate",
-                "--mapping-url", manifest["mapping_url"],
+                "--baseline-url", baseline_url,
+                "--mapping-url", local_mapping_url,
                 "--mapping-version", Path(mapping).name,
                 "--relevance-model", manifest["relevance_model"],
                 "--devices", ",".join(_REWARD_DEVICES),
@@ -617,14 +626,22 @@ def _service_node(manifest: Manifest, index: int) -> None:
             "worker_count": _REWARD_GPUS_PER_NODE,
             "mapping_version": Path(mapping).name,
             "service_config": {
-                "baseline_url": f"http://{host}:{_BASELINE_PORT}/generate",
-                "mapping_url": manifest["mapping_url"],
+                "baseline_url": baseline_url,
+                "mapping_url": local_mapping_url,
                 "relevance_model": manifest["relevance_model"],
                 "devices": list(_REWARD_DEVICES),
                 "docids_per_query": _SAMPLES_PER_PROMPT,
                 "max_samples_per_request": DEFAULT_REWARD_BATCH_SIZE,
             },
         }))
+        if local_mapping_owned:
+            _wait_health(
+                processes, host, "mapping", _MAPPING_PORT,
+                {
+                    "mapping_version": Path(mapping).name,
+                    "service_config": {"mapping": mapping},
+                },
+            )
         if baseline is not None:
             _wait_health(processes, host, "baseline", _BASELINE_PORT, baseline[1])
             print(
@@ -854,24 +871,8 @@ def _run(manifest: Manifest) -> None:
             if _mapping_service(Path(manifest["mapping"]), manifest["head_ip"])[0] != manifest["mapping_url"]:
                 raise RuntimeError("Resident mapping service changed before training started")
             print(f"Reusing verified resident mapping: {manifest['mapping_url']}", flush=True)
-        _available_ports(
-            manifest["head_ip"],
-            (_RAY_PORT, _ROUTER_PORT, *_REWARD_PORTS)
-            + ((_MAPPING_PORT,) if manifest["mapping_owned"] else ()),
-        )
-        for host in manifest["addresses"][2::2]:
-            _available_ports(host, _REWARD_PORTS)
-        if manifest["mapping_owned"]:
-            print(f"Starting isolated mapping: {manifest['mapping_url']}", flush=True)
-            processes.start(
-                "mapping",
-                [sys.executable, "-u", "-m",
-                 "examples.experimental.generative_retriever.services.mapping_service",
-                 "--mapping", manifest["mapping"], "--host", manifest["head_ip"],
-                 "--port", str(_MAPPING_PORT)],
-            )
-        for index, host in enumerate(manifest["hosts"][::2]):
-            node = index * 2
+        _available_ports(manifest["head_ip"], (_RAY_PORT, _ROUTER_PORT))
+        for node, host in enumerate(manifest["hosts"]):
             argv = (
                 [sys.executable, "-u", "-m", _MODULE, "_service_node", str(path), str(node)]
                 if node == 0 else _remote(host, "_service_node", path, node)
@@ -879,7 +880,7 @@ def _run(manifest: Manifest) -> None:
             processes.start(f"services-{node}", argv, stdin=True)
         worker_urls = [
             f"http://{host}:{port}/score"
-            for host in manifest["addresses"][::2] for port in _REWARD_PORTS
+            for host in manifest["addresses"] for port in _REWARD_PORTS
         ]
         _start_service(
             processes, "reward-router", "reward_router_service",
@@ -928,25 +929,20 @@ def _run(manifest: Manifest) -> None:
             assigned = sorted(ray.get(actor.gpu_ids.remote()))  # pyright: ignore[reportFunctionMemberAccess]
             if assigned != [0, 1, 2, 3]:
                 raise RuntimeError(f"Service node {host} GPU reservation was {assigned}, not 0-3")
-        if manifest["mapping_owned"]:
-            _wait_health(
-                processes, manifest["head_ip"], "mapping", _MAPPING_PORT,
-                {"mapping_version": Path(manifest["mapping"]).name,
-                 "service_config": {"mapping": manifest["mapping"]}},
-            )
         for index, host in enumerate(manifest["addresses"][::2]):
             _wait_health(
                 processes, host, f"baseline-{index}", _BASELINE_PORT,
                 {"worker_count": 4, "docids_per_query": _SAMPLES_PER_PROMPT},
             )
+        for node, host in enumerate(manifest["addresses"]):
             for port in _REWARD_PORTS:
                 _wait_health(
-                    processes, host, f"reward-{index}-{port}", port,
+                    processes, host, f"reward-{node}-{port}", port,
                     {"worker_count": _REWARD_GPUS_PER_NODE, "mapping_version": Path(manifest["mapping"]).name},
                 )
         _wait_health(
             processes, manifest["head_ip"], "reward-router", _ROUTER_PORT,
-            {"worker_count": len(manifest["hosts"]) // 2,
+            {"worker_count": len(manifest["hosts"]),
              "mapping_version": Path(manifest["mapping"]).name,
              "service_config": {"worker_urls": worker_urls}},
         )

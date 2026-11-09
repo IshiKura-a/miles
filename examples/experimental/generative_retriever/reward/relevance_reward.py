@@ -14,6 +14,8 @@ PM_THRESHOLD = 0.58
 SM_THRESHOLD = 0.82
 DEFAULT_TRAIN_GROUP_SIZE = 512
 DEFAULT_EVAL_GROUP_SIZE = 64
+DEFAULT_EVAL_BATCH_SIZE = 1024
+MAX_EVAL_BATCH_SIZE = 1024
 MAX_DOCIDS_PER_QUERY = 512
 RQ_CODE_NUM = 4
 RQ_CODE_DIM = 256
@@ -30,6 +32,7 @@ DOC2K_MIN_GROUP_SAMPLES = 4
 DOC2K_HEAD_RANK_CUTOFF = 64
 DOC2K_MIN_HEAD_RANKS = 16
 DOC2K_MAX_ADDS_PER_QUERY = 8
+DOC2K_ADD_MIN_QUERIES = 2
 DOC2K_PRUNE_MIN_QUERIES = 5
 TREE_CREDIT_TOP_K = (8, 4, 2)
 TREE_CREDIT_LEVEL_WEIGHT = 0.25
@@ -162,17 +165,162 @@ def build_baseline_set(keyword_scores: Mapping[str, tuple[float, float]]) -> Bas
     for keyword, (pm_score, sm_score) in keyword_scores.items():
         if not isinstance(keyword, str) or not keyword.strip():
             raise ValueError("Baseline keyword must be a non-empty string")
-        calculate_reward(
-            pm_score=pm_score,
-            sm_score=sm_score,
-            is_pm_unique=False,
-            is_sm_unique=False,
-        )
+        _normalize_score(pm_score, PM_THRESHOLD, "PM score")
+        _normalize_score(sm_score, SM_THRESHOLD, "SM score")
         if pm_score >= PM_THRESHOLD:
             pm_qualified.add(keyword)
         if sm_score >= SM_THRESHOLD:
             sm_qualified.add(keyword)
     return BaselineSets(pm=frozenset(pm_qualified), sm=frozenset(sm_qualified))
+
+
+def score_and_summarize_docid(
+    keywords: list[str],
+    pair_scores: Mapping[tuple[str, str], tuple[float, float]],
+    query: str,
+    baseline: BaselineSets,
+    *,
+    mode: RewardMode = "discrete_relevance_unique",
+    keyword_frequencies: Mapping[str, int] | None = None,
+    k_floor: int = DOCID_REWARD_FLOOR,
+) -> tuple[float, dict[str, float], list[str], list[str]]:
+    """Compute docID reward, summary metrics, and doc2k edge sets without per-keyword object allocation."""
+    if mode not in REWARD_MODES:
+        raise ValueError(f"Unknown reward mode: {mode!r}")
+    if not keywords:
+        raise ValueError("Doc ID reward requires at least one keyword")
+    n = float(len(keywords))
+    base_pm = baseline.pm
+    base_sm = baseline.sm
+    is_cont = mode == "continuous_relevance_unique"
+
+    sum_pm = 0.0
+    sum_sm = 0.0
+    sum_pm_pass = 0.0
+    sum_sm_pass = 0.0
+    sum_norm_pm = 0.0
+    sum_norm_sm = 0.0
+    sum_rel_qual = 0.0
+    sum_pm_ub = 0.0
+    sum_sm_ub = 0.0
+    sum_ub = 0.0
+    sum_disc_base = 0.0
+    sum_cont_base = 0.0
+    sum_disc_tot = 0.0
+    sum_cont_tot = 0.0
+    sum_reward = 0.0
+    cnt_pm_uniq = 0
+    cnt_sm_uniq = 0
+    cnt_both_uniq = 0
+    cnt_rel_elig = 0
+    cnt_pm_u_elig = 0
+    cnt_sm_u_elig = 0
+    cnt_u_elig = 0
+    sum_uniq_qual = 0.0
+    cnt_any_uniq = 0
+
+    passed_keywords: list[str] = []
+    unique_good_keywords: list[str] = []
+
+    for kw in keywords:
+        pm_s, sm_s = pair_scores[(query, kw)]
+        pm_f = float(pm_s)
+        sm_f = float(sm_s)
+        norm_pm = pm_f / PM_THRESHOLD if pm_f < PM_THRESHOLD else 1.0
+        norm_sm = sm_f / SM_THRESHOLD if sm_f < SM_THRESHOLD else 1.0
+        p_ok = pm_f >= PM_THRESHOLD
+        s_ok = sm_f >= SM_THRESHOLD
+        pm_p = 1.0 if p_ok else 0.0
+        sm_p = 1.0 if s_ok else 0.0
+        disc_b = pm_p + sm_p
+        cont_b = norm_pm + norm_sm
+        rel_q = cont_b * 0.5
+
+        u_pm = kw not in base_pm
+        u_sm = kw not in base_sm
+        pm_u_el = u_pm and p_ok
+        sm_u_el = u_sm and s_ok
+        u_el = pm_u_el or sm_u_el
+        rel_el = p_ok or s_ok
+
+        pm_ub = (0.5 * UNIQUE_WEIGHT * rel_q) if pm_u_el else 0.0
+        sm_ub = (0.5 * UNIQUE_WEIGHT * rel_q) if sm_u_el else 0.0
+        ub = pm_ub + sm_ub
+        disc_t = disc_b + ub
+        cont_t = cont_b + ub
+        raw_r = cont_t if is_cont else disc_t
+        freq = max(1, int(keyword_frequencies.get(kw, 1))) if keyword_frequencies is not None else 1
+        rew = raw_r / float(freq)
+
+        sum_pm += pm_f
+        sum_sm += sm_f
+        sum_pm_pass += pm_p
+        sum_sm_pass += sm_p
+        sum_norm_pm += norm_pm
+        sum_norm_sm += norm_sm
+        sum_rel_qual += rel_q
+        sum_pm_ub += pm_ub
+        sum_sm_ub += sm_ub
+        sum_ub += ub
+        sum_disc_base += disc_b
+        sum_cont_base += cont_b
+        sum_disc_tot += disc_t
+        sum_cont_tot += cont_t
+        sum_reward += rew
+
+        if u_pm:
+            cnt_pm_uniq += 1
+        if u_sm:
+            cnt_sm_uniq += 1
+        if u_pm and u_sm:
+            cnt_both_uniq += 1
+        if u_pm or u_sm:
+            sum_uniq_qual += rel_q
+            cnt_any_uniq += 1
+        if rel_el:
+            cnt_rel_elig += 1
+        if p_ok and s_ok:
+            passed_keywords.append(kw)
+            if u_pm and u_sm:
+                unique_good_keywords.append(kw)
+        if pm_u_el:
+            cnt_pm_u_elig += 1
+        if sm_u_el:
+            cnt_sm_u_elig += 1
+        if u_el:
+            cnt_u_elig += 1
+
+    mean_reward = sum_reward / n
+    metrics = {
+        "pm_score": sum_pm / n,
+        "sm_score": sum_sm / n,
+        "pm_pass": sum_pm_pass / n,
+        "sm_pass": sum_sm_pass / n,
+        "normalized_pm": sum_norm_pm / n,
+        "normalized_sm": sum_norm_sm / n,
+        "pm_relevance": (sum_norm_pm if is_cont else sum_pm_pass) / n,
+        "sm_relevance": (sum_norm_sm if is_cont else sum_sm_pass) / n,
+        "relevance_quality": sum_rel_qual / n,
+        "pm_unique_bonus": sum_pm_ub / n,
+        "sm_unique_bonus": sum_sm_ub / n,
+        "unique_bonus": sum_ub / n,
+        "discrete_base": sum_disc_base / n,
+        "continuous_base": sum_cont_base / n,
+        "discrete_total": sum_disc_tot / n,
+        "continuous_total": sum_cont_tot / n,
+        "reward": mean_reward,
+        "pm_unique_keyword_rate": float(cnt_pm_uniq) / n,
+        "sm_unique_keyword_rate": float(cnt_sm_uniq) / n,
+        "unique_keyword_rate": float(cnt_both_uniq) / n,
+        "relevance_eligible_rate": float(cnt_rel_elig) / n,
+        "pm_unique_eligible_rate": float(cnt_pm_u_elig) / n,
+        "sm_unique_eligible_rate": float(cnt_sm_u_elig) / n,
+        "unique_eligible_rate": float(cnt_u_elig) / n,
+        "unique_quality": (sum_uniq_qual / float(cnt_any_uniq)) if cnt_any_uniq else 0.0,
+        "train_total": mean_reward,
+    }
+    docid_value = sum_reward / float(max(len(keywords), k_floor))
+    return docid_value, metrics, passed_keywords, unique_good_keywords
 
 
 def calculate_keyword_rewards(

@@ -224,9 +224,9 @@ R_continuous = continuous_base + unique_bonus
   分别对应 depth 3 / 2 / 1），并以每层权重 `TREE_CREDIT_LEVEL_WEIGHT = 0.25` 分配到 4 个
   decoder token 位置。
 - **耦合 `doc2k` 在线动态映射更新**：
-  每个 rollout step 结束时，各 reward worker 通过 `/harvest_step_delta` 汇总本步的动态映射增量并提交至 `mapping_service`（`/update`）：
-  1. **Tail-to-Head 注入**：将尾部（rank > `DOC2K_HEAD_RANK_CUTOFF = 64`）命中的 unique good keywords 注入头部 doc ID（每 query 最多 `DOC2K_MAX_ADDS_PER_QUERY = 8` 个，单 doc ID 词数上限 `DOCID_MAX_KEYWORDS = 150`）；
-  2. **Dead Keyword 裁剪**：对单步至少被 `DOC2K_PRUNE_MIN_QUERIES = 5` 个不同 query 召回且词数超过 `DOCID_REWARD_FLOOR = 25` 的 doc ID，裁剪本步 0 次过阈值的死词（保留至少 25 个词）。
+  每个 rollout step 结束时，各 reward worker 通过 `/harvest_step_delta` 汇总本步的动态映射增量并提交至 `mapping_service`（`/update_delta`）：
+  1. **Tail-to-Head 同前缀双头共投注入**：将尾部（rank > `DOC2K_HEAD_RANK_CUTOFF = 64`）同时满足 `PM >= 0.58 and SM >= 0.82` 且双头 Unique 的好词，优先路由至共享 RQ 前缀且词数 `< DOCID_REWARD_FLOOR` 的头部 doc ID，跨步累计被至少 `DOC2K_ADD_MIN_QUERIES = 2` 个不同 query 验证通过后注入（每 query 最多投票 `DOC2K_MAX_ADDS_PER_QUERY = 8` 个，单 doc ID 词数上限 `DOCID_MAX_KEYWORDS = 150`）；
+  2. **全桶冗余死词裁剪（零死词守恒）**：对所有词数 `> 1` 的 doc ID，每当跨步累计被至少 `DOC2K_PRUNE_MIN_QUERIES = 5` 个不同 query 召回时，裁剪该窗口内 0 次同时过 PM/SM 阈值且全库度数 `degree > 1` 的冗余词（每桶至少保留 1 个词，全库 `degree == 1` 的唯一归属词原位保留以保证零死词）。
   同时，Baseline `/prepare` 始终查询初始静态映射（`use_initial=True`），保证 $B(q)$ 参照系固定不变。
 
 GRPO launcher 以 `--reward-mode` 指定训练模式，HTTP reward 请求用 `reward_mode`；
@@ -385,15 +385,15 @@ CUDA_VISIBLE_DEVICES=4,5 uv run python -m \
 
 [reward_service.py](../../examples/experimental/generative_retriever/services/reward_service.py)
 是单节点多 GPU 显存直连服务（`--devices cuda:0,cuda:1,cuda:2,cuda:3,cuda:4,cuda:5,cuda:6,cuda:7`，端口 `30490` / 多机 `31583`）。
-单机在单个进程内统一调度本机全部 8 张 GPU（`cuda:0..7`），多机在每台服务节点上运行 1 个管理本机 8 张 GPU 的进程，由 [reward_router_service.py](../../examples/experimental/generative_retriever/services/reward_router_service.py) 按 `q-hash` 将同一 query 的 `/prepare` 和 `/score` 路由到同一节点，并采用 **节点级二级缓存 + 进程内 8 卡 `k-hash` 显存共享架构**：
+单机在单个进程内统一调度本机全部 8 张 GPU（`cuda:0..7`），多机在**全部 `2n` 台节点（含服务节点 `2k` 与 learner 节点 `2k+1`）**上各运行 1 个管理本机 8 张 GPU 的进程（全集群共 `16n` 张 GPU 并行承载 Reward），由 [reward_router_service.py](../../examples/experimental/generative_retriever/services/reward_router_service.py) 按 `q-hash` 将同一 query 的 `/prepare` 和 `/score` 路由到同一节点，并采用 **节点级二级缓存 + 8 个独立 GPU 子进程 `k-hash` 显存共享架构**：
 
 1. **一级缓存（L1 Score Cache，`--score-cache-size`）**：
    - 节点内全局共享一份 `(q, k) -> (pm_score, sm_score)` 缓存（容量 `8,388,608` 对）。
    - 同一个 query 在 `/prepare`（Baseline 512 个 doc ID 打分）与 `/score`（Rollout 512 个 doc ID 打分）之间重叠的 `(q, k)` 对、同一 query 跨多个 `/score` 批次的重复词、以及数据集中的重复高频 query 直接在 L1 命中返回，零 GPU 计算。
 2. **二级缓存（L2 Per-Node 8 卡共享 GPU 显存表，`--query-cache-size` + `--keyword-cache-size`）**：
-   - 仅当 `(q, k)` 在 L1 未命中时触发，全部常驻在各 GPU HBM 显存预分配的 `bfloat16` `[capacity, 2, 128]` 张量表（[GpuEmbeddingTable](../../examples/experimental/generative_retriever/reward/relevance_model.py)）中，进程内多线程直连调度 `cuda:0..7`，零跨进程 HTTP RPC、零主机 `mmap`：
-     - **`query_features`（`--query-cache-size`）**：按 `xxhash64(q) % 8` 分片常驻在对应 GPU 显存中（每条仅 `512 Bytes`），Baseline `/prepare` 编码一次 $q$ 后，后续 Rollout `/score` 直接在显存中 $O(1)$ 复用 `q_emb`；
-     - **`keyword_features`（`--keyword-cache-size`）**：按 `xxhash64(k) % 8`（`k-hash`）在节点内 8 张 GPU 显存间全局分片（每卡 `8,388,608` 条仅占 `4.0 GiB` HBM，单节点 8 卡合并不重复常驻 **`6,710 万`条** 唯一 keyword 向量）。同一节点内任何 keyword 最多只编码一次，8 张 GPU 通过进程内线程池并行执行查表/编码与 `cross_model(q_emb, k_emb)` 打分，多机之间节点级独立闭环、零跨机网络通信。
+   - 仅当 `(q, k)` 在 L1 未命中时触发，全部常驻在各 GPU HBM 显存预分配的 `bfloat16` `[capacity, 2, 128]` 张量表（[GpuEmbeddingTable](../../examples/experimental/generative_retriever/reward/relevance_model.py)）中，由 8 个独立 `spawn` GPU 子进程直连调度 `cuda:0..7`，零 Python GIL 竞争、零跨进程 HTTP RPC、零主机 `mmap`：
+     - **`query_features`（`--query-cache-size`）**：按 `xxhash64(q) % 8` 分片常驻在对应 GPU 显存及主进程内存缓存中（每条仅 `512 Bytes`），Baseline `/prepare` 编码一次 $q$ 后，后续 Rollout `/score` 直接 $O(1)$ 复用 `q_emb`；
+     - **`keyword_features`（`--keyword-cache-size`）**：按 `xxhash64(k) % 8`（`k-hash`）在节点内 8 张 GPU 显存间全局分片（每卡最高 `16,777,216` 条仅占 `8.0 GiB` HBM，单节点 8 卡合并不重复常驻 **`1.34 亿`条** 唯一 keyword 向量）。同一节点内任何 keyword 最多只编码一次，8 张 GPU 子进程并行执行查表/编码与 `cross_model(q_emb, k_emb)` 打分，多机之间节点级独立闭环、零跨机打分网络通信。
 
 ### 两机 16 GPU 与多机 `2n × 8` GPU 异步 GRPO 配置
 
@@ -401,9 +401,10 @@ CUDA_VISIBLE_DEVICES=4,5 uv run python -m \
 是 Git 仓库内的多机入口，底层执行 **`train_async.py`**（Train N 与 Rollout N+1 重叠）。
 `--hosts` 按「服务/rollout 节点、learner 节点」依次成对排列；每个节点 8 卡，总计 `2n` 台：
 
-- 每对节点（16 卡）分配 8 learner（节点 `2k+1` 的 GPU 0–7）、4 rollout（节点 `2k` 的 GPU 4–7）、4 frozen baseline（节点 `2k` 的 GPU 0–3）和 8 reward worker（节点 `2k` 的 GPU 0–7）。
+- 每对节点（16 卡）分配 8 learner（节点 `2k+1` 的 GPU 0–7）、4 rollout（节点 `2k` 的 GPU 4–7）、4 frozen baseline（节点 `2k` 的 GPU 0–3）和 **16 reward GPU（节点 `2k` 与节点 `2k+1` 的全部 GPU 0–7）**。
+- 每台节点各自在本地启动 `mapping_service`（优先复用本机 `31480` 常驻服务，否则在 `31580` 启动本机专属服务），所有 `/lookup` 均在节点本地内存完成（零跨机查询流量）；每步结束时 `reward_router_service` 汇总全集群 `doc2k` 增量并并发广播 `/update_delta` 至所有节点的 `mapping_service`；每当触发 Checkpoint 保存（[GRRolloutDataSource.save](../../examples/experimental/generative_retriever/index/data_source.py)）时，自动调用 `/save_mapping` 将最新 `doc2k` 索引快照持久化至 `checkpoints/iter_XXXXXXX/mapping/`。
 - 每步处理 **`8000n` query × `512` sample**（两机 16 卡即 `8,000` query/step，`global_batch_size = 4,096,000n`）。
-- 完整遍历 `15,000,000` 条数据的 optimizer step 数为 **`1875/n`**；当 `1875` 不能被 `n` 整除时拒绝启动，不隐式复用或丢弃数据。
+- 完整遍历 `15,000,000` 条数据的最大 optimizer step 数为 **`1875 // n`**（例如 `n=1` 为 `1,875` 步，`n=3` 为 `625` 步，`n=4` 六十四卡为 `468` 步）。
 支持 `--num-rollout` 指定不超过该上限的短验收步骤；正式训练省略此参数。
 此精确遍历前提是每轮无请求或 group 失败；否则现有 rollout 会
 跳过失败 group 并补取 query，不能将运行结果视为精确遍历。
@@ -414,9 +415,9 @@ CUDA_VISIBLE_DEVICES=4,5 uv run python -m \
 所有节点必须部署同一 Miles commit，且运行工作树干净；入口启动前检查
 commit 和工作树状态，另行验证外部 SGLang 补丁、SLMv3 模型源码与
 Stage5/Qwen 索引。不一致就拒绝启动，不会覆盖其他节点的工作树。
-入口优先检测首个服务节点的 `31480` 常驻 mapping；仅当 `/health` 的 `api_version == 2`、
+每个节点优先检测本机的 `31480` 常驻 mapping；仅当 `/health` 的 `api_version == 2`、
 版本名称和映射路径与当前统一列式索引一致时才复用，
-并且不会在本次任务退出时停止该服务。没有常驻服务时才在 `31580` 启动任务专属
+并且不会在本次任务退出时停止该服务。没有常驻服务时才在本机 `31580` 启动任务专属
 mapping；有服务但映射不符则明确报错，不使用错误数据。
 冻结 baseline 同样在每个服务节点的 `31581` 验证健康状态和完整配置
 （Stage5、Qwen、SLMv3、当前映射、4 GPU、constrained top-512）；一致则复用，
@@ -462,8 +463,8 @@ uv run --no-sync --env-file .env python -m \
   --hosts node-0,node-1,node-2,node-3,node-4,node-5 --run-id <another_run_id>
 ```
 
-全局 reward score 请求并发为 `8n`、prepare 并发为 `n`，每个 worker
-的转发并发仍为 1。入口只在端口未占用时建立本次运行所需的 reward/router 服务
+全局 reward score 请求并发为 `32n`、prepare 并发为 `4n`，每个 8 卡节点 worker
+的转发并发为 `8`。入口只在端口未占用时建立本次运行所需的 reward/router 服务
 及 Ray 集群，不终止别的任务；run manifest、服务/训练日志、checkpoint
 位于 `$cosmos_data_path/local/User/zihao/online_rl/gr_offline_syn/<run_id>/`。
 成功条件为 `latest_checkpointed_iteration.txt` 等于目标 step 数。
@@ -519,10 +520,13 @@ good_count_m(q) = |U_m(q)|
    - `good_density`：$\mathbb{E}_q[|S_m(q)|]$
    - `query_good_rate`：$\mathbb{P}_q(|S_m(q)| > 0)$
    - `keyword_good_rate`：$\mathbb{E}_q[|S_m(q)| / |K_S(q)|]$
-2. **Policy Unique Gain（`unique_gain`）**（相对于对应 baseline 合格集合 $B_m(q)$ 的增量）：
+2. **Policy Unique Gain（`unique_gain`）**（相对于对应 baseline 合格集合 $B_m(q)$ 及全部输出集合 $K_B(q)$ 的增量）：
+   - `unique_keywords_per_query`：$\mathbb{E}_q[|K_P(q) \setminus K_B(q)|]$
+   - `unique_keyword_rate`：$\mathbb{E}_q[|K_P(q) \setminus K_B(q)| / |K_P(q)|]$
    - `unique_good_density`：$\mathbb{E}_q[|U_m(q)|]$（即 $\text{mean}(\text{good\_count}_m)$）
    - `unique_query_good_rate`：$\mathbb{P}_q(|U_m(q)| > 0)$
    - `unique_keyword_good_rate`：$\mathbb{E}_q[|U_m(q)| / |K_P(q)|]$
+   - `unique_only_keyword_good_rate`：$\mathbb{E}_q[|P_m(q) \setminus K_B(q)| / |K_P(q) \setminus K_B(q)|]$
 
 ### 评测接口
 
@@ -545,8 +549,8 @@ Mapping 查询按最多 4,096 个不同 ID 分批；baseline 服务缓存 query 
   中训练更新的 44 个解码头张量（`docEnc2decoder.`、`decoder.`、`lm_head.`）所在分片前缀，
   快速导出 `policy-head-step<step>.pt` 供 `baseline_service.py --policy-checkpoint` 加载。
 - 离线 generator 使用 `--docids-per-query 64`（默认在 GPU 0–3 上并行），
-  评分服务默认在 GPU 4–7 上以 `--batch-size 256` 运行，评测客户端默认
-  `--batch-size 64`；当前批评分与下一批生成流水线并行，且支持从已完成 query 断点续跑。
+  评分服务默认在全 8 卡 GPU 0–7 上以 `--batch-size 8192` 运行，评测客户端默认
+  `--batch-size 1024`；当前批评分与下一批生成流水线并行，且支持从已完成 query 断点续跑。
 - 也可通过 [good_count_router_service.py](../../examples/experimental/generative_retriever/services/good_count_router_service.py)
   将同一 query 固定路由到多个隔离单 GPU 进程。离线评测与八卡训练分时运行。
 
@@ -559,13 +563,13 @@ uv run --env-file .env python -m examples.experimental.generative_retriever.run_
 EVAL_ROOT="$cosmos_data_path/local/User/zihao/online_rl/gr_offline_syn/<run_id>/eval/<eval_id>"
 
 uv run python -m examples.experimental.generative_retriever.eval.good_count_eval \
-  --mode baseline --docids-per-query 64 --batch-size 64 \
+  --mode baseline --docids-per-query 64 --batch-size 1024 \
   --manifest "$EVAL_ROOT/queries.jsonl" --output "$EVAL_ROOT/baseline.jsonl" \
   --generate-url http://127.0.0.1:30587/generate \
   --score-url http://127.0.0.1:30689/score
 
 uv run python -m examples.experimental.generative_retriever.eval.good_count_eval \
-  --mode policy --docids-per-query 64 --batch-size 64 --score-head pm \
+  --mode policy --docids-per-query 64 --batch-size 1024 --score-head pm \
   --manifest "$EVAL_ROOT/queries.jsonl" \
   --baseline-results "$EVAL_ROOT/baseline.jsonl" \
   --output "$EVAL_ROOT/policy.jsonl" \

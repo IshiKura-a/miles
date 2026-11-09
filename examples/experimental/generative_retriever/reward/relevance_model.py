@@ -28,8 +28,8 @@ EXPECTED_GRAPHENE_COMMIT = "a57cb597de0891c1e0a2612d12366188b96aa0cc"
 _PIPELINE_PATH = Path("graphene/multi_cup/multi_cup_graphene_pipeline.py")
 _QUERY_PREFIX = "Search query: "
 _KEYWORD_PREFIX = "Document: "
-_CROSS_CHUNK_SIZE = 8192
-_TOWER_MAX_BATCH_SIZE = 1024
+_CROSS_CHUNK_SIZE = 16384
+_TOWER_MAX_BATCH_SIZE = 4096
 _KEYWORD_PAD_THRESHOLD = 64
 _KEYWORD_PAD_MULTIPLE = 256
 _QUERY_PAD_THRESHOLD = 16
@@ -39,7 +39,7 @@ GRAPHENE_NUM_TOKENS = 2
 GRAPHENE_FEATURE_DIM = 128
 GRAPHENE_NUM_SCORE_HEADS = 4
 DEFAULT_QUERY_CACHE_SIZE = 16384
-DEFAULT_KEYWORD_CACHE_SIZE = 8388608
+DEFAULT_KEYWORD_CACHE_SIZE = 16777216
 DEFAULT_SCORE_CACHE_SIZE = 1048576
 DEFAULT_PAIR_BATCH_SIZE = 32768
 logger = logging.getLogger(__name__)
@@ -555,6 +555,7 @@ class MultiGpuRelevanceScorer:
         self._cache_lock = Lock()
         per_gpu_q_cache = max(2048, feature_cache_size // self.num_gpus)
         self._q_capacity = per_gpu_q_cache * self.num_gpus
+        self._query_emb_cache: LRUCache[str, np.ndarray] = LRUCache(self._q_capacity)
         self._k_capacity = keyword_cache_size * self.num_gpus
         self._q_stats = [
             CacheStats(capacity=per_gpu_q_cache, size=0, hits=0, misses=0, evictions=0)
@@ -606,10 +607,11 @@ class MultiGpuRelevanceScorer:
 
     def query_feature_stats(self) -> CacheStats:
         with self._cache_lock:
+            ram_stats = self._query_emb_cache.stats()
             return CacheStats(
                 capacity=sum(s.capacity for s in self._q_stats),
-                size=sum(s.size for s in self._q_stats),
-                hits=sum(s.hits for s in self._q_stats),
+                size=max(ram_stats.size, sum(s.size for s in self._q_stats)),
+                hits=ram_stats.hits + sum(s.hits for s in self._q_stats),
                 misses=sum(s.misses for s in self._q_stats),
                 evictions=sum(s.evictions for s in self._q_stats),
             )
@@ -630,16 +632,28 @@ class MultiGpuRelevanceScorer:
         unique_queries = list(dict.fromkeys(queries))
         if not unique_queries:
             return {}, {"hits": 0, "misses": 0, "evictions": 0}
+        q_embeds: dict[str, np.ndarray] = {}
+        missing_queries: list[str] = []
+        ram_hits = 0
+        with self._cache_lock:
+            for q in unique_queries:
+                cached = self._query_emb_cache.get(q)
+                if cached is not None:
+                    q_embeds[q] = cached
+                    ram_hits += 1
+                else:
+                    missing_queries.append(q)
+        if not missing_queries:
+            return q_embeds, {"hits": ram_hits, "misses": 0, "evictions": 0}
         buckets: list[list[str]] = [[] for _ in range(self.num_gpus)]
-        for q in unique_queries:
+        for q in missing_queries:
             buckets[xxhash.xxh64_intdigest(q) % self.num_gpus].append(q)
         futures = [
             (idx, self._executor.submit(self._call_worker, idx, "encode_queries", bucket))
             for idx, bucket in enumerate(buckets)
             if bucket
         ]
-        q_embeds: dict[str, np.ndarray] = {}
-        q_delta_total = {"hits": 0, "misses": 0, "evictions": 0}
+        q_delta_total = {"hits": ram_hits, "misses": 0, "evictions": 0}
         for idx, future in futures:
             encoded_u16, q_delta, q_stat = future.result()
             q_embeds.update(encoded_u16)
@@ -647,6 +661,8 @@ class MultiGpuRelevanceScorer:
                 q_delta_total[key] += q_delta[key]
             with self._cache_lock:
                 self._q_stats[idx] = q_stat
+                for q, emb in encoded_u16.items():
+                    self._query_emb_cache.put(q, emb)
         return q_embeds, q_delta_total
 
     def _score_k_shard(

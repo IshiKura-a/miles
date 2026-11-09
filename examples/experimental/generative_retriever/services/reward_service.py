@@ -40,6 +40,7 @@ from examples.experimental.generative_retriever.reward.relevance_model import (
 from examples.experimental.generative_retriever.reward.relevance_reward import (
     DEFAULT_REWARD_BATCH_SIZE,
     DEFAULT_TRAIN_GROUP_SIZE,
+    DOC2K_ADD_MIN_QUERIES,
     DOC2K_HEAD_RANK_CUTOFF,
     DOC2K_MAX_ADDS_PER_QUERY,
     DOC2K_MIN_GROUP_SAMPLES,
@@ -55,6 +56,7 @@ from examples.experimental.generative_retriever.reward.relevance_reward import (
     RewardMode,
     build_baseline_set,
     calculate_keyword_rewards,
+    score_and_summarize_docid,
 )
 
 logger = logging.getLogger(__name__)
@@ -202,6 +204,7 @@ class KeywordRewardEngine:
             trust_env=False,
         )
         self._step_additions: dict[tuple[int, int, int, int], list[str]] = {}
+        self._step_candidate_queries: dict[tuple[tuple[int, int, int, int], str], set[str]] = {}
         self._step_docid_queries: dict[tuple[int, int, int, int], set[str]] = {}
         self._step_docid_keywords: dict[tuple[int, int, int, int], list[str]] = {}
         self._step_edge_passes: dict[tuple[tuple[int, int, int, int], str], int] = {}
@@ -342,15 +345,18 @@ class KeywordRewardEngine:
                     for keyword in query_keywords[query]
                 ])
                 scored_at = time.perf_counter()
+                built_baselines = {
+                    query: build_baseline_set({
+                        keyword: pair_scores[(query, keyword)]
+                        for keyword in query_keywords[query]
+                    })
+                    for query in missing_queries
+                }
+                built_at = time.perf_counter()
                 with self._lock:
                     acquired_at = time.perf_counter()
                     b_evictions_before = self.baselines.stats().evictions
-                    for query in missing_queries:
-                        scores = {
-                            keyword: pair_scores[(query, keyword)]
-                            for keyword in query_keywords[query]
-                        }
-                        baseline = build_baseline_set(scores)
+                    for query, baseline in built_baselines.items():
                         self.baselines.put(query, baseline)
                         self._baseline_queries.add(query)
                         baselines[query] = baseline
@@ -365,7 +371,8 @@ class KeywordRewardEngine:
                     "reward_baseline_stage queries=%d missing=%d baseline_s=%.3f mapping_s=%.3f "
                     "lock_wait_s=%.3f graphene_s=%.3f build_s=%.3f total_s=%.3f",
                     len(queries), len(owned), generated_at - started, mapped_at - generated_at,
-                    acquired_at - scored_at, scored_at - mapped_at, finished - acquired_at,
+                    acquired_at - built_at, scored_at - mapped_at,
+                    (built_at - scored_at) + (finished - acquired_at),
                     finished - started,
                 )
             except Exception as error:
@@ -429,88 +436,142 @@ class KeywordRewardEngine:
             query_group_indices.setdefault(sample.prompt, []).append(idx)
         rewards = []
         details = []
-        sample_breakdowns: list[dict[str, Any]] = []
+        include_inline_keywords = len(request.samples) <= _INLINE_KEYWORDS_SAMPLE_LIMIT
+        sample_unique_good: list[list[str]] = []
+        local_docid_queries: dict[tuple[int, int, int, int], set[str]] = {}
+        local_docid_keywords: dict[tuple[int, int, int, int], list[str]] = {}
+        local_edge_passes: dict[tuple[tuple[int, int, int, int], str], int] = {}
+
         for sample, docid, keywords in zip(
             request.samples, docids, sample_keywords, strict=True,
         ):
-            scores = {
-                keyword: pair_scores[(sample.prompt, keyword)]
-                for keyword in keywords
-            }
             baseline = baselines[sample.prompt]
-            breakdown = calculate_keyword_rewards(
-                scores,
-                baseline,
-                mode=request.reward_mode,
-                keyword_frequencies=query_kw_freq.get(sample.prompt),
-            )
-            sample_breakdowns.append(breakdown)
-            denominator = max(len(breakdown), DOCID_REWARD_FLOOR)
-            value = math.fsum(result.reward for result in breakdown.values()) / float(denominator)
-            rewards.append(value)
-            detail_entry: dict[str, Any] = {
-                "query": sample.prompt, "docid": docid, "keyword_count": len(scores),
-                "aggregation": f"floor_{DOCID_REWARD_FLOOR}", "reward": value,
-                "metrics": summarize_breakdown_metrics(breakdown),
-            }
-            if len(request.samples) <= _INLINE_KEYWORDS_SAMPLE_LIMIT:
-                detail_entry["keywords"] = [
+            freq_map = query_kw_freq.get(sample.prompt)
+            if include_inline_keywords:
+                scores = {
+                    keyword: pair_scores[(sample.prompt, keyword)]
+                    for keyword in keywords
+                }
+                breakdown = calculate_keyword_rewards(
+                    scores,
+                    baseline,
+                    mode=request.reward_mode,
+                    keyword_frequencies=freq_map,
+                )
+                denominator = max(len(breakdown), DOCID_REWARD_FLOOR)
+                value = math.fsum(result.reward for result in breakdown.values()) / float(denominator)
+                metrics = summarize_breakdown_metrics(breakdown)
+                passed_kws = [
+                    kw
+                    for kw, res in breakdown.items()
+                    if res.pm_pass >= 1.0 and res.sm_pass >= 1.0
+                ]
+                uniq_good_kws = [
+                    kw
+                    for kw, res in breakdown.items()
+                    if res.pm_unique_eligible and res.sm_unique_eligible
+                ]
+                inline_kws = [
                     {"keyword": keyword, **asdict(result)}
                     for keyword, result in breakdown.items()
                 ]
+            else:
+                value, metrics, passed_kws, uniq_good_kws = score_and_summarize_docid(
+                    keywords,
+                    pair_scores,
+                    sample.prompt,
+                    baseline,
+                    mode=request.reward_mode,
+                    keyword_frequencies=freq_map,
+                    k_floor=DOCID_REWARD_FLOOR,
+                )
+                inline_kws = None
+            sample_unique_good.append(uniq_good_kws)
+            if len(keywords) > 1:
+                local_docid_queries.setdefault(docid, set()).add(sample.prompt)
+                local_docid_keywords[docid] = keywords
+                for kw in passed_kws:
+                    edge = (docid, kw)
+                    local_edge_passes[edge] = local_edge_passes.get(edge, 0) + 1
+            rewards.append(value)
+            detail_entry: dict[str, Any] = {
+                "query": sample.prompt, "docid": docid, "keyword_count": len(keywords),
+                "aggregation": f"floor_{DOCID_REWARD_FLOOR}", "reward": value,
+                "metrics": metrics,
+            }
+            if inline_kws is not None:
+                detail_entry["keywords"] = inline_kws
             details.append(detail_entry)
             logger.debug("reward_mode=%s docid=%s keywords=%d reward=%f",
-                        request.reward_mode, docid, len(scores), value)
+                        request.reward_mode, docid, len(keywords), value)
+
+        local_candidate_votes: list[tuple[tuple[int, int, int, int], str, str]] = []
+        for query_text, indices in query_group_indices.items():
+            if len(indices) < DOC2K_MIN_GROUP_SAMPLES:
+                continue
+            head_cutoff = min(DOC2K_HEAD_RANK_CUTOFF, max(DOC2K_MIN_HEAD_RANKS, len(indices) // 2))
+            head_indices = indices[:head_cutoff]
+            tail_indices = indices[head_cutoff:]
+            if not tail_indices:
+                continue
+            head_keywords = {
+                kw for i in head_indices for kw in sample_keywords[i]
+            }
+            default_target = docids[head_indices[0]]
+            for i in head_indices:
+                if len(sample_keywords[i]) < DOCID_REWARD_FLOOR:
+                    default_target = docids[i]
+                    break
+            added_for_query = 0
+            seen_tail: set[str] = set()
+            for i in tail_indices:
+                if added_for_query >= DOC2K_MAX_ADDS_PER_QUERY:
+                    break
+                tail_docid = docids[i]
+                target_docid: tuple[int, int, int, int] | None = None
+                for hi in head_indices:
+                    hd = docids[hi]
+                    if hd[:2] == tail_docid[:2] and len(sample_keywords[hi]) < DOCID_REWARD_FLOOR:
+                        target_docid = hd
+                        break
+                if target_docid is None:
+                    for hi in head_indices:
+                        hd = docids[hi]
+                        if hd[0] == tail_docid[0] and len(sample_keywords[hi]) < DOCID_REWARD_FLOOR:
+                            target_docid = hd
+                            break
+                if target_docid is None:
+                    target_docid = default_target
+                for kw in sample_unique_good[i]:
+                    if kw not in head_keywords and kw not in seen_tail:
+                        seen_tail.add(kw)
+                        local_candidate_votes.append((target_docid, kw, query_text))
+                        added_for_query += 1
+                        if added_for_query >= DOC2K_MAX_ADDS_PER_QUERY:
+                            break
+
+        pre_lock_at = time.perf_counter()
         with self._lock:
             acquired_at = time.perf_counter()
-            for sample, docid, keywords, breakdown in zip(
-                request.samples, docids, sample_keywords, sample_breakdowns, strict=True
-            ):
-                if len(keywords) > DOCID_REWARD_FLOOR:
-                    self._step_docid_queries.setdefault(docid, set()).add(sample.prompt)
-                    self._step_docid_keywords.setdefault(docid, keywords)
-                    for keyword, result in breakdown.items():
-                        edge = (docid, keyword)
-                        self._step_edge_passes[edge] = (
-                            self._step_edge_passes.get(edge, 0) + int(result.relevance_eligible)
-                        )
-            for indices in query_group_indices.values():
-                if len(indices) < DOC2K_MIN_GROUP_SAMPLES:
-                    continue
-                head_cutoff = min(DOC2K_HEAD_RANK_CUTOFF, max(DOC2K_MIN_HEAD_RANKS, len(indices) // 2))
-                head_indices = indices[:head_cutoff]
-                tail_indices = indices[head_cutoff:]
-                if not tail_indices:
-                    continue
-                head_keywords = {
-                    kw for i in head_indices for kw in sample_keywords[i]
-                }
-                tail_unique_good: list[str] = []
-                seen_tail: set[str] = set()
-                for i in tail_indices:
-                    for kw, res in sample_breakdowns[i].items():
-                        if res.unique_eligible and kw not in head_keywords and kw not in seen_tail:
-                            tail_unique_good.append(kw)
-                            seen_tail.add(kw)
-                if not tail_unique_good:
-                    continue
-                target_docid = docids[head_indices[0]]
-                for i in head_indices:
-                    if len(sample_keywords[i]) < DOCID_REWARD_FLOOR:
-                        target_docid = docids[i]
-                        break
-                bucket_adds = self._step_additions.setdefault(target_docid, [])
-                existing_adds = set(bucket_adds)
-                for kw in tail_unique_good[:DOC2K_MAX_ADDS_PER_QUERY]:
-                    if kw not in existing_adds:
+            for docid, q_set in local_docid_queries.items():
+                self._step_docid_queries.setdefault(docid, set()).update(q_set)
+            for docid, kws in local_docid_keywords.items():
+                self._step_docid_keywords[docid] = kws
+            for edge, cnt in local_edge_passes.items():
+                self._step_edge_passes[edge] = self._step_edge_passes.get(edge, 0) + cnt
+            for target_docid, kw, query_text in local_candidate_votes:
+                cand_q = self._step_candidate_queries.setdefault((target_docid, kw), set())
+                cand_q.add(query_text)
+                if len(cand_q) >= DOC2K_ADD_MIN_QUERIES:
+                    bucket_adds = self._step_additions.setdefault(target_docid, [])
+                    if kw not in bucket_adds:
                         bucket_adds.append(kw)
-                        existing_adds.add(kw)
             cache = self._cache_stats()
         finished = time.perf_counter()
         logger.info(
             "reward_score_stage samples=%d pairs=%d mapping_s=%.3f lock_wait_s=%.3f "
             "baseline_s=%.3f graphene_s=%.3f breakdown_s=%.3f total_s=%.3f",
-            len(request.samples), len(pairs), mapped_at - started, acquired_at - scored_at,
+            len(request.samples), len(pairs), mapped_at - started, acquired_at - pre_lock_at,
             prepared_at - mapped_at, scored_at - prepared_at, finished - scored_at,
             finished - started,
         )
@@ -533,27 +594,35 @@ class KeywordRewardEngine:
                 for docid, keywords in self._step_additions.items()
                 if keywords
             ]
+            for docid, keywords in self._step_additions.items():
+                for kw in keywords:
+                    self._step_candidate_queries.pop((docid, kw), None)
+            self._step_additions.clear()
+
             removals = []
+            harvested_docids: list[tuple[int, int, int, int]] = []
             for docid, queries in self._step_docid_queries.items():
                 if len(queries) < min_queries:
                     continue
+                harvested_docids.append(docid)
                 keywords = self._step_docid_keywords.get(docid, [])
-                if len(keywords) <= DOCID_REWARD_FLOOR:
+                if len(keywords) <= 1:
                     continue
                 dead_keywords = [
                     kw for kw in keywords
                     if self._step_edge_passes.get((docid, kw), 0) == 0
                 ]
-                max_removable = max(0, len(keywords) - DOCID_REWARD_FLOOR)
+                max_removable = max(0, len(keywords) - 1)
                 if dead_keywords and max_removable > 0:
                     removals.append({
                         "docid": list(docid),
                         "keywords": dead_keywords[:max_removable],
                     })
-            self._step_additions.clear()
-            self._step_docid_queries.clear()
-            self._step_docid_keywords.clear()
-            self._step_edge_passes.clear()
+            for docid in harvested_docids:
+                self._step_docid_queries.pop(docid, None)
+                kws = self._step_docid_keywords.pop(docid, [])
+                for kw in kws:
+                    self._step_edge_passes.pop((docid, kw), None)
             return {
                 "additions": additions,
                 "removals": removals,

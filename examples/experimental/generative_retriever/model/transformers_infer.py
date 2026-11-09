@@ -15,6 +15,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import copy
 from dataclasses import dataclass
 import json
 import logging
@@ -126,6 +127,26 @@ class SLMv3Retriever:
         self.constraint: PrefixConstraint = load_constraint(
             str(self.slm_root), str(mapping), self.code_num, self.code_dim,
         )
+
+    def clone_to_device(self, device: str) -> SLMv3Retriever:
+        if device.startswith("cuda") and not torch.cuda.is_available():
+            raise RuntimeError(f"requested device {device!r}, but no CUDA/ROCm device is available")
+        target_device = torch.device(device)
+        if target_device == self.device:
+            return self
+        cloned = object.__new__(SLMv3Retriever)
+        cloned.checkpoint = self.checkpoint
+        cloned.qwen_model = self.qwen_model
+        cloned.slm_root = self.slm_root
+        cloned.device = target_device
+        cloned.model = copy.deepcopy(self.model).to(device=target_device, dtype=torch.bfloat16).eval()
+        cloned.encoder = cloned.model.encoder_list[0]
+        cloned.processor = copy.deepcopy(self.processor)
+        cloned.tokenizer = copy.deepcopy(self.tokenizer)
+        cloned.code_dim = self.code_dim
+        cloned.code_num = self.code_num
+        cloned.constraint = self.constraint
+        return cloned
 
     def _render_prompt(self, query: str) -> str:
         truncated_query = self.tokenizer.decode(

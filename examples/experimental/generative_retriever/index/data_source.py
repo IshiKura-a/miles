@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
+import httpx
 import torch
 
 from miles.rollout.data_source import RolloutDataSourceWithBuffer
+
+logger = logging.getLogger(__name__)
 
 
 class GRRolloutDataSource(RolloutDataSourceWithBuffer):
@@ -22,7 +26,8 @@ class GRRolloutDataSource(RolloutDataSourceWithBuffer):
         position = self._completed_position(rollout_id)
         if self.epoch_id != 0 or self.sample_offset < position or self.buffer:
             raise ValueError("GR rollout cannot checkpoint a wrapped or buffered prompt dataset")
-        path = Path(self.args.save) / "rollout" / f"global_dataset_state_dict_{rollout_id}.pt"
+        save_root = Path(self.args.save).expanduser().resolve()
+        path = save_root / "rollout" / f"global_dataset_state_dict_{rollout_id}.pt"
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
             {
@@ -34,6 +39,24 @@ class GRRolloutDataSource(RolloutDataSourceWithBuffer):
             },
             path,
         )
+        reward_url = getattr(self.args, "generative_retriever_reward_url", None)
+        if isinstance(reward_url, str) and reward_url:
+            save_mapping_url = reward_url.removesuffix("/score") + "/save_mapping"
+            mapping_output_dir = str(save_root / f"iter_{rollout_id + 1:07d}" / "mapping")
+            try:
+                with httpx.Client(timeout=600.0, trust_env=False) as client:
+                    response = client.post(
+                        save_mapping_url,
+                        json={"output_dir": mapping_output_dir},
+                    )
+                    response.raise_for_status()
+            except Exception as error:
+                logger.warning(
+                    "Failed to save coupled doc2k index at %s -> %s: %s",
+                    save_mapping_url,
+                    mapping_output_dir,
+                    error,
+                )
 
     def load(self, rollout_id: int | None = None) -> None:
         if self.args.load is None:

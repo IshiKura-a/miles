@@ -120,13 +120,19 @@ def checkpoint_tensor_shape(checkpoint: Path, tensor_name: str) -> tuple[int, ..
 
 
 def load_checkpoint(model: Any, checkpoint: Path) -> None:
-    loaded_keys: set[str] = set()
-    for shard_path in checkpoint_shards(checkpoint):
-        state_dict = torch.load(shard_path, map_location="cpu", mmap=True, weights_only=True)
-        if not isinstance(state_dict, dict):
+    shards = checkpoint_shards(checkpoint)
+
+    def _read_shard(shard_path: Path) -> dict[str, Any]:
+        sd = torch.load(shard_path, map_location="cpu", weights_only=True)
+        if not isinstance(sd, dict):
             raise TypeError(f"checkpoint shard is not a state dict: {shard_path}")
-        model.load_state_dict(state_dict, strict=False)
-        loaded_keys.update(state_dict)
+        return sd
+
+    loaded_keys: set[str] = set()
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(shards)))) as pool:
+        for state_dict in pool.map(_read_shard, shards):
+            model.load_state_dict(state_dict, strict=False)
+            loaded_keys.update(state_dict)
 
     required_prefixes = (
         "encoder_list.0.model.encoder.model.",
