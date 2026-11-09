@@ -11,7 +11,9 @@ import logging
 import multiprocessing as mp
 from multiprocessing.connection import Connection
 import os
+import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 from threading import Lock
@@ -565,6 +567,7 @@ class MultiGpuRelevanceScorer:
             CacheStats(capacity=keyword_cache_size, size=0, hits=0, misses=0, evictions=0)
             for _ in range(self.num_gpus)
         ]
+        _stage_local_relevance_source(resolve_relevance_source(relevance_model))
         ctx = mp.get_context("spawn")
         self._executor = ThreadPoolExecutor(max_workers=self.num_gpus)
         self._conns: list[Connection] = []
@@ -832,9 +835,42 @@ def resolve_relevance_source(
     return _validate_source(Path(cosmos_root) / "local" / relative_checkpoint / "code")
 
 
+def _stage_local_relevance_source(source: Path) -> Path:
+    resolved = _validate_source(source)
+    local_root = Path(tempfile.gettempdir())
+    try:
+        if resolved.is_relative_to(local_root):
+            return resolved
+    except ValueError:
+        pass
+    target = local_root / f"gr_relevance_source_{EXPECTED_GRAPHENE_COMMIT[:12]}"
+    if (target / _PIPELINE_PATH).is_file() and (target / "GIT_COMMIT.txt").is_file():
+        try:
+            return _validate_source(target)
+        except (OSError, ValueError):
+            pass
+    staging = local_root / f".gr_relevance_source_{EXPECTED_GRAPHENE_COMMIT[:12]}.{os.getpid()}"
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True, exist_ok=True)
+    for metadata_name in ("GIT_COMMIT.txt", "SHA256SUMS", "SOURCE_REPOSITORY.txt"):
+        metadata_src = resolved / metadata_name
+        if metadata_src.is_file():
+            shutil.copy2(metadata_src, staging / metadata_name)
+    shutil.copytree(
+        resolved / "graphene",
+        staging / "graphene",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    try:
+        os.replace(staging, target)
+    except OSError:
+        shutil.rmtree(staging, ignore_errors=True)
+    return _validate_source(target)
+
+
 def load_relevance_pipeline_factory(source: str | Path) -> RelevancePipelineFactory:
-    resolved = _validate_source(Path(source))
-    source_text = os.fspath(resolved)
+    staged = _stage_local_relevance_source(Path(source))
+    source_text = os.fspath(staged)
     if source_text not in sys.path:
         sys.path.append(source_text)
     module = importlib.import_module("graphene.multi_cup.multi_cup_graphene_pipeline")
