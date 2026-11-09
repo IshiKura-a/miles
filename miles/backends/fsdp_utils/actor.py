@@ -107,15 +107,23 @@ class FSDPTrainRayActor(TrainRayActor):
 
         self.prof = TrainProfiler(args)
 
-        for i in range(dist.get_world_size()):
-            if i == dist.get_rank():
-                self.hf_config = load_hf_config(self.args.hf_checkpoint)
-                self.tokenizer = load_tokenizer(
-                    self.args.hf_checkpoint, chat_template_path=self.args.chat_template_path, trust_remote_code=True
-                )
-                if hasattr(self.hf_config, "vision_config"):
-                    self.processor = load_processor(self.args.hf_checkpoint, trust_remote_code=True)
-            dist.barrier(group=get_gloo_group())
+        if dist.get_rank() == 0:
+            hf_config = load_hf_config(self.args.hf_checkpoint)
+            tokenizer = load_tokenizer(
+                self.args.hf_checkpoint, chat_template_path=self.args.chat_template_path, trust_remote_code=True
+            )
+            processor = (
+                load_processor(self.args.hf_checkpoint, trust_remote_code=True)
+                if hasattr(hf_config, "vision_config")
+                else None
+            )
+            broadcast_objects = [hf_config, tokenizer, processor]
+        else:
+            broadcast_objects = [None, None, None]
+        dist.broadcast_object_list(broadcast_objects, src=0, group=get_gloo_group())
+        self.hf_config, self.tokenizer, processor = broadcast_objects
+        if processor is not None:
+            self.processor = processor
 
         self.precision_policy = resolve_precision_policy(self.hf_config, self.args)
         try:

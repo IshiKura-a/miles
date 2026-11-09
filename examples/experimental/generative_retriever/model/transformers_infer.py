@@ -39,6 +39,7 @@ from examples.experimental.generative_retriever.model.model_loading import (
     import_slmv3,
     load_checkpoint,
     require_directory,
+    stage_local_model_dir,
 )
 from examples.experimental.generative_retriever.reward.relevance_reward import (
     DEFAULT_EVAL_GROUP_SIZE,
@@ -84,8 +85,8 @@ class SLMv3Retriever:
         id_mapping: str | Path,
         device: str = "cuda",
     ) -> None:
-        self.checkpoint = require_directory(checkpoint, "checkpoint")
-        self.qwen_model = require_directory(qwen_model, "Qwen model")
+        self.checkpoint = stage_local_model_dir(checkpoint, "checkpoint")
+        self.qwen_model = stage_local_model_dir(qwen_model, "Qwen model")
         self.slm_root = require_directory(slm_root, "SLMv3 source")
         mapping = Path(id_mapping).expanduser().resolve()
         if not mapping.is_file() and not (mapping.is_dir() and (mapping / "docid_keywords.parquet").is_file()):

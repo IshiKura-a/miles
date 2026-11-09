@@ -23,7 +23,7 @@ from examples.experimental.generative_retriever.model.model_loading import (
     checkpoint_tensor_shape,
     import_slmv3,
     load_checkpoint,
-    require_directory,
+    stage_local_model_dir,
 )
 
 
@@ -31,7 +31,7 @@ def _required_path(variable: str) -> Path:
     value = os.environ.get(variable)
     if not value:
         raise ValueError(f"{variable} must be set for the GR FSDP model factory")
-    return require_directory(value, variable)
+    return stage_local_model_dir(value, variable)
 
 
 class GRStage5Policy(nn.Module):

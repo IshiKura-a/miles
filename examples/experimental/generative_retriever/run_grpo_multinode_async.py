@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 import filecmp
 import hashlib
@@ -38,6 +39,9 @@ from ray._private.node import Node
 from ray._private.parameter import RayParams
 
 from examples.experimental.generative_retriever import run_grpo
+from examples.experimental.generative_retriever.model.model_loading import (
+    stage_local_model_dir,
+)
 from examples.experimental.generative_retriever.reward.relevance_reward import (
     DEFAULT_REWARD_BATCH_SIZE,
     DEFAULT_TRAIN_GROUP_SIZE,
@@ -727,6 +731,8 @@ def _prepare_node_assets(manifest: Manifest) -> None:
     for name in ("config.json", "tokenizer.json", "pytorch_model.bin.index.json"):
         if not (bundle / name).is_file():
             raise FileNotFoundError(f"Model bundle asset is not readable on this node: {bundle / name}")
+    stage_local_model_dir(manifest["checkpoint"], "checkpoint")
+    stage_local_model_dir(manifest["qwen_model"], "Qwen model")
 
 
 def _check_miles_checkouts(hosts: list[str]) -> None:
@@ -738,7 +744,8 @@ def _check_miles_checkouts(hosts: list[str]) -> None:
     )
     if local_changes:
         raise RuntimeError("Miles checkout on the launch node is dirty; deploy a committed version before training")
-    for host in hosts[1:]:
+
+    def _verify_host_checkout(host: str) -> None:
         remote_checkout = f"git -C {shlex.quote(str(_REPO))}"
         checkout = subprocess.run(
             [
@@ -754,12 +761,20 @@ def _check_miles_checkouts(hosts: list[str]) -> None:
         if len(lines) != 1:
             raise RuntimeError(f"Miles checkout on {host} is dirty; deploy a clean checkout before training")
 
+    remote_hosts = hosts[1:]
+    if remote_hosts:
+        with ThreadPoolExecutor(max_workers=len(remote_hosts)) as pool:
+            futures = [pool.submit(_verify_host_checkout, host) for host in remote_hosts]
+            for future in futures:
+                future.result()
+
 
 def _check_remote_sources(manifest: Manifest) -> None:
     _check_miles_checkouts(manifest["hosts"])
     run_dir = Path(manifest["run_dir"])
     require_sglang_abort_patch()
     sglang_patch = Path(__file__).resolve().parent / "runtime/patches/sglang-embedding-abort.patch"
+    sglang_patch_text = sglang_patch.read_text()
     sglang_root = Path(sys.prefix) / "src/sglang"
     files = (
         sglang_root / "python/sglang/srt/entrypoints/openai/serving_embedding.py",
@@ -768,7 +783,16 @@ def _check_remote_sources(manifest: Manifest) -> None:
         Path(manifest["qwen_model"]) / "model.safetensors.index.json",
     )
     expected = [hashlib.sha256(path.read_bytes()).hexdigest() for path in files]
-    for index, host in enumerate(manifest["hosts"][1:], start=1):
+    required = (
+        (run_dir / "manifest.json", "f"),
+        (run_dir / "sglang_bundle/config.json", "f"),
+        (Path(manifest["prompt_source"]), "f"),
+        (Path(manifest["mapping"]), "e"),
+        (Path(sys.executable), "x"),
+        (_REPO / ".venv/activate-rocm.sh", "f"),
+    )
+
+    def _prepare_remote_host(index: int, host: str) -> None:
         remote = "sha256sum " + " ".join(shlex.quote(str(path)) for path in files)
         result = subprocess.run(
             ["ssh", "-o", "BatchMode=yes", host, remote],
@@ -782,18 +806,10 @@ def _check_remote_sources(manifest: Manifest) -> None:
                 "ssh", "-o", "BatchMode=yes", host,
                 f"git -C {shlex.quote(str(sglang_root))} apply --reverse --check -",
             ],
-            input=sglang_patch.read_text(), capture_output=True, text=True,
+            input=sglang_patch_text, capture_output=True, text=True,
         )
         if patch_check.returncode:
             raise RuntimeError(f"SGLang embedding abort patch is missing on {host}: {patch_check.stderr.strip()}")
-        required = (
-            (run_dir / "manifest.json", "f"),
-            (run_dir / "sglang_bundle/config.json", "f"),
-            (Path(manifest["prompt_source"]), "f"),
-            (Path(manifest["mapping"]), "e"),
-            (Path(sys.executable), "x"),
-            (_REPO / ".venv/activate-rocm.sh", "f"),
-        )
         for file, test_flag in required:
             probe = subprocess.run(
                 ["ssh", "-o", "BatchMode=yes", host,
@@ -808,6 +824,13 @@ def _check_remote_sources(manifest: Manifest) -> None:
             _remote(host, "_prepare_assets", run_dir / "manifest.json", index),
             check=True,
         )
+
+    remote_hosts = list(enumerate(manifest["hosts"][1:], start=1))
+    if remote_hosts:
+        with ThreadPoolExecutor(max_workers=len(remote_hosts)) as pool:
+            futures = [pool.submit(_prepare_remote_host, index, host) for index, host in remote_hosts]
+            for future in futures:
+                future.result()
 
 
 def _worker(manifest: Manifest, index: int) -> None:

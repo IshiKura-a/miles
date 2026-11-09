@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import importlib
 import json
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -17,6 +19,7 @@ from torch.distributed.checkpoint.metadata import TensorStorageMetadata
 from torch.distributed.checkpoint.state_dict_loader import load
 
 _POLICY_HEAD_PREFIXES = ("docEnc2decoder.", "decoder.", "lm_head.")
+_WEIGHT_SUFFIXES = (".bin", ".safetensors", ".pt", ".pth", ".onnx", ".tar")
 
 
 def require_directory(path: str | Path, name: str) -> Path:
@@ -24,6 +27,39 @@ def require_directory(path: str | Path, name: str) -> Path:
     if not resolved.is_dir():
         raise FileNotFoundError(f"{name} directory does not exist: {resolved}")
     return resolved
+
+
+def stage_local_model_dir(path: str | Path, name: str) -> Path:
+    resolved = require_directory(path, name)
+    local_root = Path(tempfile.gettempdir())
+    try:
+        if resolved.is_relative_to(local_root):
+            return resolved
+    except ValueError:
+        pass
+    digest = hashlib.sha256(os.fspath(resolved).encode("utf-8")).hexdigest()[:12]
+    target = local_root / f"gr_model_{resolved.name}_{digest}"
+    sentinel = target / ".staged_ok"
+    if sentinel.is_file():
+        return target
+    staging = local_root / f".gr_model_{resolved.name}_{digest}.{os.getpid()}"
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True, exist_ok=True)
+    for entry in sorted(resolved.iterdir()):
+        dst = staging / entry.name
+        if entry.is_dir():
+            dst.symlink_to(entry)
+        elif entry.suffix.lower() in _WEIGHT_SUFFIXES or entry.stat().st_size > 64 * 1024 * 1024:
+            dst.symlink_to(entry)
+        else:
+            shutil.copy2(entry, dst)
+    sentinel.parent.mkdir(parents=True, exist_ok=True)
+    (staging / ".staged_ok").write_text(os.fspath(resolved) + "\n", encoding="utf-8")
+    try:
+        os.replace(staging, target)
+    except OSError:
+        shutil.rmtree(staging, ignore_errors=True)
+    return target if (target / ".staged_ok").is_file() else resolved
 
 
 def import_slmv3(slm_root: Path) -> dict[str, Any]:
