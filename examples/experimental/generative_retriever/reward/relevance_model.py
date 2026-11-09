@@ -855,10 +855,11 @@ def _stage_local_relevance_source(source: Path) -> Path:
     for metadata_name in ("GIT_COMMIT.txt", "SHA256SUMS", "SOURCE_REPOSITORY.txt"):
         metadata_src = resolved / metadata_name
         if metadata_src.is_file():
-            shutil.copy2(metadata_src, staging / metadata_name)
+            shutil.copyfile(metadata_src, staging / metadata_name)
     shutil.copytree(
         resolved / "graphene",
         staging / "graphene",
+        copy_function=shutil.copyfile,
         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
     )
     try:

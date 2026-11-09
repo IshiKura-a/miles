@@ -64,7 +64,7 @@ def stage_local_model_dir(path: str | Path, name: str) -> Path:
     for asset_name in _STAGE_ASSETS:
         src = resolved / asset_name
         if src.is_file():
-            shutil.copy2(src, staging / asset_name)
+            shutil.copyfile(src, staging / asset_name)
     for index_name in ("pytorch_model.bin.index.json", "model.safetensors.index.json"):
         idx_file = staging / index_name
         if idx_file.is_file():
