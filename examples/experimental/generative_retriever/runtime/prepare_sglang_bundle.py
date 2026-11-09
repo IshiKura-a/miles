@@ -48,7 +48,8 @@ def _replace_symlink(link: Path, target: Path) -> None:
     if link.is_symlink():
         if Path(os.readlink(link)) == target or link.resolve() == target:
             return
-    if link.exists() or link.is_symlink():
+        link.unlink()
+    elif link.exists():
         raise FileExistsError(f"refusing to replace existing bundle file: {link}")
     link.symlink_to(target)
 
