@@ -130,12 +130,12 @@ markdown-it-py==4.2.0
 markupsafe==3.0.4
 matplotlib==3.11.2
 matplotlib-inline==0.2.2
-mbridge @ git+https://github.com/ISEEKYAN/mbridge.git@89eb10887887bc74853f89a4de258c0702932a1c
+mbridge @ https://github.com/IshiKura-a/miles/releases/download/rocm10-gfx942-v0.5.20/mbridge-0.15.1-py3-none-any.whl
 mcp==2.3.0
 mcp-types==2.3.0
 mdit-py-plugins==0.6.1
 mdurl==0.1.2
-megatron-bridge @ git+https://github.com/radixark/Megatron-Bridge.git@8cd3466d14d2337c8492827b3712482c2b3e4866
+megatron-bridge @ https://github.com/IshiKura-a/miles/releases/download/rocm10-gfx942-v0.5.20/megatron_bridge-0.7.0%2B8cd3466d-py3-none-any.whl
 -e file:///home/aiscuser/miles/.venv/src/Megatron-LM
 megatron-energon==7.4.1
 memray==1.20.0
@@ -270,7 +270,7 @@ setuptools==79.0.1
 setuptools-rust==1.13.0
 setuptools-scm==10.3.4
 -e file:///home/aiscuser/miles/.venv/src/sglang/python
-sglang-kernel @ file:///home/aiscuser/miles/.venv/src/sglang/python/sglang/kernels/aot/dist/sglang_kernel-0.4.7-cp312-cp312-linux_x86_64.whl
+sglang-kernel @ https://github.com/IshiKura-a/miles/releases/download/rocm10-gfx942-v0.5.20/sglang_kernel-0.4.7-cp312-cp312-linux_x86_64.whl
 sglang-router==0.3.2
 shellingham==1.5.4
 simplejson==4.2.0
@@ -298,7 +298,7 @@ tiktoken==0.14.0
 timm==1.0.30
 tokenizers==0.22.2
 torch==2.11.0+rocm10.0.0
-torch-memory-saver @ git+https://github.com/fzyzcjy/torch_memory_saver.git@06caa534822c5b980b61733a5d79ac731f9a5f9c
+torch-memory-saver @ https://github.com/IshiKura-a/miles/releases/download/rocm10-gfx942-v0.5.20/torch_memory_saver-0.0.10b1-cp312-cp312-linux_x86_64.whl
 torchaudio==2.11.0+rocm10.0.0
 torchvision==0.26.0+rocm10.0.0
 tqdm==4.70.1

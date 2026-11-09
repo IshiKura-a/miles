@@ -9,6 +9,8 @@ Run on the first host before launching multi-node GRPO training:
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
+import filecmp
 import math
 import os
 from pathlib import Path
@@ -40,17 +42,12 @@ _ROCM_PACKAGES = (
     "amd-torchvision-device-gfx942==0.26.0+rocm10.0.0",
     "triton==3.8.0+git4cff872c.rocm10.0.0",
 )
-_GIT_WHEELS = (
-    "mbridge @ git+https://github.com/ISEEKYAN/mbridge.git@89eb10887887bc74853f89a4de258c0702932a1c",
-    "megatron-bridge @ git+https://github.com/radixark/Megatron-Bridge.git@8cd3466d14d2337c8492827b3712482c2b3e4866",
-    "torch-memory-saver @ git+https://github.com/fzyzcjy/torch_memory_saver.git@06caa534822c5b980b61733a5d79ac731f9a5f9c",
+_PREBUILT_RELEASE_URL = (
+    "https://github.com/IshiKura-a/miles/releases/download/rocm10-gfx942-v0.5.20"
 )
+_AITER_CORE_SO_URL = f"{_PREBUILT_RELEASE_URL}/module_aiter_core.so"
 _SKIP_PREFIXES = (
     "-e ",
-    "sglang-kernel @",
-    "torch-memory-saver @",
-    "megatron-bridge @",
-    "mbridge @",
     "rocm==",
     "rocm-bootstrap==",
     "rocm-sdk-",
@@ -240,7 +237,8 @@ def _write_activate_script(venv: Path) -> Path:
         'export NCCL_IB_HCA=""\n'
         'export NCCL_IB_TIMEOUT="22"\n'
         'export NCCL_IB_PCI_RELAXED_ORDERING="1"\n'
-        'export NCCL_NET_GDR_LEVEL="5"\n',
+        'export NCCL_NET_GDR_LEVEL="5"\n'
+        'export cosmos_data_path="${cosmos_data_path:-${datastore:-}}"\n',
         encoding="utf-8",
     )
     script.chmod(0o755)
@@ -286,6 +284,60 @@ def _patch_aiter_tree(aiter_dir: Path) -> None:
         torch_utils.write_text(utils_text.replace(old, new), encoding="utf-8")
 
 
+def _fetch_shallow_commit(repo_dir: Path, url: str, commit: str) -> None:
+    if repo_dir.exists():
+        return
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    _run(["git", "-C", str(repo_dir), "init", "-q"])
+    _run(["git", "-C", str(repo_dir), "remote", "add", "origin", url])
+    _run(["git", "-C", str(repo_dir), "fetch", "-q", "--depth", "1", "origin", commit])
+    _run(["git", "-C", str(repo_dir), "checkout", "-q", "-f", "FETCH_HEAD"])
+
+
+def _fetch_aiter_repo(aiter: Path) -> None:
+    if not aiter.exists():
+        aiter.mkdir(parents=True, exist_ok=True)
+        _run(["git", "-C", str(aiter), "init", "-q"])
+        _run(["git", "-C", str(aiter), "remote", "add", "origin", "https://github.com/ROCm/aiter.git"])
+        _run(
+            [
+                "git", "-C", str(aiter), "fetch", "-q", "--depth", "2",
+                "origin", _AITER_COMMIT, *_AITER_CHERRYPICKS,
+            ]
+        )
+        _run(["git", "-C", str(aiter), "checkout", "-q", "-f", _AITER_COMMIT])
+        _run(["git", "-C", str(aiter), "cherry-pick", "--no-commit", *_AITER_CHERRYPICKS])
+        _patch_aiter_tree(aiter)
+        _run(["git", "-C", str(aiter), "submodule", "update", "--init", "--recursive", "--depth", "1", "-q"])
+
+    core_so = aiter / "aiter/jit/module_aiter_core.so"
+    if not core_so.is_file():
+        core_so.parent.mkdir(parents=True, exist_ok=True)
+        _run(
+            [
+                "curl", "-fsSL", "--retry", "5", "--retry-all-errors",
+                "-o", str(core_so), _AITER_CORE_SO_URL,
+            ]
+        )
+        core_so.chmod(0o775)
+
+
+def _deduplicate_rocm_sdk_libs(site_packages: Path) -> None:
+    devel_lib_dir = site_packages / "_rocm_sdk_devel/lib"
+    if not devel_lib_dir.is_dir():
+        return
+    for lib_file in sorted(devel_lib_dir.glob("*.so*")):
+        if not lib_file.is_file() or lib_file.is_symlink():
+            continue
+        for target_pkg in ("_rocm_sdk_core", "_rocm_sdk_libraries"):
+            candidate = site_packages / target_pkg / "lib" / lib_file.name
+            if candidate.is_file() and not candidate.is_symlink() and filecmp.cmp(lib_file, candidate, shallow=False):
+                rel_target = os.path.relpath(candidate, start=devel_lib_dir)
+                lib_file.unlink()
+                lib_file.symlink_to(rel_target)
+                break
+
+
 def _prepare_sources(venv: Path, env: dict[str, str]) -> None:
     src = venv / "src"
     src.mkdir(parents=True, exist_ok=True)
@@ -293,24 +345,19 @@ def _prepare_sources(venv: Path, env: dict[str, str]) -> None:
     uv = str(shutil.which("uv") or (Path.home() / ".local/bin/uv"))
 
     megatron = src / "Megatron-LM"
-    if not megatron.exists():
-        _run(["git", "clone", "--no-checkout", "https://github.com/radixark/Megatron-LM.git", str(megatron)])
-        _run(["git", "-C", str(megatron), "checkout", _MEGATRON_COMMIT])
-
     sglang = src / "sglang"
-    if not sglang.exists():
-        _run(["git", "clone", "--no-checkout", "https://github.com/sgl-project/sglang.git", str(sglang)])
-        _run(["git", "-C", str(sglang), "checkout", _SGLANG_COMMIT])
-    _apply_patch_idempotent(sglang, _SGLANG_PATCH)
-
     aiter = src / "aiter"
-    if not aiter.exists():
-        _run(["git", "clone", "https://github.com/ROCm/aiter.git", str(aiter)])
-        _run(["git", "-C", str(aiter), "checkout", "-f", _AITER_COMMIT])
-        for commit in _AITER_CHERRYPICKS:
-            _run(["git", "-C", str(aiter), "cherry-pick", "--no-commit", commit])
-        _patch_aiter_tree(aiter)
-        _run(["git", "-C", str(aiter), "submodule", "update", "--init", "--recursive"])
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [
+            pool.submit(_fetch_shallow_commit, megatron, "https://github.com/radixark/Megatron-LM.git", _MEGATRON_COMMIT),
+            pool.submit(_fetch_shallow_commit, sglang, "https://github.com/sgl-project/sglang.git", _SGLANG_COMMIT),
+            pool.submit(_fetch_aiter_repo, aiter),
+        ]
+        for future in futures:
+            future.result()
+
+    _apply_patch_idempotent(sglang, _SGLANG_PATCH)
 
     _run(
         [
@@ -320,19 +367,23 @@ def _prepare_sources(venv: Path, env: dict[str, str]) -> None:
         env=env,
     )
 
-    aot_dir = sglang / "python/sglang/kernels/aot"
-    wheels = list((aot_dir / "dist").glob("sglang_kernel-*.whl"))
-    if not wheels:
-        pyproject = aot_dir / "pyproject.toml"
-        backup = aot_dir / "pyproject.toml.bak"
-        shutil.copy2(pyproject, backup)
-        try:
-            shutil.copy2(aot_dir / "pyproject_rocm.toml", pyproject)
-            _run([python, "setup_rocm.py", "bdist_wheel"], cwd=aot_dir, env={**env, "MAX_JOBS": "32"})
-        finally:
-            shutil.move(backup, pyproject)
+    has_sgl_kernel = (
+        subprocess.run([python, "-c", "import sgl_kernel"], env=env, capture_output=True).returncode == 0
+    )
+    if not has_sgl_kernel:
+        aot_dir = sglang / "python/sglang/kernels/aot"
         wheels = list((aot_dir / "dist").glob("sglang_kernel-*.whl"))
-    _run([uv, "pip", "install", "--python", python, "--no-deps", str(wheels[0])], env=env)
+        if not wheels:
+            pyproject = aot_dir / "pyproject.toml"
+            backup = aot_dir / "pyproject.toml.bak"
+            shutil.copy2(pyproject, backup)
+            try:
+                shutil.copy2(aot_dir / "pyproject_rocm.toml", pyproject)
+                _run([python, "setup_rocm.py", "bdist_wheel"], cwd=aot_dir, env={**env, "MAX_JOBS": "32"})
+            finally:
+                shutil.move(backup, pyproject)
+            wheels = list((aot_dir / "dist").glob("sglang_kernel-*.whl"))
+        _run([uv, "pip", "install", "--python", python, "--no-deps", str(wheels[0])], env=env)
 
     sgl_py = sglang / "python"
     sgl_pyproject = sgl_py / "pyproject.toml"
@@ -349,6 +400,33 @@ def _prepare_sources(venv: Path, env: dict[str, str]) -> None:
 
     _run([uv, "pip", "install", "--python", python, "--no-deps", "--no-build-isolation", "-e", str(megatron)], env=env)
     _run([uv, "pip", "install", "--python", python, "--no-deps", "--no-build-isolation", "-e", str(_REPO)], env=env)
+
+
+def _sync_remote_host(
+    host: str,
+    *,
+    slmgr_repo: Path,
+    venv: Path,
+    rocm_devel: Path,
+    activate: Path,
+) -> None:
+    _run([
+        "ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no", host,
+        f"git -C {shlex.quote(str(slmgr_repo))} apply --reverse --check {shlex.quote(str(_SLMV3_PATCH))} "
+        f"|| git -C {shlex.quote(str(slmgr_repo))} apply {shlex.quote(str(_SLMV3_PATCH))}",
+    ])
+    _run([
+        "rsync", "-a",
+        "-e", "ssh -o BatchMode=yes -o StrictHostKeyChecking=no",
+        f"{venv}/", f"{host}:{venv}/",
+    ])
+    _run([
+        "ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no", host,
+        f"sudo mkdir -p /usr/lib64 && sudo ln -sf /lib/x86_64-linux-gnu/libc.so /usr/lib64/libc.so "
+        f"&& sudo ln -sfn {shlex.quote(str(rocm_devel))} /opt/rocm "
+        f"&& source {shlex.quote(str(activate))} "
+        f"&& python -c 'import torch, aiter, sglang, sgl_kernel, miles, gin; assert torch.cuda.device_count() == 8'",
+    ])
 
 
 def prepare(*, hosts: list[str], slm_root: Path) -> None:
@@ -384,6 +462,7 @@ def prepare(*, hosts: list[str], slm_root: Path) -> None:
     if core_libs and devel_lib.exists() and not devel_lib.is_symlink():
         devel_lib.unlink()
         devel_lib.symlink_to(core_libs[0])
+    _deduplicate_rocm_sdk_libs(site_packages)
 
     rocm_devel = site_packages / "_rocm_sdk_devel"
     _run(["sudo", "mkdir", "-p", "/usr/lib64"])
@@ -398,27 +477,28 @@ def prepare(*, hosts: list[str], slm_root: Path) -> None:
         if line.strip() and not line.startswith(_SKIP_PREFIXES)
     ]
     _run([uv, "pip", "install", "--python", python, "--no-deps", *pinned], env=env)
-    _run([uv, "pip", "install", "--python", python, "--no-deps", "--no-build-isolation", *_GIT_WHEELS], env=env)
     _prepare_sources(venv, env)
     _run(
         [python, "-c", "import torch, aiter, sglang, sgl_kernel, miles, gin; assert torch.cuda.device_count() == 8"],
         env=env,
     )
 
-    for host in hosts[1:]:
-        _run([
-            "ssh", "-o", "BatchMode=yes", host,
-            f"git -C {shlex.quote(str(slmgr_repo))} apply --reverse --check {shlex.quote(str(_SLMV3_PATCH))} "
-            f"|| git -C {shlex.quote(str(slmgr_repo))} apply {shlex.quote(str(_SLMV3_PATCH))}",
-        ])
-        _run(["rsync", "-a", f"{venv}/", f"{host}:{venv}/"])
-        _run([
-            "ssh", "-o", "BatchMode=yes", host,
-            f"sudo mkdir -p /usr/lib64 && sudo ln -sf /lib/x86_64-linux-gnu/libc.so /usr/lib64/libc.so "
-            f"&& sudo ln -sfn {shlex.quote(str(rocm_devel))} /opt/rocm "
-            f"&& source {shlex.quote(str(activate))} "
-            f"&& python -c 'import torch, aiter, sglang, sgl_kernel, miles, gin; assert torch.cuda.device_count() == 8'",
-        ])
+    remote_hosts = hosts[1:]
+    if remote_hosts:
+        with ThreadPoolExecutor(max_workers=len(remote_hosts)) as pool:
+            futures = [
+                pool.submit(
+                    _sync_remote_host,
+                    host,
+                    slmgr_repo=slmgr_repo,
+                    venv=venv,
+                    rocm_devel=rocm_devel,
+                    activate=activate,
+                )
+                for host in remote_hosts
+            ]
+            for future in futures:
+                future.result()
 
 
 def main() -> None:
