@@ -211,9 +211,14 @@ def _prepare_prompt_data(source: Path, jsonl_alias: Path) -> _PromptData:
     if not isinstance(first, dict) or not isinstance(first.get("query"), str):
         raise ValueError(f"Prompt data must contain either prompt or query fields: {source}")
     jsonl_alias.parent.mkdir(parents=True, exist_ok=True)
-    if jsonl_alias.is_symlink() or jsonl_alias.exists():
-        jsonl_alias.unlink()
-    jsonl_alias.symlink_to(source)
+    if jsonl_alias.is_symlink():
+        if Path(os.readlink(jsonl_alias)) != source and jsonl_alias.resolve() != source:
+            jsonl_alias.unlink()
+            jsonl_alias.symlink_to(source)
+    else:
+        if jsonl_alias.exists():
+            jsonl_alias.unlink()
+        jsonl_alias.symlink_to(source)
     return _PromptData(
         path=jsonl_alias,
         input_key="query",

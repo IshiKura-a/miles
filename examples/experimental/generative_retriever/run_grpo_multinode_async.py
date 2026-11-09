@@ -425,7 +425,8 @@ def _manifest(
     run_dir = output / args.run_id
     checkpoint_dir = run_dir / "checkpoints"
     alias = run_dir / "prompt_data.jsonl"
-    bundle = run_dir / "sglang_bundle"
+    shared_bundle = run_dir / "sglang_bundle"
+    local_bundle = _local_bundle_path(args.run_id)
     count = run_grpo._count_records(prompt)
     if count != _PROMPT_DATASET_ROWS or args.rollout_batch_size * args.num_rollout > count:
         raise ValueError(f"Expected {_PROMPT_DATASET_ROWS} source rows without wrapping, got {count}")
@@ -446,9 +447,16 @@ def _manifest(
         else:
             run_dir.mkdir(parents=True, exist_ok=True)
         run_grpo._prepare_prompt_data(prompt, alias)
+        local_ckpt = stage_local_model_dir(checkpoint, "checkpoint")
+        local_qwen = stage_local_model_dir(qwen, "Qwen model")
         prepare_bundle(
-            checkpoint=checkpoint, qwen_model=qwen, slm_root=slm_root,
-            id_mapping=mapping, output=bundle, num_beams=args.n_samples_per_prompt,
+            checkpoint=local_ckpt, qwen_model=local_qwen, slm_root=slm_root,
+            id_mapping=mapping, output=shared_bundle, num_beams=args.n_samples_per_prompt,
+            num_return_sequences=args.n_samples_per_prompt, temperature=1.0, decoding_mode="beam_sample",
+        )
+        prepare_bundle(
+            checkpoint=local_ckpt, qwen_model=local_qwen, slm_root=slm_root,
+            id_mapping=mapping, output=local_bundle, num_beams=args.n_samples_per_prompt,
             num_return_sequences=args.n_samples_per_prompt, temperature=1.0, decoding_mode="beam_sample",
         )
     return {
@@ -469,7 +477,7 @@ def _manifest(
         "prompt_source": str(prompt),
         "num_rollout": args.num_rollout,
         "train_argv": _train_arguments(
-            args, addresses=addresses, bundle=bundle, prompt=alias,
+            args, addresses=addresses, bundle=local_bundle, prompt=alias,
             reward_url=f"http://{addresses[0]}:{_ROUTER_PORT}",
             checkpoint_dir=checkpoint_dir, resume=resume,
         ),
@@ -700,6 +708,10 @@ def _ray_temp(run_id: str) -> str:
     return f"/tmp/gr_{hashlib.sha256(run_id.encode()).hexdigest()[:12]}"
 
 
+def _local_bundle_path(run_id: str) -> Path:
+    return Path(f"/tmp/gr_bundle_{hashlib.sha256(run_id.encode()).hexdigest()[:12]}")
+
+
 def _prepare_node_assets(manifest: Manifest) -> None:
     os.environ.update(manifest["runtime_env"])
     run_dir = Path(manifest["run_dir"])
@@ -717,12 +729,14 @@ def _prepare_node_assets(manifest: Manifest) -> None:
     if not alias.is_file():
         raise FileNotFoundError(f"Prompt alias is not readable on this node: {alias}")
 
+    local_ckpt = stage_local_model_dir(manifest["checkpoint"], "checkpoint")
+    local_qwen = stage_local_model_dir(manifest["qwen_model"], "Qwen model")
     bundle = prepare_bundle(
-        checkpoint=manifest["checkpoint"],
-        qwen_model=manifest["qwen_model"],
+        checkpoint=local_ckpt,
+        qwen_model=local_qwen,
         slm_root=manifest["slm_root"],
         id_mapping=manifest["mapping"],
-        output=run_dir / "sglang_bundle",
+        output=_local_bundle_path(manifest["run_id"]),
         num_beams=_SAMPLES_PER_PROMPT,
         num_return_sequences=_SAMPLES_PER_PROMPT,
         temperature=1.0,
@@ -731,8 +745,6 @@ def _prepare_node_assets(manifest: Manifest) -> None:
     for name in ("config.json", "tokenizer.json", "pytorch_model.bin.index.json"):
         if not (bundle / name).is_file():
             raise FileNotFoundError(f"Model bundle asset is not readable on this node: {bundle / name}")
-    stage_local_model_dir(manifest["checkpoint"], "checkpoint")
-    stage_local_model_dir(manifest["qwen_model"], "Qwen model")
 
 
 def _check_miles_checkouts(hosts: list[str]) -> None:

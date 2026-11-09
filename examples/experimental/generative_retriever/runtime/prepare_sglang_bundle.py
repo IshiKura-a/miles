@@ -100,10 +100,10 @@ def prepare_bundle(
         "num_return_sequences": num_return_sequences,
         "decoding_mode": decoding_mode,
     }
-    (output_path / "config.json").write_text(
-        json.dumps(config, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    rendered_config = json.dumps(config, indent=2, sort_keys=True) + "\n"
+    config_target = output_path / "config.json"
+    if not config_target.is_file() or config_target.read_text(encoding="utf-8") != rendered_config:
+        config_target.write_text(rendered_config, encoding="utf-8")
 
     for filename in _QWEN_ASSETS:
         source = qwen_path / filename
