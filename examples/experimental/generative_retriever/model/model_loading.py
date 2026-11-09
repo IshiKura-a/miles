@@ -20,6 +20,22 @@ from torch.distributed.checkpoint.state_dict_loader import load
 
 _POLICY_HEAD_PREFIXES = ("docEnc2decoder.", "decoder.", "lm_head.")
 _WEIGHT_SUFFIXES = (".bin", ".safetensors", ".pt", ".pth", ".onnx", ".tar")
+_STAGE_ASSETS = (
+    "added_tokens.json",
+    "chat_template.jinja",
+    "chat_template.json",
+    "config.json",
+    "customized_preprocess_fill_prompt.py",
+    "generation_config.json",
+    "merges.txt",
+    "model.safetensors.index.json",
+    "pytorch_model.bin.index.json",
+    "special_tokens_map.json",
+    "spiece.model",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "vocab.json",
+)
 
 
 def require_directory(path: str | Path, name: str) -> Path:
@@ -45,14 +61,19 @@ def stage_local_model_dir(path: str | Path, name: str) -> Path:
     staging = local_root / f".gr_model_{resolved.name}_{digest}.{os.getpid()}"
     shutil.rmtree(staging, ignore_errors=True)
     staging.mkdir(parents=True, exist_ok=True)
-    for entry in sorted(resolved.iterdir()):
-        dst = staging / entry.name
-        if entry.is_dir():
-            dst.symlink_to(entry)
-        elif entry.suffix.lower() in _WEIGHT_SUFFIXES or entry.stat().st_size > 64 * 1024 * 1024:
-            dst.symlink_to(entry)
-        else:
-            shutil.copy2(entry, dst)
+    for asset_name in _STAGE_ASSETS:
+        src = resolved / asset_name
+        if src.is_file():
+            shutil.copy2(src, staging / asset_name)
+    for index_name in ("pytorch_model.bin.index.json", "model.safetensors.index.json"):
+        idx_file = staging / index_name
+        if idx_file.is_file():
+            with idx_file.open(encoding="utf-8") as handle:
+                weight_map = json.load(handle).get("weight_map", {})
+            for shard_name in sorted(set(weight_map.values())):
+                dst = staging / shard_name
+                if not dst.exists() and not dst.is_symlink():
+                    dst.symlink_to(resolved / shard_name)
     sentinel.parent.mkdir(parents=True, exist_ok=True)
     (staging / ".staged_ok").write_text(os.fspath(resolved) + "\n", encoding="utf-8")
     try:
