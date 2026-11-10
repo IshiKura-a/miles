@@ -5,14 +5,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-from collections import deque
-from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any
 from weakref import WeakKeyDictionary
 
 import httpx
 
-from miles.rollout.base_types import GenerateFnInput, GenerateFnOutput
+from miles.rollout.base_types import BaseGroupGenerateFn, GenerateFnInput, GenerateFnOutput
 from miles.utils.http_utils import GeneralHttpClientProvider
 from miles.utils.types import Sample
 from examples.experimental.generative_retriever.reward.relevance_reward import (
@@ -24,11 +22,14 @@ from examples.experimental.generative_retriever.reward.relevance_reward import (
     RQ_CODE_DIM,
     RQ_CODE_NUM,
 )
-from examples.experimental.generative_retriever.reward.reward_http import post_json_async
+from examples.experimental.generative_retriever.reward.reward_http import (
+    AsyncRequestBatcher,
+    PendingBatchRequest,
+    post_json_async,
+)
 
-_REQUESTS_BY_STATE: WeakKeyDictionary[Any, dict[Any, Any]] = WeakKeyDictionary()
 _PREPARE_BATCHERS: WeakKeyDictionary[
-    asyncio.AbstractEventLoop, dict[tuple[str, float, int], _BaselinePrepareBatcher]
+    asyncio.AbstractEventLoop, dict[tuple[str, float, int], BaselinePrepareBatcher]
 ] = WeakKeyDictionary()
 _DOCID_SIZE = RQ_CODE_NUM
 _DOCID_DIM = RQ_CODE_DIM
@@ -40,89 +41,52 @@ _RETRY_DELAY_SECONDS = 0.5
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class _PendingPrepare:
-    query: str
-    future: asyncio.Future[dict[str, float]]
-
-
-class _BaselinePrepareBatcher:
+class BaselinePrepareBatcher(AsyncRequestBatcher[str, dict[str, float]]):
     def __init__(self, url: str, timeout_seconds: float, concurrency: int) -> None:
-        if concurrency <= 0:
-            raise ValueError("Baseline prepare concurrency must be positive")
+        super().__init__(
+            max_batch_size=_MAX_PREPARE_QUERIES,
+            concurrency=concurrency,
+            batch_wait_seconds=_PREPARE_BATCH_WAIT_SECONDS,
+        )
         self._url = url
         self._timeout_seconds = timeout_seconds
-        self._slots = asyncio.Semaphore(concurrency)
-        self._requests: set[asyncio.Task[None]] = set()
-        self._pending: deque[_PendingPrepare] = deque()
-        self._flush_task: asyncio.Task[None] | None = None
 
     async def submit(self, query: str) -> dict[str, float]:
-        future = asyncio.get_running_loop().create_future()
-        self._pending.append(_PendingPrepare(query=query, future=future))
-        if self._flush_task is None:
-            self._flush_task = asyncio.create_task(self._flush())
-        return await future
+        return await self.submit_weighted(query, weight=1)
 
-    async def _flush(self) -> None:
-        try:
-            while self._pending:
-                await asyncio.sleep(_PREPARE_BATCH_WAIT_SECONDS)
-                await self._slots.acquire()
-                requests = [
-                    self._pending.popleft()
-                    for _ in range(min(len(self._pending), _MAX_PREPARE_QUERIES))
-                ]
-                task = asyncio.create_task(self._dispatch(requests))
-                self._requests.add(task)
-                task.add_done_callback(self._requests.discard)
-        finally:
-            self._flush_task = None
-            if self._pending:
-                self._flush_task = asyncio.create_task(self._flush())
-
-    async def _dispatch(self, requests: list[_PendingPrepare]) -> None:
-        try:
-            metrics = await self._post(requests)
-            for index, request in enumerate(requests):
-                if not request.future.done():
-                    request.future.set_result(metrics if index == 0 else {})
-        except asyncio.CancelledError:
-            for request in requests:
-                request.future.cancel()
-            raise
-        except Exception as error:
-            for request in requests:
-                if not request.future.done():
-                    request.future.set_exception(error)
-        finally:
-            self._slots.release()
-
-    async def _post(self, requests: list[_PendingPrepare]) -> dict[str, float]:
-        queries = list(dict.fromkeys(request.query for request in requests))
+    async def execute_batch(
+        self,
+        requests: list[PendingBatchRequest[str, dict[str, float]]],
+    ) -> None:
+        queries = list(dict.fromkeys(request.payload for request in requests))
         payload = await post_json_async(
-            self._url, {"queries": queries}, timeout=self._timeout_seconds,
+            self._url,
+            {"queries": queries},
+            timeout=self._timeout_seconds,
         )
         if payload.get("prepared_queries") != len(queries):
             raise ValueError("Reward prepare endpoint returned an unexpected query count")
-        return _prepare_metrics(payload)
+        metrics = parse_prepare_metrics(payload)
+        for index, request in enumerate(requests):
+            if not request.future.done():
+                request.future.set_result(metrics if index == 0 else {})
 
 
-def _get_prepare_batcher(
+def get_prepare_batcher(
     url: str, timeout_seconds: float, concurrency: int,
-) -> _BaselinePrepareBatcher:
+) -> BaselinePrepareBatcher:
     loop = asyncio.get_running_loop()
     batchers = _PREPARE_BATCHERS.setdefault(loop, {})
     key = (url, timeout_seconds, concurrency)
     batcher = batchers.get(key)
     if batcher is None:
-        batcher = _BaselinePrepareBatcher(url, timeout_seconds, concurrency)
+        batcher = BaselinePrepareBatcher(url, timeout_seconds, concurrency)
         batchers[key] = batcher
     return batcher
 
 
-def _prepare_metrics(payload: dict[str, Any]) -> dict[str, float]:
-    metrics = {}
+def parse_prepare_metrics(payload: dict[str, Any]) -> dict[str, float]:
+    metrics: dict[str, float] = {}
 
     def collect(prefix: str, values: Any) -> None:
         if not isinstance(values, dict):
@@ -145,7 +109,7 @@ def _prepare_metrics(payload: dict[str, Any]) -> dict[str, float]:
     return metrics
 
 
-def _add_arguments(parser) -> None:
+def add_arguments(parser: Any) -> None:
     parser.set_defaults(wandb_always_use_train_step=True)
     parser.add_argument(
         "--generative-retriever-reward-mode", choices=REWARD_MODES,
@@ -178,7 +142,7 @@ def _add_arguments(parser) -> None:
     parser.add_argument("--generative-retriever-prepare-concurrency", type=int, default=1)
 
 
-def _parse_embedding(
+def parse_embedding(
     output: dict[str, Any],
     docid_size: int,
     docid_dim: int,
@@ -211,12 +175,11 @@ def _parse_embedding(
     return token_ids, logprobs
 
 
-async def _resolve_engine_url(args: Any, sample: Sample) -> str:
-    del sample
+def resolve_engine_url(args: Any) -> str:
     return f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
 
 
-async def _request_embedding(args: Any, router_url: str, prompt_ids: list[int]) -> dict[str, Any]:
+async def request_embedding(args: Any, router_url: str, prompt_ids: list[int]) -> dict[str, Any]:
     attempt = 1
     while True:
         try:
@@ -248,18 +211,18 @@ async def _request_embedding(args: Any, router_url: str, prompt_ids: list[int]) 
     return {"embedding": embedding}
 
 
-async def _request_embedding_and_prepare(
+async def request_embedding_and_prepare(
     args: Any,
     router_url: str,
     prompt_ids: list[int],
     query: str,
 ) -> tuple[dict[str, Any], dict[str, float]]:
-    prepare_url = getattr(args, "generative_retriever_reward_prepare_url", None)
+    prepare_url = args.generative_retriever_reward_prepare_url
     if not prepare_url:
         raise ValueError("--generative-retriever-reward-prepare-url is required")
     embedding, prepare_metrics = await asyncio.gather(
-        _request_embedding(args, router_url, prompt_ids),
-        _get_prepare_batcher(
+        request_embedding(args, router_url, prompt_ids),
+        get_prepare_batcher(
             prepare_url,
             args.generative_retriever_reward_timeout,
             args.generative_retriever_prepare_concurrency,
@@ -268,10 +231,10 @@ async def _request_embedding_and_prepare(
     return embedding, prepare_metrics
 
 
-def _training_prompt_ids(state: Any, sample: Sample) -> list[int]:
-    if not isinstance(sample.prompt, str) or not sample.prompt.strip():
+def encode_training_prompt(state: Any, query: str) -> list[int]:
+    if not isinstance(query, str) or not query.strip():
         raise ValueError("GR rollout requires a non-empty query string prompt")
-    query_ids = state.tokenizer.encode(sample.prompt, add_special_tokens=False)[:QUERY_MAX_TOKENS]
+    query_ids = state.tokenizer.encode(query, add_special_tokens=False)[:QUERY_MAX_TOKENS]
     truncated_query = state.tokenizer.decode(query_ids)
     instruction = f'Given the user Query: "{truncated_query}", summarize it in one token:'
     prompt = state.tokenizer.apply_chat_template(
@@ -282,70 +245,135 @@ def _training_prompt_ids(state: Any, sample: Sample) -> list[int]:
     return list(state.tokenizer.encode(prompt, add_special_tokens=False))
 
 
-async def generate(input: GenerateFnInput) -> GenerateFnOutput:
-    args = input.args
-    sample = input.sample
-    if sample.status not in {Sample.Status.PENDING, Sample.Status.ABORTED}:
-        raise ValueError(f"generative retriever received sample with status {sample.status!r}")
-    if sample.response or sample.response_length:
-        raise ValueError("GR SGLang /encode rollout is single-turn and cannot continue a partial response")
-
-    query = sample.prompt
-    if not isinstance(query, str):
-        raise TypeError("GR rollout query must be a string")
-    engine_url = await _resolve_engine_url(args, sample)
-    group_size = args.n_samples_per_prompt
-    if sample.index is None:
-        raise ValueError("Constrained beam rollout requires sample.index")
-    if not input.evaluation and sample.group_index is None:
-        raise ValueError("Constrained training rollout requires sample.group_index")
-    beam_rank = 0 if input.evaluation else sample.index % group_size
-    requests = _REQUESTS_BY_STATE.setdefault(input.state, {})
-    group_key = sample.index if input.evaluation else sample.group_index
-    key = (input.evaluation, group_key, engine_url, query)
-    if key not in requests:
-        prompt_ids = _training_prompt_ids(input.state, sample)
-        requests[key] = (
-            asyncio.create_task(
-                _request_embedding_and_prepare(
-                    args,
-                    engine_url,
-                    prompt_ids,
-                    query,
-                )
-            ),
-            set(),
-            prompt_ids,
-        )
-    task, consumed, prompt_ids = requests[key]
-    try:
-        output, prepare_metrics = await asyncio.shield(task)
-    finally:
-        if task.done() and (task.cancelled() or task.exception() is not None):
-            requests.pop(key, None)
-    consumed.add(beam_rank)
-    if input.evaluation or len(consumed) == group_size:
-        requests.pop(key, None)
-    docid_size = _DOCID_SIZE
-    docid_dim = _DOCID_DIM
-    token_ids, logprobs = _parse_embedding(output, docid_size, docid_dim, group_size, beam_rank)
-
+def populate_beam_sample(
+    sample: Sample,
+    *,
+    prompt_ids: list[int],
+    output: dict[str, Any],
+    group_size: int,
+    beam_rank: int,
+    prepare_metrics: dict[str, float],
+) -> None:
+    token_ids, logprobs = parse_embedding(
+        output, _DOCID_SIZE, _DOCID_DIM, group_size, beam_rank,
+    )
+    positional_docid = [token_id - DOCID_TOKEN_OFFSET for token_id in token_ids]
     sample.tokens = prompt_ids + token_ids
-    sample.response_length = docid_size
+    sample.response_length = _DOCID_SIZE
     sample.rollout_log_probs = logprobs
-    sample.response = ",".join(str(token_id - 2) for token_id in token_ids)
+    sample.response = ",".join(str(code) for code in positional_docid)
     sample.status = Sample.Status.COMPLETED
     metadata = sample.metadata.setdefault("generative_retriever", {})
     metadata["docid_tokens"] = token_ids
     metadata["beam_rank"] = beam_rank
-    metadata["positional_docid"] = [token_id - 2 for token_id in token_ids]
+    metadata["positional_docid"] = positional_docid
     metadata["rq_codes"] = [
-        token_id - 2 - position * docid_dim
-        for position, token_id in enumerate(token_ids)
+        code - position * _DOCID_DIM
+        for position, code in enumerate(positional_docid)
     ]
     if beam_rank == 0 and prepare_metrics:
         metadata["prepare_metrics"] = prepare_metrics
-    return GenerateFnOutput(samples=sample)
 
 
-cast(Any, generate).add_arguments = _add_arguments
+def validate_pending_sample(sample: Sample, *, evaluation: bool) -> str:
+    if sample.status not in {Sample.Status.PENDING, Sample.Status.ABORTED}:
+        raise ValueError(f"generative retriever received sample with status {sample.status!r}")
+    if sample.response or sample.response_length:
+        raise ValueError("GR SGLang /encode rollout is single-turn and cannot continue a partial response")
+    if not isinstance(sample.prompt, str):
+        raise TypeError("GR rollout query must be a string")
+    if sample.index is None:
+        raise ValueError("Constrained beam rollout requires sample.index")
+    if not evaluation and sample.group_index is None:
+        raise ValueError("Constrained training rollout requires sample.group_index")
+    return sample.prompt
+
+
+async def generate_group_samples(
+    state: Any,
+    group: list[Sample],
+    *,
+    evaluation: bool,
+) -> list[Sample]:
+    args = state.args
+    group_size = args.n_samples_per_prompt
+    if len(group) != group_size:
+        raise ValueError(f"Expected group of {group_size} samples, got {len(group)}")
+    first = group[0]
+    query = validate_pending_sample(first, evaluation=evaluation)
+    for beam_rank, sample in enumerate(group):
+        if validate_pending_sample(sample, evaluation=evaluation) != query:
+            raise ValueError("All samples in a GR query group must share the same prompt")
+        if not evaluation and sample.group_index != first.group_index:
+            raise ValueError("All samples in a GR query group must share group_index")
+        if not evaluation and sample.index % group_size != beam_rank:
+            raise ValueError(f"Expected beam rank {beam_rank}, got sample.index={sample.index}")
+
+    prompt_ids = encode_training_prompt(state, query)
+    output, prepare_metrics = await request_embedding_and_prepare(
+        args,
+        resolve_engine_url(args),
+        prompt_ids,
+        query,
+    )
+    for beam_rank, sample in enumerate(group):
+        populate_beam_sample(
+            sample,
+            prompt_ids=prompt_ids,
+            output=output,
+            group_size=group_size,
+            beam_rank=0 if evaluation else beam_rank,
+            prepare_metrics=prepare_metrics,
+        )
+    return group
+
+
+async def generate_single_sample(
+    state: Any,
+    sample: Sample,
+    *,
+    evaluation: bool,
+) -> Sample:
+    args = state.args
+    group_size = args.n_samples_per_prompt
+    query = validate_pending_sample(sample, evaluation=evaluation)
+    assert sample.index is not None
+    beam_rank = 0 if evaluation else sample.index % group_size
+    prompt_ids = encode_training_prompt(state, query)
+    output, prepare_metrics = await request_embedding_and_prepare(
+        args,
+        resolve_engine_url(args),
+        prompt_ids,
+        query,
+    )
+    populate_beam_sample(
+        sample,
+        prompt_ids=prompt_ids,
+        output=output,
+        group_size=group_size,
+        beam_rank=beam_rank,
+        prepare_metrics=prepare_metrics,
+    )
+    return sample
+
+
+class GRGroupGenerateFn(BaseGroupGenerateFn):
+    add_arguments = staticmethod(add_arguments)
+
+    async def __call__(self, input: GenerateFnInput) -> GenerateFnOutput:
+        if isinstance(input.sample, list):
+            samples = await generate_group_samples(
+                input.state,
+                input.sample,
+                evaluation=input.evaluation,
+            )
+            return GenerateFnOutput(samples=samples)
+        sample = await generate_single_sample(
+            input.state,
+            input.sample,
+            evaluation=input.evaluation,
+        )
+        return GenerateFnOutput(samples=sample)
+
+
+generate = GRGroupGenerateFn()

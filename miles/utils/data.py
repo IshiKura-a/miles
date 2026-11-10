@@ -275,10 +275,15 @@ class Dataset:
 
 
 def get_minimum_num_micro_batch_size(total_lengths, max_tokens_per_gpu):
-    # use first fit to get the number of micro batches
+    if not total_lengths:
+        return 0
+    min_length = min(total_lengths)
     batches = []
+    first_open = 0
     for length in total_lengths:
-        for i in range(len(batches)):
+        while first_open < len(batches) and batches[first_open] + min_length > max_tokens_per_gpu:
+            first_open += 1
+        for i in range(first_open, len(batches)):
             if batches[i] + length <= max_tokens_per_gpu:
                 batches[i] += length
                 break

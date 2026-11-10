@@ -86,7 +86,7 @@ class BaseRolloutFn(abc.ABC):
 @dataclass(frozen=True)
 class GenerateFnInput:
     state: GenerateState
-    sample: Sample
+    sample: Sample | list[Sample]
     sampling_params: dict[str, Any]
     evaluation: bool
 
@@ -100,6 +100,14 @@ class GenerateFnOutput:
     # One generate may lead to multiple samples, such as multi-agent, tree-like exploration, or
     # multi-turn with removing thinking tokens.
     samples: Sample | list[Sample]
+
+
+class BaseGroupGenerateFn(abc.ABC):
+    """Base class for generate functions that generate a whole prompt group in one call."""
+
+    @abc.abstractmethod
+    async def __call__(self, input: GenerateFnInput) -> GenerateFnOutput:
+        raise NotImplementedError
 
 
 def call_rollout_fn(fn, *args, evaluation: bool, **kwargs):

@@ -96,6 +96,20 @@ def submit_generate_tasks(
     ]
 
 
+def group_submission_budget(
+    args: Namespace,
+    target_data_size: int,
+    completed_groups: int,
+    pending_groups: int,
+) -> tuple[int, int]:
+    remaining_groups = target_data_size - completed_groups
+    if args.rollout_max_in_flight_groups is None:
+        return remaining_groups, args.over_sampling_batch_size
+    group_budget = min(remaining_groups, args.rollout_max_in_flight_groups)
+    batch_size = min(args.over_sampling_batch_size, max(1, group_budget - pending_groups))
+    return group_budget, batch_size
+
+
 async def generate_rollout_async(
     state: GenerateState, rollout_id: int, data_source: Callable[[int], list[list[Sample]]]
 ) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
@@ -121,9 +135,14 @@ async def generate_rollout_async(
     do_print = True
     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Rollout generation")
     while len(data) < target_data_size:
-        while scheduler.has_capacity(pending_groups=len(pendings), group_budget=target_data_size - len(data)):
+        while True:
+            group_budget, batch_size = group_submission_budget(
+                args, target_data_size, len(data), len(pendings)
+            )
+            if not scheduler.has_capacity(pending_groups=len(pendings), group_budget=group_budget):
+                break
             # get samples from the buffer and submit the generation requests.
-            samples = data_source(args.over_sampling_batch_size)
+            samples = data_source(batch_size)
             scheduler.on_submit(samples)
             pendings.update(submit_generate_tasks(state, samples, scheduler.sample_done_callback))
 

@@ -21,6 +21,7 @@ from examples.experimental.generative_retriever.reward.relevance_reward import (
 _QUERIES_PER_STEP = 4000
 _GLOBAL_BATCH_SIZE = _QUERIES_PER_STEP * DEFAULT_TRAIN_GROUP_SIZE
 _MAX_STEPS = PROMPT_DATASET_ROWS // _QUERIES_PER_STEP
+_IN_FLIGHT_GROUPS = 512
 _REWARD_DEVICES = tuple(f"cuda:{i}" for i in range(8))
 
 
@@ -68,6 +69,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     sglang_mem_fraction_static: float = 0.0
     sglang_server_concurrency: int = 8192
     rollout_batch_size: int = _QUERIES_PER_STEP
+    rollout_max_in_flight_groups: int = _IN_FLIGHT_GROUPS
     n_samples_per_prompt: int = DEFAULT_TRAIN_GROUP_SIZE
     global_batch_size: int = _GLOBAL_BATCH_SIZE
     max_tokens_per_gpu: int = 131072

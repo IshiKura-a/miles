@@ -7,6 +7,7 @@ from copy import deepcopy
 from typing import Any
 
 from miles.rollout.base_types import (
+    BaseGroupGenerateFn,
     BaseRolloutFn,
     GenerateFnInput,
     RolloutFnConstructorInput,
@@ -135,6 +136,59 @@ async def generate_and_rm(
     return sample
 
 
+async def generate_and_rm_whole_group(
+    state: GenerateState,
+    generate_function: BaseGroupGenerateFn,
+    group: list[Sample],
+    sampling_params: dict[str, Any],
+    evaluation: bool = False,
+    sample_done_callback: Callable[[], None] | None = None,
+) -> list[Sample]:
+    args = state.args
+    sink = None if evaluation else TrajectoryLifecycle().sink
+    if sink is not None:
+        for sample in group:
+            sink.attempt_start(sample)
+
+    try:
+        try:
+            async with state.generate_fn_semaphore:
+                if state.aborted:
+                    for sample in group:
+                        sample.status = Sample.Status.ABORTED
+                    return group
+
+                if sink is not None:
+                    for sample in group:
+                        sink.gen_start(sample)
+                output = await generate_function(
+                    GenerateFnInput(
+                        state=state,
+                        sample=group,
+                        sampling_params=deepcopy(sampling_params),
+                        evaluation=evaluation,
+                    )
+                )
+                assert isinstance(output.samples, list), "group generate_function must return list[Sample]"
+                group = output.samples
+        finally:
+            if sink is not None:
+                for sample in group:
+                    sink.attempt_end(sample)
+
+        if state.aborted or any(sample.status == Sample.Status.ABORTED for sample in group):
+            return group
+
+        samples_need_reward = [sample for sample in group if sample.reward is None]
+        if samples_need_reward:
+            await batched_async_rm(args, samples_need_reward, inplace_set_reward_field=True)
+        return group
+    finally:
+        if sample_done_callback is not None:
+            for _ in group:
+                sample_done_callback()
+
+
 async def generate_and_rm_group(
     state: GenerateState,
     group: list[Sample],
@@ -152,7 +206,17 @@ async def generate_and_rm_group(
             if sample.routing_key is None:
                 sample.routing_key = str(uuid.uuid4())
 
-    log_prefix = f"[group indices={[getattr(s, 'index', '?') for s in group]}]"
+    if isinstance(state.generate_function, BaseGroupGenerateFn):
+        return await generate_and_rm_whole_group(
+            state,
+            state.generate_function,
+            group,
+            sampling_params,
+            evaluation=evaluation,
+            sample_done_callback=sample_done_callback,
+        )
+
+    log_prefix = f"[group indices={[s.index for s in group]}]"
     logger.debug(f"{log_prefix} Starting group with {len(group)} samples")
     tasks = []
     for idx, sample in enumerate(group):

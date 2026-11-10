@@ -11,6 +11,7 @@ import httpx
 import torch
 
 from miles.rollout.data_source import RolloutDataSourceWithBuffer
+from miles.utils.types import Sample
 
 
 class GRRolloutDataSource(RolloutDataSourceWithBuffer):
@@ -20,7 +21,46 @@ class GRRolloutDataSource(RolloutDataSourceWithBuffer):
         super().__init__(args)
         self.pending_mapping_checkpoints: list[int] = []
 
-    def _completed_position(self, rollout_id: int) -> int:
+    def get_samples(self, num_samples: int) -> list[list[Sample]]:
+        samples = self._get_samples_from_buffer(num_samples)
+        remaining = num_samples - len(samples)
+        if remaining == 0:
+            return samples
+        if self.dataset is None:
+            raise ValueError("GR rollout requires a global prompt dataset")
+        if self.sample_offset + remaining <= len(self.dataset):
+            prompt_samples = self.dataset.samples[self.sample_offset : self.sample_offset + remaining]
+            self.sample_offset += remaining
+        else:
+            prompt_samples = self.dataset.samples[self.sample_offset :]
+            remaining -= len(prompt_samples)
+            self.epoch_id += 1
+            if self.args.rollout_shuffle:
+                self.dataset.shuffle(self.epoch_id)
+            prompt_samples += self.dataset.samples[:remaining]
+            self.sample_offset = remaining
+
+        group_size = self.args.n_samples_per_prompt
+        for prompt_sample in prompt_samples:
+            group_index = self.sample_group_index
+            base_index = self.sample_index
+            base_metadata = prompt_sample.metadata
+            group = [
+                Sample(
+                    group_index=group_index,
+                    index=base_index + rank,
+                    prompt=prompt_sample.prompt,
+                    label=prompt_sample.label,
+                    metadata=dict(base_metadata) if base_metadata else {},
+                )
+                for rank in range(group_size)
+            ]
+            self.sample_group_index += 1
+            self.sample_index += group_size
+            samples.append(group)
+        return samples
+
+    def completed_position(self, rollout_id: int) -> int:
         if self.dataset is None:
             raise ValueError("GR resume requires a global prompt dataset")
         position = (rollout_id + 1) * self.args.rollout_batch_size
@@ -29,7 +69,7 @@ class GRRolloutDataSource(RolloutDataSourceWithBuffer):
         return position
 
     def save(self, rollout_id: int) -> None:
-        position = self._completed_position(rollout_id)
+        position = self.completed_position(rollout_id)
         if self.epoch_id != 0 or self.sample_offset < position or self.buffer:
             raise ValueError("GR rollout cannot checkpoint a wrapped or buffered prompt dataset")
         save_root = absolute_path(self.args.save)
@@ -69,7 +109,7 @@ class GRRolloutDataSource(RolloutDataSourceWithBuffer):
         if not path.is_file():
             raise FileNotFoundError(f"GR rollout checkpoint is missing: {path}")
         super().load(rollout_id)
-        position = self._completed_position(rollout_id)
+        position = self.completed_position(rollout_id)
         if self.epoch_id != 0 or self.sample_offset < position or self.buffer:
             raise ValueError("GR rollout checkpoint has an invalid prompt cursor")
         self.sample_offset = self.sample_group_index = position

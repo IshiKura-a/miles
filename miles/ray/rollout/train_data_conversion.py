@@ -222,7 +222,24 @@ def _normalize_rewards_by_rollout(
         return []
 
     normalized_rewards = torch.empty(len(raw_rewards), dtype=torch.float)
+    has_compacted_rollouts = any(sample.rollout_id is not None for sample in samples)
     for prompt_segments in _reward_group_segments(args, samples, prompt_group_sizes):
+        if not has_compacted_rollouts:
+            rollout_rewards = torch.tensor(
+                [raw_rewards[segment_index] for segment_index in prompt_segments],
+                dtype=torch.float,
+            )
+            normalized_rollout_rewards = rollout_rewards - rollout_rewards.mean()
+            if args.advantage_estimator in ["grpo", "gspo"] and args.grpo_std_normalization and len(rollout_rewards) > 1:
+                rollout_std = rollout_rewards.std()
+                if rollout_std > 0:
+                    normalized_rollout_rewards = normalized_rollout_rewards / (rollout_std + 1e-6)
+            for segment_index, normalized_reward in zip(
+                prompt_segments, normalized_rollout_rewards.tolist(), strict=True
+            ):
+                normalized_rewards[segment_index] = normalized_reward
+            continue
+
         segments_by_rollout_key: dict[int | tuple[str, int], list[int]] = {}
         for segment_index in prompt_segments:
             sample = samples[segment_index]

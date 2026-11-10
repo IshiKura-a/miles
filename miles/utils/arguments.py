@@ -709,6 +709,16 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "and, without --partial-rollout, discarded."
                 ),
             )
+            parser.add_argument(
+                "--rollout-max-in-flight-groups",
+                type=int,
+                default=None,
+                help=(
+                    "Maximum number of prompt groups concurrently in flight during rollout generation. "
+                    "When set, bounds the active group window and backfills as groups finish without "
+                    "changing rollout_batch_size or global_batch_size."
+                ),
+            )
 
             # partial rollout
             parser.add_argument(
@@ -3516,6 +3526,11 @@ def miles_validate_args(args):
             f"over_sampling_batch_size {args.over_sampling_batch_size} should be greater than or equal to "
             f"rollout_batch_size {args.rollout_batch_size}"
         )
+
+        if args.rollout_max_in_flight_groups is not None:
+            assert args.rollout_max_in_flight_groups >= 1, (
+                f"--rollout-max-in-flight-groups ({args.rollout_max_in_flight_groups}) must be positive"
+            )
 
         if args.num_epoch is not None:
             if args.num_rollout is not None:

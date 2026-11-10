@@ -29,6 +29,7 @@ def make_args(**overrides) -> Namespace:
         n_samples_per_prompt=GROUP_SIZE,
         over_sampling_batch_size=1,
         rollout_submission_granularity=None,
+        rollout_max_in_flight_groups=None,
         sglang_router_policy="round_robin",
         dynamic_sampling_filter_path=None,
         reward_key=None,

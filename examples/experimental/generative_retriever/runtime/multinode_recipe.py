@@ -28,6 +28,7 @@ REWARD_NODES_PER_PAIR = 2
 
 # Batch size and step limit scale with the number of node pairs.
 QUERIES_PER_STEP_PER_PAIR = 8_000
+IN_FLIGHT_GROUPS_PER_PAIR = 1_024
 SAMPLES_PER_PROMPT = DEFAULT_TRAIN_GROUP_SIZE
 MAX_STEPS_PER_PAIR = PROMPT_DATASET_ROWS // QUERIES_PER_STEP_PER_PAIR
 
@@ -58,6 +59,7 @@ def build_multinode_recipe(run_id: str, pairs: int, num_rollout: int) -> ScriptA
         run_id=run_id,
         num_rollout=num_rollout,
         rollout_batch_size=QUERIES_PER_STEP_PER_PAIR * pairs,
+        rollout_max_in_flight_groups=IN_FLIGHT_GROUPS_PER_PAIR * pairs,
         n_samples_per_prompt=SAMPLES_PER_PROMPT,
         global_batch_size=QUERIES_PER_STEP_PER_PAIR * SAMPLES_PER_PROMPT * pairs,
         actor_num_gpus_per_node=_LEARNER_GPUS_PER_NODE,
@@ -112,6 +114,7 @@ def build_multinode_train_args(
             "--generative-retriever-prepare-concurrency", str(args.prepare_concurrency),
             "--num-rollout", str(args.num_rollout),
             "--rollout-batch-size", str(args.rollout_batch_size),
+            "--rollout-max-in-flight-groups", str(args.rollout_max_in_flight_groups),
             "--n-samples-per-prompt", str(args.n_samples_per_prompt),
             "--rollout-max-response-len", "4",
             "--rollout-temperature", str(args.temperature),

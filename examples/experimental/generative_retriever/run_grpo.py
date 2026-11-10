@@ -384,9 +384,9 @@ def execute(args: ScriptArgs) -> None:
         raise ValueError("reward_timeout must be positive")
     if min(
         args.reward_batch_size, args.reward_request_concurrency, args.prepare_concurrency,
-        args.reward_forward_concurrency,
+        args.reward_forward_concurrency, args.rollout_max_in_flight_groups,
     ) <= 0:
-        raise ValueError("Reward batch and concurrency settings must be positive")
+        raise ValueError("Reward batch, concurrency, and in-flight group settings must be positive")
     if args.max_tokens_per_gpu <= 0:
         raise ValueError("max_tokens_per_gpu must be positive")
     if args.sglang_server_concurrency < args.n_samples_per_prompt:
@@ -529,6 +529,7 @@ def execute(args: ScriptArgs) -> None:
             f"--generative-retriever-prepare-concurrency {args.prepare_concurrency} "
             f"--num-rollout {args.num_rollout} "
             f"--rollout-batch-size {args.rollout_batch_size} "
+            f"--rollout-max-in-flight-groups {args.rollout_max_in_flight_groups} "
             f"--n-samples-per-prompt {args.n_samples_per_prompt} "
             "--rollout-max-response-len 4 "
             f"--rollout-temperature {args.temperature} "

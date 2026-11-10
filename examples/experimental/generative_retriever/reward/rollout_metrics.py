@@ -15,7 +15,7 @@ from examples.experimental.generative_retriever.reward.relevance_reward import (
 )
 
 
-def _mean_top_k(values: list[float], k: int) -> float:
+def mean_top_k(values: list[float], k: int) -> float:
     if not values:
         return 0.0
     if len(values) <= k:
@@ -52,9 +52,9 @@ def apply_hierarchical_tree_credit(args: Any, samples: list[Any]) -> None:
             by_p1[(d[0], d[1])].append(r)
             by_p2[(d[0], d[1], d[2])].append(r)
         k0, k1, k2 = TREE_CREDIT_TOP_K
-        v0_map = {k: _mean_top_k(v, k0) for k, v in by_p0.items()}
-        v1_map = {k: _mean_top_k(v, k1) for k, v in by_p1.items()}
-        v2_map = {k: _mean_top_k(v, k2) for k, v in by_p2.items()}
+        v0_map = {k: mean_top_k(v, k0) for k, v in by_p0.items()}
+        v1_map = {k: mean_top_k(v, k1) for k, v in by_p1.items()}
+        v2_map = {k: mean_top_k(v, k2) for k, v in by_p2.items()}
         for sample, d, r in items:
             v0 = v0_map[d[0]]
             v1 = v1_map[(d[0], d[1])]
@@ -63,7 +63,7 @@ def apply_hierarchical_tree_credit(args: Any, samples: list[Any]) -> None:
 
 
 def stage_coupled_doc2k_updates(args: Any, rollout_id: int) -> None:
-    reward_url = getattr(args, "generative_retriever_reward_url", None)
+    reward_url = args.generative_retriever_reward_url
     if not isinstance(reward_url, str) or not reward_url:
         return
     stage_url = reward_url.removesuffix("/score") + "/stage_step_updates"
@@ -72,7 +72,7 @@ def stage_coupled_doc2k_updates(args: Any, rollout_id: int) -> None:
         response.raise_for_status()
 
 
-def _add_distribution_metrics(
+def add_distribution_metrics(
     output: dict[str, Any],
     prefix: str,
     values: list[float],
@@ -91,7 +91,7 @@ def _add_distribution_metrics(
     })
 
 
-def _normalize_group_rewards(args: Any, rewards: np.ndarray, reward_std: float) -> np.ndarray:
+def normalize_group_rewards(args: Any, rewards: np.ndarray, reward_std: float) -> np.ndarray:
     if not args.rewards_normalization:
         return rewards
     centered = rewards - np.mean(rewards)
@@ -100,7 +100,7 @@ def _normalize_group_rewards(args: Any, rewards: np.ndarray, reward_std: float) 
     return centered
 
 
-def _add_group_reward_metrics(
+def add_group_reward_metrics(
     args: Any,
     samples: list[Any],
     output: dict[str, Any],
@@ -117,7 +117,9 @@ def _add_group_reward_metrics(
     unique_counts = []
     top_gaps = []
     group_advantage_abs_means = []
-    advantage_abs_values = []
+    advantage_abs_sum = 0.0
+    advantage_abs_count = 0
+    advantage_abs_max = 0.0
     zero_std_groups = 0
     for rewards in groups.values():
         data = np.asarray(rewards, dtype=np.float64)
@@ -129,27 +131,29 @@ def _add_group_reward_metrics(
         top_gaps.append(float(ordered[-1] - ordered[-2]) if ordered.size > 1 else 0.0)
         zero_std_groups += int(np.all(data == data[0]))
         if args.advantage_estimator == "grpo" and args.kl_coef == 0:
-            normalized = _normalize_group_rewards(args, data, reward_std)
+            normalized = normalize_group_rewards(args, data, reward_std)
             absolute = np.abs(normalized)
-            advantage_abs_values.extend(absolute.tolist())
+            advantage_abs_sum += float(np.sum(absolute))
+            advantage_abs_count += int(absolute.size)
+            advantage_abs_max = max(advantage_abs_max, float(np.max(absolute)))
             group_advantage_abs_means.append(float(np.mean(absolute)))
 
     prefix = "rollout/generative_retriever/group_reward"
-    _add_distribution_metrics(output, f"{prefix}/std", stds)
-    _add_distribution_metrics(output, f"{prefix}/range", ranges)
-    _add_distribution_metrics(output, f"{prefix}/unique_count", unique_counts)
-    _add_distribution_metrics(output, f"{prefix}/top1_top2_gap", top_gaps)
+    add_distribution_metrics(output, f"{prefix}/std", stds)
+    add_distribution_metrics(output, f"{prefix}/range", ranges)
+    add_distribution_metrics(output, f"{prefix}/unique_count", unique_counts)
+    add_distribution_metrics(output, f"{prefix}/top1_top2_gap", top_gaps)
     output[f"{prefix}/group_count"] = len(groups)
     output[f"{prefix}/zero_std_count"] = zero_std_groups
     output[f"{prefix}/zero_std_fraction"] = zero_std_groups / len(groups)
-    if advantage_abs_values:
-        _add_distribution_metrics(
+    if advantage_abs_count > 0:
+        add_distribution_metrics(
             output,
             f"{prefix}/advantage_abs_group_mean",
             group_advantage_abs_means,
         )
-        output[f"{prefix}/advantage_abs/mean"] = float(np.mean(advantage_abs_values))
-        output[f"{prefix}/advantage_abs/max"] = float(np.max(advantage_abs_values))
+        output[f"{prefix}/advantage_abs/mean"] = advantage_abs_sum / advantage_abs_count
+        output[f"{prefix}/advantage_abs/max"] = advantage_abs_max
 
 
 def log_rollout(
@@ -163,11 +167,13 @@ def log_rollout(
     stage_coupled_doc2k_updates(args, rollout_id)
     if rollout_extra_metrics is None:
         return False
-    _add_group_reward_metrics(args, samples, rollout_extra_metrics)
+    add_group_reward_metrics(args, samples, rollout_extra_metrics)
     apply_hierarchical_tree_credit(args, samples)
     values: dict[str, list[float]] = defaultdict(list)
     for sample in samples:
         metadata = sample.metadata.get("generative_retriever", {})
+        if "prepare_metrics" not in metadata and "reward_metrics" not in metadata:
+            continue
         for source in ("prepare_metrics", "reward_metrics"):
             for name, value in metadata.get(source, {}).items():
                 if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value)):

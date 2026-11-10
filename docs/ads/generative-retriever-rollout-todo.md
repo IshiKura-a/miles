@@ -265,8 +265,7 @@ HTTP reward hook 对每个 sample 返回一个 doc ID 的平均 keyword reward�
   constrained 512-beam 无放回采样（`decoding_mode="beam_sample"`，每 query 返回 512 个
   互不重复的有效 doc ID 及 4 个 decoder token logprob）。
 - Rollout 经 SGLang router 的 `/v1/embeddings` 返回 token 和 logprob；
-  同一 query group 只分词一次并共享生成请求，并行准备 reward baseline。Prepare 请求
-  每 10ms 合并，最多 512 个 query；learner 使用同一前缀约束在 GPU 上向量化构造 response mask 并计算 logprob。
+  每个 query group 作为单个整组任务执行一次分词、一次 `/v1/embeddings` 生成、一次 `/prepare` 基准准备，并整组 512 个有序 beam 一起提交 `/score` 打分（通过 `--rollout-max-in-flight-groups` 控制同时在途的 query group 窗口：单机 `512`、多机 `1024n`，不改变 `rollout_batch_size` 与 `global_batch_size`）。Prepare 与 Score 请求在凑满整批（512 个 query / 2,048 个 sample）时零延迟立即并发派发，未满批时最多等待 10ms 合并；learner 使用同一前缀约束在 GPU 上向量化构造 response mask 并计算 logprob。
 - 单机 Rollout engine 使用两卡 DP=2，`sglang-server-concurrency=8192`，
   `mem-fraction-static` 按并发与 group size 自适应推导（约 `0.15`）。
   Launcher 检查 mapping、baseline 和 reward 服务的 `/health`，
@@ -404,7 +403,7 @@ CUDA_VISIBLE_DEVICES=4,5 uv run python -m \
 - 每对节点（16 卡）分配 8 learner（节点 `2k+1` 的 GPU 0–7）、4 rollout（节点 `2k` 的 GPU 4–7）、4 frozen baseline（节点 `2k` 的 GPU 0–3）和 **16 reward GPU（节点 `2k` 与节点 `2k+1` 的全部 GPU 0–7）**。
 - 每台节点并行启动或复用本机 `31480` 的 API v3 常驻 `mapping_service`，并由当前 run 独占；`/lookup` 在节点本地完成。run 结束时释放所有权，基础索引继续驻留。新 run 清除旧增量；恢复 run 从匹配的 `mapping/overlay.parquet` 恢复，旧 checkpoint 如缺少该文件则不能恢复。旧版常驻服务不能安全复用，不会被自动停止。
 - 每步汇总增量并暂存，在 rollout 权重同步后按 step 顺序并发更新各节点；预取 rollout 的增量留待下次权重同步。保存 checkpoint 后在对应权重同步时保存匹配的映射快照至 `checkpoints/iter_XXXXXXX/mapping/`。默认每步同步权重；若同步间隔大于一，checkpoint 要等到后续权重同步才包含映射快照，最后一步必须落在同步边界，否则启动时报错。
-- 每步处理 **`8000n` query × `512` sample**（两机 16 卡即 `8,000` query/step，`global_batch_size = 4,096,000n`）。
+- 每步处理 **`8000n` query × `512` sample**（两机 16 卡即 `8,000` query/step，`global_batch_size = 4,096,000n`，同时在途 query group 上限 `rollout_max_in_flight_groups = 1024n`）。
 - 完整遍历 `15,000,000` 条数据的最大 optimizer step 数为 **`1875 // n`**（例如 `n=1` 为 `1,875` 步，`n=3` 为 `625` 步，`n=4` 六十四卡为 `468` 步）。
 支持 `--num-rollout` 指定不超过该上限的短验收步骤；正式训练省略此参数。
 此精确遍历前提是每轮无请求或 group 失败；否则现有 rollout 会

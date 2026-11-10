@@ -152,6 +152,18 @@ def _compute_episode_response_length_metrics(samples: list[Sample]) -> dict[str,
     computing batch-level statistics. Effective lengths count only trainable
     tokens; total lengths count both masked and unmasked tokens in every sample.
     """
+    if not samples:
+        return {}
+
+    if all(sample.rollout_id is None for sample in samples):
+        effective_lengths = [0 if sample.remove_sample else sample.effective_response_length for sample in samples]
+        log_dict = dict_add_prefix(
+            compute_statistics(effective_lengths),
+            "episode_response_length/",
+        )
+        log_dict["episode_total_response_length/mean"] = sum(s.response_length for s in samples) / len(samples)
+        return log_dict
+
     effective_lengths_by_rollout: dict[tuple[str, int | None, int], int] = {}
     total_lengths_by_rollout: dict[tuple[str, int | None, int], int] = {}
     for position, sample in enumerate(samples):
@@ -161,9 +173,6 @@ def _compute_episode_response_length_metrics(samples: list[Sample]) -> dict[str,
             effective_lengths_by_rollout.get(rollout_key, 0) + effective_response_length
         )
         total_lengths_by_rollout[rollout_key] = total_lengths_by_rollout.get(rollout_key, 0) + sample.response_length
-
-    if not effective_lengths_by_rollout:
-        return {}
 
     log_dict = dict_add_prefix(
         compute_statistics(list(effective_lengths_by_rollout.values())),
@@ -181,8 +190,22 @@ def _compute_training_sample_metrics(args: Any, samples: list[Sample]) -> dict[s
     sibling rows that share a rollout ID so long rollouts do not receive more
     metric weight merely because they produced more samples.
     """
-    rewards_by_rollout: dict[tuple[str, int | None, int], list[float]] = {}
     use_metadata_reward = bool(samples and samples[0].metadata and "raw_reward" in samples[0].metadata)
+    if all(sample.rollout_id is None for sample in samples):
+        numeric_rewards = [
+            float(raw_reward)
+            for sample in samples
+            if isinstance(
+                raw_reward := (sample.metadata["raw_reward"] if use_metadata_reward else sample.get_reward_value(args)),
+                Number,
+            )
+        ]
+        return {
+            "num_training_samples": len(samples),
+            "episode_raw_reward": sum(numeric_rewards) / len(numeric_rewards) if numeric_rewards else 0.0,
+        }
+
+    rewards_by_rollout: dict[tuple[str, int | None, int], list[float]] = {}
     for position, sample in enumerate(samples):
         rollout_key = _get_rollout_key(sample, position)
 
