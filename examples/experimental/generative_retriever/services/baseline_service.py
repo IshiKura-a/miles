@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from examples.experimental.generative_retriever.utils.paths import absolute_path
+
 import argparse
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import asdict
-from pathlib import Path
 from threading import Lock
 from typing import Annotated, Any
 
@@ -198,15 +199,15 @@ def create_app(
     devices = _validate_devices(devices)
     resolved_service_config = {
         "api_version": _SERVICE_API_VERSION,
-        "checkpoint": str(Path(checkpoint).expanduser().resolve()),
-        "qwen_model": str(Path(qwen_model).expanduser().resolve()),
-        "slm_root": str(Path(slm_root).expanduser().resolve()),
-        "id_mapping": str(Path(id_mapping).expanduser().resolve()),
+        "checkpoint": str(absolute_path(checkpoint)),
+        "qwen_model": str(absolute_path(qwen_model)),
+        "slm_root": str(absolute_path(slm_root)),
+        "id_mapping": str(absolute_path(id_mapping)),
         "devices": list(devices),
         "cache_size": _CACHE_SIZE,
         "docids_per_query": docids_per_query,
         **(
-            {"policy_checkpoint": str(Path(policy_checkpoint).expanduser().resolve())}
+            {"policy_checkpoint": str(absolute_path(policy_checkpoint))}
             if policy_checkpoint is not None
             else {}
         ),
@@ -250,7 +251,7 @@ def create_app(
     def load_policy_head(request: LoadPolicyHeadRequest) -> dict[str, Any]:
         count = app.state.pool.load_policy_head(request.policy_checkpoint)
         resolved_service_config["policy_checkpoint"] = str(
-            Path(request.policy_checkpoint).expanduser().resolve()
+            absolute_path(request.policy_checkpoint)
         )
         return {"status": "ok", "tensors_loaded": count}
 

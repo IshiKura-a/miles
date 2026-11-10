@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from examples.experimental.generative_retriever.utils.paths import absolute_path
+
 import argparse
 import hashlib
 import json
@@ -101,7 +103,7 @@ def build_shard(args: argparse.Namespace) -> None:
     checkpoint = require_directory(args.checkpoint, "Stage5 checkpoint")
     qwen_model = require_directory(args.qwen_model, "Qwen model")
     slm_root = require_directory(args.slm_root, "SLMv3 source")
-    source = Path(args.part).expanduser().resolve()
+    source = absolute_path(args.part)
     index_path = Path(f"{source}.np.bin")
     record_path = Path(f"{source}.rec")
     if not index_path.is_file() or not record_path.is_file():
@@ -114,7 +116,7 @@ def build_shard(args: argparse.Namespace) -> None:
         raise ValueError(f"Unexpected input record count: {total}")
     start = total * args.shard // args.shards
     end = total * (args.shard + 1) // args.shards
-    output_dir = Path(args.output).expanduser().resolve()
+    output_dir = absolute_path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
     output = output_dir / f"part-{args.shard:02d}-of-{args.shards:02d}.tsv"
     partial = output.with_suffix(".tsv.partial")
@@ -155,7 +157,7 @@ def build_shard(args: argparse.Namespace) -> None:
 
 
 def merge_shards(args: argparse.Namespace) -> None:
-    output_dir = Path(args.output).expanduser().resolve()
+    output_dir = absolute_path(args.output)
     manifests = []
     shards = []
     for shard in range(args.shards):

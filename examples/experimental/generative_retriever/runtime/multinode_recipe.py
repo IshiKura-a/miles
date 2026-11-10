@@ -18,7 +18,7 @@ from examples.experimental.generative_retriever.runtime.prepare_rocm_env import 
     derive_sglang_mem_fraction,
 )
 
-_REPO = Path(__file__).resolve().parents[4]
+_REPO = Path(__file__).absolute().parents[4]
 
 # Each pair has one rollout node and one learner node.
 REWARD_GPUS_PER_NODE = 8

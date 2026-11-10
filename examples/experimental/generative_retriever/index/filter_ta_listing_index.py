@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from examples.experimental.generative_retriever.utils.paths import absolute_path
+
 import argparse
 import hashlib
 import json
@@ -12,8 +14,8 @@ from pathlib import Path
 
 
 def filter_index(source: Path, output: Path) -> dict[str, object]:
-    source = source.expanduser().resolve()
-    output = output.expanduser().resolve()
+    source = absolute_path(source)
+    output = absolute_path(output)
     if not source.is_file() or source == output:
         raise ValueError(f"Source must exist and differ from output: {source}")
     output.parent.mkdir(parents=True, exist_ok=True)

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from examples.experimental.generative_retriever.utils.paths import absolute_path
+
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import importlib
@@ -14,6 +16,7 @@ import tempfile
 from typing import Any
 
 import torch
+from filelock import FileLock
 from torch.distributed.checkpoint.filesystem import FileSystemReader
 from torch.distributed.checkpoint.metadata import TensorStorageMetadata
 from torch.distributed.checkpoint.state_dict_loader import load
@@ -39,7 +42,7 @@ _STAGE_ASSETS = (
 
 
 def require_directory(path: str | Path, name: str) -> Path:
-    resolved = Path(path).expanduser().resolve()
+    resolved = absolute_path(path)
     if not resolved.is_dir():
         raise FileNotFoundError(f"{name} directory does not exist: {resolved}")
     return resolved
@@ -48,39 +51,43 @@ def require_directory(path: str | Path, name: str) -> Path:
 def stage_local_model_dir(path: str | Path, name: str) -> Path:
     resolved = require_directory(path, name)
     local_root = Path(tempfile.gettempdir())
-    try:
-        if resolved.is_relative_to(local_root):
-            return resolved
-    except ValueError:
-        pass
+    if resolved.is_relative_to(local_root):
+        return resolved
     digest = hashlib.sha256(os.fspath(resolved).encode("utf-8")).hexdigest()[:12]
     target = local_root / f"gr_model_{resolved.name}_{digest}"
     sentinel = target / ".staged_ok"
-    if sentinel.is_file():
-        return target
-    staging = local_root / f".gr_model_{resolved.name}_{digest}.{os.getpid()}"
-    shutil.rmtree(staging, ignore_errors=True)
-    staging.mkdir(parents=True, exist_ok=True)
-    for asset_name in _STAGE_ASSETS:
-        src = resolved / asset_name
-        if src.is_file():
-            shutil.copyfile(src, staging / asset_name)
-    for index_name in ("pytorch_model.bin.index.json", "model.safetensors.index.json"):
-        idx_file = staging / index_name
-        if idx_file.is_file():
-            with idx_file.open(encoding="utf-8") as handle:
-                weight_map = json.load(handle).get("weight_map", {})
-            for shard_name in sorted(set(weight_map.values())):
-                dst = staging / shard_name
-                if not dst.exists() and not dst.is_symlink():
-                    dst.symlink_to(resolved / shard_name)
-    sentinel.parent.mkdir(parents=True, exist_ok=True)
-    (staging / ".staged_ok").write_text(os.fspath(resolved) + "\n", encoding="utf-8")
-    try:
-        os.replace(staging, target)
-    except OSError:
-        shutil.rmtree(staging, ignore_errors=True)
-    return target if (target / ".staged_ok").is_file() else resolved
+    index_names = ("pytorch_model.bin.index.json", "model.safetensors.index.json")
+    if not sentinel.is_file():
+        with FileLock(f"{target}.lock"):
+            if not sentinel.is_file():
+                with tempfile.TemporaryDirectory(prefix=f".gr_model_{resolved.name}_{digest}.", dir=local_root) as tmp:
+                    staging = Path(tmp)
+                    for asset_name in _STAGE_ASSETS:
+                        src = resolved / asset_name
+                        if src.is_file():
+                            shutil.copyfile(src, staging / asset_name)
+                    indexes = [staging / index_name for index_name in index_names if (staging / index_name).is_file()]
+                    if not indexes:
+                        raise FileNotFoundError(f"{name} has no model weight index: {resolved}")
+                    for index in indexes:
+                        with index.open(encoding="utf-8") as handle:
+                            weight_map = json.load(handle)["weight_map"]
+                        if not weight_map:
+                            raise ValueError(f"Model weight index is empty: {index}")
+                        for shard_name in sorted(set(weight_map.values())):
+                            src = resolved / shard_name
+                            if not src.is_file():
+                                raise FileNotFoundError(f"Model shard is missing: {src}")
+                            dst = staging / shard_name
+                            if not dst.is_symlink():
+                                dst.symlink_to(src)
+                    (staging / ".staged_ok").write_text(os.fspath(resolved) + "\n", encoding="utf-8")
+                    os.replace(staging, target)
+    if sentinel.read_text(encoding="utf-8").strip() != os.fspath(resolved) or not any(
+        (target / index_name).is_file() for index_name in index_names
+    ):
+        raise ValueError(f"Invalid staged model directory: {target}")
+    return target
 
 
 def import_slmv3(slm_root: Path) -> dict[str, Any]:
@@ -90,7 +97,7 @@ def import_slmv3(slm_root: Path) -> dict[str, Any]:
 
     model_module = importlib.import_module("model")
 
-    # Model imports can replace Transformers' lazy module; patch the active module before utils.
+    # Transformers 5 maps mT5 to T5Tokenizer; the SLM source imports the old names.
     transformers_dynamic: Any = importlib.import_module("transformers")
     if not hasattr(transformers_dynamic, "MT5Tokenizer"):
         transformers_dynamic.MT5Tokenizer = transformers_dynamic.T5Tokenizer
@@ -104,7 +111,6 @@ def import_slmv3(slm_root: Path) -> dict[str, Any]:
         "T5MultiWithGivenQueryDocEncoderDSI": model_module.T5MultiWithGivenQueryDocEncoderDSI,
         "Encoder_QWen1216t": encoder_module.Encoder_QWen1216t,
         "DataSupport_QWen1216t": encoder_module.DataSupport_QWen1216t,
-        "get_restrict_decode_vocab": utils_module.get_restrict_decode_vocab,
     }
 
 
@@ -208,7 +214,7 @@ def load_checkpoint(model: Any, checkpoint: Path) -> None:
 
 
 def load_policy_head_checkpoint(model: Any, checkpoint: str | Path) -> int:
-    path = Path(checkpoint).expanduser().resolve()
+    path = absolute_path(checkpoint)
     if not path.is_file():
         raise FileNotFoundError(f"Policy checkpoint does not exist: {path}")
     payload = torch.load(path, map_location="cpu", mmap=True, weights_only=True)
@@ -243,7 +249,7 @@ def export_policy_head_checkpoint(
     metadata_file = ckpt_dir / ".metadata"
     if not metadata_file.is_file():
         raise FileNotFoundError(f"DCP checkpoint metadata is missing: {metadata_file}")
-    out_pt = Path(output_path).expanduser().resolve()
+    out_pt = absolute_path(output_path)
     out_pt.parent.mkdir(parents=True, exist_ok=True)
 
     dcp_prefix = "model_state.model."

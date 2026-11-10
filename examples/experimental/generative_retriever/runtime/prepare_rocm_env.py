@@ -8,6 +8,8 @@ Run on the first host before launching multi-node GRPO training:
 
 from __future__ import annotations
 
+from examples.experimental.generative_retriever.utils.paths import absolute_path
+
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import filecmp
@@ -21,8 +23,8 @@ import sys
 
 import torch
 
-_REPO = Path(__file__).resolve().parents[4]
-_DIR = Path(__file__).resolve().parent
+_REPO = Path(__file__).absolute().parents[4]
+_DIR = Path(__file__).absolute().parent
 _FREEZE = _DIR / "requirements-rocm.freeze.txt"
 _SLMV3_PATCH = _DIR / "patches/slmv3-transformers-cache.patch"
 _SGLANG_PATCH = _DIR / "patches/sglang-embedding-abort.patch"
@@ -64,7 +66,6 @@ _AITER_CHERRYPICKS = (
     "7b481fbcaf834ce98b66004ea329c2ca2bba87d7",
     "24a62b1c122f23645a19b9d8b0abd4750c59359b",
 )
-_MI300X_MEMORY_GIB = 191.45
 _MIN_CONCURRENT_QUERIES_PER_GPU = 64
 _MIN_KV_TOKENS = 32768
 _QWEN3_4B_NUM_LAYERS = 36
@@ -99,7 +100,7 @@ def derive_sglang_mem_fraction(
     elif torch.cuda.is_available():
         gpu_gib = float(torch.cuda.get_device_properties(0).total_memory) / float(2**30)
     else:
-        gpu_gib = _MI300X_MEMORY_GIB
+        raise RuntimeError("Cannot detect a GPU to determine SGLang memory fraction")
     concurrent_queries_per_gpu = max(
         _MIN_CONCURRENT_QUERIES_PER_GPU,
         math.ceil(
@@ -241,8 +242,7 @@ def _write_activate_script(venv: Path) -> Path:
         'export NCCL_IB_HCA=""\n'
         'export NCCL_IB_TIMEOUT="22"\n'
         'export NCCL_IB_PCI_RELAXED_ORDERING="1"\n'
-        'export NCCL_NET_GDR_LEVEL="5"\n'
-        'export cosmos_data_path="${cosmos_data_path:-${datastore:-}}"\n',
+        'export NCCL_NET_GDR_LEVEL="5"\n',
         encoding="utf-8",
     )
     script.chmod(0o755)
@@ -434,7 +434,7 @@ def _sync_remote_host(
 
 
 def prepare(*, hosts: list[str], slm_root: Path) -> None:
-    slmgr_repo = slm_root.resolve().parent
+    slmgr_repo = absolute_path(slm_root).parent
     _apply_patch_idempotent(slmgr_repo, _SLMV3_PATCH)
 
     venv = _REPO / ".venv"

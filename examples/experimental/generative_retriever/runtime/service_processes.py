@@ -15,7 +15,7 @@ import httpx
 from examples.experimental.generative_retriever.runtime.prepare_rocm_env import build_service_env
 from examples.experimental.generative_retriever.services.mapping_service import MAPPING_SERVICE_API_VERSION
 
-_REPO = Path(__file__).resolve().parents[4]
+_REPO = Path(__file__).absolute().parents[4]
 _SERVICE_TIMEOUT = 3600
 
 

@@ -23,6 +23,7 @@ from examples.experimental.generative_retriever.model.model_loading import (
     checkpoint_tensor_shape,
     import_slmv3,
     load_checkpoint,
+    require_directory,
     stage_local_model_dir,
 )
 
@@ -257,11 +258,14 @@ def build_gr_stage5_policy(checkpoint_path: str, args: Any, init_context) -> GRS
 
     checkpoint = _required_path("GR_CHECKPOINT")
     qwen_model = _required_path("GR_QWEN_MODEL")
-    slm_root = _required_path("GR_SLM_ROOT")
+    slm_root_value = os.environ.get("GR_SLM_ROOT")
+    if not slm_root_value:
+        raise ValueError("GR_SLM_ROOT must be set for the GR FSDP model factory")
+    slm_root = require_directory(slm_root_value, "GR_SLM_ROOT")
     mapping = os.environ.get("GR_ID_MAPPING")
     if not mapping:
         raise ValueError("GR_ID_MAPPING must be set for constrained GR training")
-    constraint = load_constraint(str(slm_root), mapping, 4, 256)
+    constraint = load_constraint(mapping, 4, 256)
     slmv3 = import_slmv3(slm_root)
     run_args = build_run_arguments(slmv3["RunArguments"], checkpoint, qwen_model)
 

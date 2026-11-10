@@ -11,6 +11,8 @@ Example:
 
 from __future__ import annotations
 
+from examples.experimental.generative_retriever.utils.paths import absolute_path
+
 import argparse
 import json
 import os
@@ -26,6 +28,7 @@ from typing import IO, Any, Literal
 import httpx
 
 from examples.experimental.generative_retriever.eval.good_count_eval import run as run_good_count_eval
+from examples.experimental.generative_retriever.index.id_text_mapping import is_columnar_index_dir
 from examples.experimental.generative_retriever.model.model_loading import export_policy_head_checkpoint
 from examples.experimental.generative_retriever.reward.relevance_reward import (
     DEFAULT_EVAL_BATCH_SIZE,
@@ -34,7 +37,7 @@ from examples.experimental.generative_retriever.reward.relevance_reward import (
 from examples.experimental.generative_retriever.runtime.prepare_rocm_env import build_service_env
 from examples.experimental.generative_retriever.runtime.service_processes import stop_process
 
-_REPO_ROOT = Path(__file__).resolve().parents[3]
+_REPO_ROOT = Path(__file__).absolute().parents[3]
 _DEFAULT_GENERATOR_DEVICES = "cuda:0,cuda:1,cuda:2,cuda:3"
 _DEFAULT_SCORER_DEVICES = "cuda:0,cuda:1,cuda:2,cuda:3,cuda:4,cuda:5,cuda:6,cuda:7"
 _MAPPING_PORT = 30488
@@ -87,7 +90,7 @@ class _ManagedService:
 
 
 def _expand_path(value: str, name: str, *, expect_dir: bool = False, expect_file: bool = False) -> Path:
-    expanded = Path(os.path.expandvars(value)).expanduser().resolve()
+    expanded = absolute_path(os.path.expandvars(value))
     if "$" in os.fspath(expanded):
         raise ValueError(f"{name} contains an unresolved environment variable: {value}")
     if expect_dir and not expanded.is_dir():
@@ -279,14 +282,12 @@ def run_evaluation(config: EvalConfig) -> dict[str, Any] | None:
     qwen_model = _expand_path(config.qwen_model, "qwen_model", expect_dir=True)
     slm_root = _expand_path(config.slm_root, "slm_root", expect_dir=True)
     id_mapping = _expand_path(config.id_mapping, "id_mapping")
-    if not id_mapping.exists():
-        raise FileNotFoundError(f"id_mapping does not exist: {id_mapping}")
+    if not is_columnar_index_dir(id_mapping):
+        raise FileNotFoundError(f"Incomplete initial mapping index: {id_mapping}")
     ckpt_mapping_dir = run_dir / "checkpoints" / f"iter_{step_pad}" / "mapping"
-    policy_mapping = (
-        ckpt_mapping_dir
-        if (ckpt_mapping_dir / "docid_keywords.parquet").is_file()
-        else id_mapping
-    )
+    if not is_columnar_index_dir(ckpt_mapping_dir):
+        raise FileNotFoundError(f"Incomplete checkpoint mapping index: {ckpt_mapping_dir}")
+    policy_mapping = ckpt_mapping_dir
     relevance_model = _expand_path(config.relevance_model, "relevance_model", expect_dir=True)
     cached_baseline_path = (
         output_root

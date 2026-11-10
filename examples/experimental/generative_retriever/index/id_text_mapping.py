@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from examples.experimental.generative_retriever.utils.paths import absolute_path
+
 from collections.abc import Iterable
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -10,6 +12,10 @@ from pathlib import Path
 import httpx
 
 PositionalID = tuple[int, int, int, int]
+COLUMNAR_INDEX_FILES = (
+    "keywords.parquet", "docid_keywords.parquet", "docid_unique.u32.npy",
+    "docid_offsets.i64.npy", "docid_kw_ids.u32.npy",
+)
 
 
 @dataclass(frozen=True)
@@ -52,17 +58,13 @@ def unpack_docid_u32(value: int) -> PositionalID:
 
 
 def is_columnar_index_dir(path: str | Path) -> bool:
-    resolved = Path(path).expanduser().resolve()
-    return (
-        resolved.is_dir()
-        and (resolved / "keywords.parquet").is_file()
-        and (resolved / "docid_keywords.parquet").is_file()
-    )
+    resolved = absolute_path(path)
+    return resolved.is_dir() and all((resolved / name).is_file() for name in COLUMNAR_INDEX_FILES)
 
 
 def lookup_texts(mapping: str | Path, docids: Iterable[PositionalID]) -> MappingLookup:
     """Scan the official TSV once, preserving every distinct matching text per ID."""
-    path = Path(mapping).expanduser().resolve()
+    path = absolute_path(mapping)
     requested = set(docids)
     if not requested:
         raise ValueError("At least one GR ID is required")

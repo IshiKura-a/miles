@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from examples.experimental.generative_retriever.utils.paths import absolute_path
+
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +32,7 @@ class GRRolloutDataSource(RolloutDataSourceWithBuffer):
         position = self._completed_position(rollout_id)
         if self.epoch_id != 0 or self.sample_offset < position or self.buffer:
             raise ValueError("GR rollout cannot checkpoint a wrapped or buffered prompt dataset")
-        save_root = Path(self.args.save).expanduser().resolve()
+        save_root = absolute_path(self.args.save)
         path = save_root / "rollout" / f"global_dataset_state_dict_{rollout_id}.pt"
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(

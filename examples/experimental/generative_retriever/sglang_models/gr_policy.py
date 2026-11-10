@@ -42,14 +42,14 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
         self.docid_dim = int(raw_gr_config["docid_dim"])
         self.num_beams = int(raw_gr_config["num_beams"])
         self.num_return_sequences = int(raw_gr_config["num_return_sequences"])
-        self.decoding_mode = raw_gr_config.get("decoding_mode", "beam")
-        self.temperature = float(raw_gr_config.get("temperature", 1.0))
+        self.decoding_mode = raw_gr_config["decoding_mode"]
+        self.temperature = float(raw_gr_config["temperature"])
         if self.decoding_mode not in {"beam", "beam_sample", "sample"}:
             raise ValueError("GR decoding_mode must be 'beam', 'beam_sample', or 'sample'")
         if self.decoding_mode in {"beam", "beam_sample"} and not 1 <= self.num_return_sequences <= self.num_beams:
             raise ValueError("Require 1 <= num_return_sequences <= num_beams")
         self.constraint = load_constraint(
-            raw_gr_config["slm_root"], raw_gr_config["id_mapping"], self.docid_size, self.docid_dim,
+            raw_gr_config["id_mapping"], self.docid_size, self.docid_dim,
         )
 
         decoder_config = self.gr_config
@@ -88,7 +88,9 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        prefix_lens = forward_batch.extend_prefix_lens_cpu or [0] * forward_batch.batch_size
+        prefix_lens = forward_batch.extend_prefix_lens_cpu
+        if prefix_lens is None or len(prefix_lens) != forward_batch.batch_size:
+            raise RuntimeError("GR policy requires CPU prefill prefix lengths for every query")
         if any(prefix_lens):
             raise RuntimeError("GR policy requires --disable-radix-cache so every query has full hidden states")
         lengths = forward_batch.extend_seq_lens_cpu

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from examples.experimental.generative_retriever.utils.paths import absolute_path
+
 import argparse
 import importlib
 import json
@@ -23,7 +25,7 @@ class _RecordReaderFactory(Protocol):
 
 
 def _load_reader(slm_root: Path):
-    root = slm_root.expanduser().resolve()
+    root = absolute_path(slm_root)
     if not root.is_dir():
         raise FileNotFoundError(f"SLMv3 source directory does not exist: {root}")
     sys.path.insert(0, str(root))
@@ -66,13 +68,13 @@ def convert_queryfeat(
     if limit is not None and limit <= 0:
         raise ValueError("limit must be positive")
     reader_class = None
-    output_path = Path(output).expanduser().resolve()
+    output_path = absolute_path(output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     count = 0
     with output_path.open("w", encoding="utf-8") as output_file:
         for raw_part in parts:
-            part = Path(raw_part).expanduser().resolve()
+            part = absolute_path(raw_part)
             json_path = part if part.suffix == ".json" else Path(f"{part}.json")
             if json_path.is_file():
                 with json_path.open("rb") as stream:

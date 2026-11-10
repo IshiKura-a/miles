@@ -14,6 +14,8 @@ Example:
 
 from __future__ import annotations
 
+from examples.experimental.generative_retriever.utils.paths import absolute_path
+
 import argparse
 import copy
 from dataclasses import dataclass
@@ -88,9 +90,7 @@ class SLMv3Retriever:
         self.checkpoint = stage_local_model_dir(checkpoint, "checkpoint")
         self.qwen_model = stage_local_model_dir(qwen_model, "Qwen model")
         self.slm_root = require_directory(slm_root, "SLMv3 source")
-        mapping = Path(id_mapping).expanduser().resolve()
-        if not mapping.is_file() and not (mapping.is_dir() and (mapping / "docid_keywords.parquet").is_file()):
-            raise FileNotFoundError(f"Official ID mapping is missing: {mapping}")
+        mapping = absolute_path(id_mapping)
         _check_transformers_version(self.checkpoint)
 
         if device.startswith("cuda") and not torch.cuda.is_available():
@@ -126,7 +126,7 @@ class SLMv3Retriever:
         self.code_dim = run_args.code_dim
         self.code_num = run_args.code_num
         self.constraint: PrefixConstraint = load_constraint(
-            str(self.slm_root), str(mapping), self.code_num, self.code_dim,
+            str(mapping), self.code_num, self.code_dim,
         )
 
     def clone_to_device(self, device: str) -> SLMv3Retriever:

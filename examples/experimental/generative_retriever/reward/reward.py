@@ -322,11 +322,11 @@ async def reward(args: Any, samples: Sample | list[Sample], **kwargs: Any) -> fl
         )
 
     batch = samples if isinstance(samples, list) else [samples]
-    timeout_seconds = getattr(args, "generative_retriever_reward_timeout", 30.0)
+    timeout_seconds = args.generative_retriever_reward_timeout
     if timeout_seconds <= 0:
         raise ValueError("generative_retriever_reward_timeout must be positive")
 
-    mode = getattr(args, "generative_retriever_reward_mode", "discrete_relevance_unique")
+    mode = args.generative_retriever_reward_mode
     if mode not in REWARD_MODES:
         raise ValueError(f"Unknown reward mode: {mode!r}")
     rewards: list[float] = []

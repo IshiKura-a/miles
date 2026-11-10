@@ -1,0 +1,1 @@
+"""Shared generative retriever utilities."""

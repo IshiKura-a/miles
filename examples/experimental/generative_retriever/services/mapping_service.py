@@ -7,6 +7,8 @@ Run:
 
 from __future__ import annotations
 
+from examples.experimental.generative_retriever.utils.paths import absolute_path, symlink_target
+
 import argparse
 import gc
 import logging
@@ -119,8 +121,8 @@ class ResidentMapping:
             raise ValueError(f"Mapping path must be a columnar index directory: {path}")
         self.path = path
         self.version = (
-            (path / "keywords.parquet").resolve().parent.name
-            if path.name == "mapping"
+            symlink_target(path / "keywords.parquet").parent.name
+            if path.name == "mapping" and (path / "keywords.parquet").is_symlink()
             else path.name
         )
         self._lock = RLock()
@@ -156,15 +158,9 @@ class ResidentMapping:
         u_path = directory / "docid_unique.u32.npy"
         off_path = directory / "docid_offsets.i64.npy"
         kid_path = directory / "docid_kw_ids.u32.npy"
-        if u_path.is_file() and off_path.is_file() and kid_path.is_file():
-            self._unique_docids_u32 = np.load(u_path)
-            self._csr_offsets = np.load(off_path)
-            self._csr_kw_ids = np.load(kid_path)
-        else:
-            pairs_table = pq.read_table(pairs_path, columns=["docid_u32", "keyword_id"])
-            docid_u32 = pairs_table.column("docid_u32").to_numpy(zero_copy_only=False)
-            kw_id = pairs_table.column("keyword_id").to_numpy(zero_copy_only=False)
-            self._rebuild_csr(docid_u32, kw_id)
+        self._unique_docids_u32 = np.load(u_path)
+        self._csr_offsets = np.load(off_path)
+        self._csr_kw_ids = np.load(kid_path)
 
         self.rows = int(len(self._csr_kw_ids))
         self._kw_degree = np.bincount(self._csr_kw_ids, minlength=n_kw).astype(np.int32)
@@ -176,25 +172,6 @@ class ResidentMapping:
             self.rows,
         )
 
-    def _rebuild_csr(self, docid_u32: np.ndarray, kw_id: np.ndarray) -> None:
-        if len(docid_u32) == 0:
-            raise ValueError("docid-to-keyword mapping cannot be empty")
-        packed = (docid_u32.astype(np.uint64) << np.uint64(32)) | kw_id.astype(np.uint64)
-        packed = np.unique(packed)
-        sorted_docids = (packed >> np.uint64(32)).astype(np.uint32)
-        sorted_kw_ids = (packed & np.uint64(0xFFFFFFFF)).astype(np.uint32)
-        change_idx = np.flatnonzero(sorted_docids[1:] != sorted_docids[:-1]) + 1
-        unique_docids = np.empty(len(change_idx) + 1, dtype=np.uint32)
-        unique_docids[0] = sorted_docids[0]
-        unique_docids[1:] = sorted_docids[change_idx]
-        offsets = np.empty(len(unique_docids) + 1, dtype=np.int64)
-        offsets[0] = 0
-        offsets[1:-1] = change_idx
-        offsets[-1] = len(sorted_docids)
-        self._unique_docids_u32 = unique_docids
-        self._csr_offsets = offsets
-        self._csr_kw_ids = sorted_kw_ids
-        self.rows = int(len(sorted_kw_ids))
 
     @property
     def id_count(self) -> int:
@@ -432,7 +409,7 @@ class ResidentMapping:
     def save_docid_mappings(self, output_dir: str | Path) -> dict[str, Any]:
         with self._lock:
             overlay_snapshot = dict(self._overlay_kw_ids)
-        target_dir = Path(output_dir).expanduser().resolve()
+        target_dir = absolute_path(output_dir)
         target_dir.mkdir(parents=True, exist_ok=True)
         counts = np.diff(self._csr_offsets)
         base_docids = np.repeat(self._unique_docids_u32, counts)
@@ -505,7 +482,7 @@ class ResidentMapping:
 
 
 def create_app(mapping: str | Path) -> FastAPI:
-    path = Path(mapping).expanduser().resolve()
+    path = absolute_path(mapping)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):

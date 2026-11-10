@@ -19,9 +19,11 @@ from ray._private.parameter import RayParams
 import torch
 import typer
 
-_MILES_REPO_ROOT = Path(__file__).resolve().parents[3]
+_MILES_REPO_ROOT = Path(__file__).absolute().parents[3]
 if str(_MILES_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_MILES_REPO_ROOT))
+
+from examples.experimental.generative_retriever.utils.paths import absolute_path
 
 import miles.utils.external_utils.command_utils as U
 from miles.utils.misc import get_current_node_ip
@@ -45,7 +47,8 @@ from examples.experimental.generative_retriever.reward.relevance_reward import (
     REWARD_PAIR_BATCH_SIZE,
     REWARD_TOWER_BATCH_SIZE,
 )
-from examples.experimental.generative_retriever.reward.relevance_model import resolve_relevance_source
+from examples.experimental.generative_retriever.reward.relevance_model import relevance_source_path
+from examples.experimental.generative_retriever.index.id_text_mapping import is_columnar_index_dir
 from examples.experimental.generative_retriever.services.baseline_service import (
     BASELINE_CACHE_SIZE,
     BASELINE_SERVICE_API_VERSION,
@@ -125,7 +128,7 @@ def _ensure_resident_services(
     service_log_dir: Path,
 ) -> str:
     relevance_model = expanded_path(args.relevance_model, "Relevance model")
-    relevance_source = resolve_relevance_source(
+    relevance_source = relevance_source_path(
         relevance_model,
     )
     service_dir = service_log_dir
@@ -372,11 +375,9 @@ def execute(args: ScriptArgs) -> None:
     checkpoint = required_directory(args.checkpoint, "checkpoint")
     qwen_model = required_directory(args.qwen_model, "Qwen model")
     slm_root = required_directory(args.slm_root, "SLMv3 source")
-    mapping = Path(os.path.expandvars(args.id_mapping)).expanduser().resolve()
-    if not args.id_mapping or (
-        not mapping.is_file() and not (mapping.is_dir() and (mapping / "docid_keywords.parquet").is_file())
-    ):
-        raise FileNotFoundError(f"Official ID mapping is required: {args.id_mapping!r}")
+    mapping = absolute_path(os.path.expandvars(args.id_mapping))
+    if not is_columnar_index_dir(mapping):
+        raise FileNotFoundError(f"Incomplete official mapping index: {mapping}")
     if args.temperature <= 0:
         raise ValueError("Training sampling temperature must be positive")
     if args.reward_timeout <= 0:
@@ -397,7 +398,7 @@ def execute(args: ScriptArgs) -> None:
         )
     if args.save_interval <= 0:
         raise ValueError("save_interval must be positive")
-    prompt_source = Path(os.path.expandvars(args.prompt_data)).expanduser().resolve()
+    prompt_source = absolute_path(os.path.expandvars(args.prompt_data))
     if not prompt_source.is_file():
         raise FileNotFoundError(f"prompt data does not exist: {prompt_source}")
     if args.actor_num_gpus_per_node + args.rollout_num_gpus > args.num_gpus_per_node:
@@ -425,7 +426,7 @@ def execute(args: ScriptArgs) -> None:
         ).is_file():
             raise FileNotFoundError("GR resume requires the matching rollout dataset state")
         mapping_checkpoint = str(checkpoint_dir / f"iter_{iteration:07d}" / "mapping")
-        if not (Path(mapping_checkpoint) / "overlay.parquet").is_file():
+        if not is_columnar_index_dir(mapping_checkpoint) or not (Path(mapping_checkpoint) / "overlay.parquet").is_file():
             raise FileNotFoundError("GR resume requires the matching mapping overlay checkpoint")
     service_log_dir = expanded_path(
         args.service_log_dir,

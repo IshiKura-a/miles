@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from examples.experimental.generative_retriever.utils.paths import absolute_path, symlink_target
+
 from dataclasses import dataclass
 import json
 import os
+import tempfile
 from pathlib import Path
 
 import miles.utils.external_utils.command_utils as U
@@ -24,7 +27,7 @@ _REWARD_DEVICES = tuple(f"cuda:{i}" for i in range(8))
 def required_directory(value: str, name: str) -> str:
     if not value:
         raise ValueError(f"{name} is required")
-    path = Path(os.path.expandvars(value)).expanduser().resolve()
+    path = absolute_path(os.path.expandvars(value))
     if "$" in os.fspath(path):
         raise ValueError(f"{name} contains an unresolved environment variable")
     if not path.is_dir():
@@ -86,7 +89,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
 
 
 def expanded_path(value: str, name: str, *, directory: bool = True) -> Path:
-    path = Path(os.path.expandvars(value)).expanduser().resolve()
+    path = absolute_path(os.path.expandvars(value))
     if "$" in os.fspath(path):
         raise ValueError(f"{name} contains an unresolved environment variable")
     if directory and not path.is_dir():
@@ -106,26 +109,28 @@ class PromptData:
 def count_records(path: Path) -> int:
     stat = path.stat()
     cache_file = Path.home() / ".local/state/miles/generative_retriever/prompt_counts.json"
-    key = f"{path}:{stat.st_size}:{stat.st_mtime_ns}"
+    key = f"counted-v1:{path}:{stat.st_size}:{stat.st_mtime_ns}"
     if cache_file.is_file():
-        try:
-            cached = json.loads(cache_file.read_text(encoding="utf-8"))
-            if isinstance(cached.get(key), int) and cached[key] > 0:
-                return int(cached[key])
-        except Exception:
-            pass
-    if path.name == "Part0.json" and stat.st_size > 1_000_000_000:
-        count = PROMPT_DATASET_ROWS
-    else:
-        with path.open("rb", buffering=16 * 1024 * 1024) as stream:
-            count = sum(bool(line.strip()) for line in stream)
+        cached = json.loads(cache_file.read_text(encoding="utf-8"))
+        if not isinstance(cached, dict):
+            raise ValueError(f"Invalid prompt count cache: {cache_file}")
+        if key in cached:
+            count = cached[key]
+            if type(count) is not int or count <= 0:
+                raise ValueError(f"Invalid prompt count in {cache_file}: {count!r}")
+            return count
+    with path.open("rb", buffering=16 * 1024 * 1024) as stream:
+        count = sum(bool(line.strip()) for line in stream)
+    final_stat = path.stat()
+    if (final_stat.st_size, final_stat.st_mtime_ns) != (stat.st_size, stat.st_mtime_ns):
+        raise RuntimeError(f"Prompt dataset changed while counting: {path}")
     if count == 0:
         raise ValueError(f"Prompt dataset is empty: {path}")
-    try:
-        cache_file.parent.mkdir(parents=True, exist_ok=True)
-        cache_file.write_text(json.dumps({key: count}), encoding="utf-8")
-    except Exception:
-        pass
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=cache_file.parent) as tmp:
+        temporary = Path(tmp) / cache_file.name
+        temporary.write_text(json.dumps({key: count}), encoding="utf-8")
+        temporary.replace(cache_file)
     return count
 
 
@@ -146,12 +151,11 @@ def prepare_prompt_data(source: Path, jsonl_alias: Path) -> PromptData:
         raise ValueError(f"Prompt data must contain either prompt or query fields: {source}")
     jsonl_alias.parent.mkdir(parents=True, exist_ok=True)
     if jsonl_alias.is_symlink():
-        if Path(os.readlink(jsonl_alias)) != source and jsonl_alias.resolve() != source:
-            jsonl_alias.unlink()
-            jsonl_alias.symlink_to(source)
+        if symlink_target(jsonl_alias) != source:
+            raise FileExistsError(f"Prompt alias points to a different dataset: {jsonl_alias}")
     else:
         if jsonl_alias.exists():
-            jsonl_alias.unlink()
+            raise FileExistsError(f"Prompt alias is not a symlink: {jsonl_alias}")
         jsonl_alias.symlink_to(source)
     return PromptData(
         path=jsonl_alias,

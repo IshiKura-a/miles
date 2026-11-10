@@ -10,6 +10,8 @@ Run:
 
 from __future__ import annotations
 
+from examples.experimental.generative_retriever.utils.paths import absolute_path
+
 import argparse
 import gc
 import logging
@@ -35,7 +37,7 @@ from examples.experimental.generative_retriever.reward.relevance_model import (
     DEFAULT_QUERY_CACHE_SIZE,
     DEFAULT_SCORE_CACHE_SIZE,
     MultiGpuRelevanceScorer,
-    resolve_relevance_source,
+    relevance_source_path,
 )
 from examples.experimental.generative_retriever.reward.relevance_reward import (
     DEFAULT_REWARD_BATCH_SIZE,
@@ -178,6 +180,7 @@ class KeywordRewardEngine:
         *,
         pair_batch_size: int,
         keyword_cache_size: int = _KEYWORD_CACHE_SIZE,
+        relevance_source: str | Path,
     ) -> None:
         self.devices = _parse_devices(devices)
         self.mapping_version = mapping_version
@@ -189,6 +192,7 @@ class KeywordRewardEngine:
         self.scorer = MultiGpuRelevanceScorer(
             relevance_model,
             self.devices,
+            relevance_source=relevance_source,
             batch_size=batch_size,
             cross_batch_size=_CROSS_BATCH_SIZE,
             feature_cache_size=query_cache_size,
@@ -663,8 +667,8 @@ def create_app(
     if query_cache_size <= 0 or keyword_cache_size <= 0 or score_cache_size <= 0:
         raise ValueError("Reward cache capacities must be positive")
     request_model = reward_request_model(max_samples_per_request)
-    resolved_relevance_source = str(resolve_relevance_source(relevance_model))
-    resolved_relevance_model = str(Path(relevance_model).expanduser().resolve())
+    resolved_relevance_source = str(relevance_source_path(relevance_model))
+    resolved_relevance_model = str(absolute_path(relevance_model))
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -680,6 +684,7 @@ def create_app(
             docids_per_query,
             pair_batch_size=pair_batch_size,
             keyword_cache_size=keyword_cache_size,
+            relevance_source=resolved_relevance_source,
         )
         gc.collect()
         gc.freeze()

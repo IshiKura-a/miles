@@ -6,6 +6,8 @@ checkpoint shards. Model weights are not copied.
 
 from __future__ import annotations
 
+from examples.experimental.generative_retriever.utils.paths import absolute_path, symlink_target
+
 import argparse
 import json
 import os
@@ -14,6 +16,7 @@ import subprocess
 import sys
 
 from examples.experimental.generative_retriever.model.model_loading import require_directory
+from examples.experimental.generative_retriever.index.id_text_mapping import is_columnar_index_dir
 from examples.experimental.generative_retriever.reward.relevance_reward import (
     DEFAULT_TRAIN_GROUP_SIZE,
     RQ_CODE_DIM,
@@ -22,7 +25,7 @@ from examples.experimental.generative_retriever.reward.relevance_reward import (
 
 
 def require_sglang_abort_patch() -> None:
-    patch = Path(__file__).resolve().parent / "patches/sglang-embedding-abort.patch"
+    patch = Path(__file__).absolute().parent / "patches/sglang-embedding-abort.patch"
     sglang_root = Path(sys.prefix) / "src/sglang"
     result = subprocess.run(
         ["git", "-C", str(sglang_root), "apply", "--reverse", "--check", str(patch)],
@@ -46,7 +49,7 @@ _QWEN_ASSETS = (
 
 def _replace_symlink(link: Path, target: Path) -> None:
     if link.is_symlink():
-        if Path(os.readlink(link)) == target or link.resolve() == target:
+        if symlink_target(link) == target:
             return
         link.unlink()
     elif link.exists():
@@ -69,12 +72,10 @@ def prepare_bundle(
     checkpoint_path = require_directory(checkpoint, "checkpoint")
     qwen_path = require_directory(qwen_model, "Qwen model")
     slm_path = require_directory(slm_root, "SLMv3 source")
-    mapping_path = Path(id_mapping).expanduser().resolve()
-    if not mapping_path.is_file() and not (
-        mapping_path.is_dir() and (mapping_path / "docid_keywords.parquet").is_file()
-    ):
-        raise FileNotFoundError(f"Official ID mapping is missing: {mapping_path}")
-    output_path = Path(output).expanduser().resolve()
+    mapping_path = absolute_path(id_mapping)
+    if not is_columnar_index_dir(mapping_path):
+        raise FileNotFoundError(f"Incomplete official mapping index: {mapping_path}")
+    output_path = absolute_path(output)
     output_path.mkdir(parents=True, exist_ok=True)
 
     if decoding_mode not in {"beam", "beam_sample", "sample"}:

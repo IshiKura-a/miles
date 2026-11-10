@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from examples.experimental.generative_retriever.utils.paths import absolute_path
+
 import argparse
 from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import Annotated, Any
 
 import httpx
@@ -19,6 +20,7 @@ from examples.experimental.generative_retriever.index.id_text_mapping import (
 )
 from examples.experimental.generative_retriever.reward.relevance_model import (
     MultiGpuRelevanceScorer,
+    relevance_source_path,
 )
 from examples.experimental.generative_retriever.reward.relevance_reward import (
     MAX_DOCIDS_PER_QUERY,
@@ -70,10 +72,11 @@ class GoodCountPool:
         self.mapping_version = mapping_version
         self.use_initial = use_initial
         self.devices = devices
-        self.relevance_model = str(Path(relevance_model).expanduser().resolve())
+        self.relevance_model = str(absolute_path(relevance_model))
         self.scorer = MultiGpuRelevanceScorer(
             self.relevance_model,
             devices,
+            relevance_source=relevance_source_path(self.relevance_model),
             batch_size=batch_size,
             score_cache_size=4_194_304,
             pair_batch_size=REWARD_PAIR_BATCH_SIZE,

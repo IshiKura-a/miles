@@ -4,12 +4,13 @@ Example:
     python -m examples.experimental.generative_retriever.reward.build_baseline_rewards \
         --baseline-results /path/to/official-gr-constrained-reward-inputs.json \
         --mapping-url http://127.0.0.1:30488 \
-        --relevance-source /path/to/checkpoint/code \
         --relevance-model /path/to/ForArcher/Large \
         --output-dir /path/to/baseline-rewards --max-queries 1
 """
 
 from __future__ import annotations
+
+from examples.experimental.generative_retriever.utils.paths import absolute_path
 
 import argparse
 import json
@@ -24,7 +25,7 @@ from examples.experimental.generative_retriever.model.model_loading import requi
 from examples.experimental.generative_retriever.reward.relevance_model import (
     load_relevance_pipeline_factory,
     optimize_graphene_pipeline,
-    resolve_relevance_source,
+    relevance_source_path,
 )
 from examples.experimental.generative_retriever.reward.relevance_reward import (
     DEFAULT_TRAIN_GROUP_SIZE, DOCID_REWARD_FLOOR, PM_THRESHOLD, SM_THRESHOLD, REWARD_MODES, RewardMode,
@@ -130,7 +131,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline-results", required=True)
     parser.add_argument("--mapping-url", required=True)
-    parser.add_argument("--relevance-source")
     parser.add_argument("--relevance-model", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--max-queries", type=int, default=1)
@@ -147,10 +147,10 @@ def main() -> None:
     records = evidence["queries"][:args.max_queries]
     if not records:
         raise ValueError("Baseline evidence contains no queries")
-    output = Path(args.output_dir).expanduser().resolve()
+    output = absolute_path(args.output_dir)
     if output.exists():
         raise FileExistsError(f"Baseline output already exists: {output}")
-    relevance_source = resolve_relevance_source(args.relevance_model, args.relevance_source)
+    relevance_source = relevance_source_path(args.relevance_model)
     logging.basicConfig(level=logging.INFO)
     pipeline_factory = load_relevance_pipeline_factory(relevance_source)
     pipeline = pipeline_factory(
@@ -165,9 +165,9 @@ def main() -> None:
         for index, record in enumerate(records)
     ]
     (output / "manifest.json").write_text(json.dumps({
-        "baseline_results": str(Path(args.baseline_results).resolve()), "mapping_version": mapping_version,
+        "baseline_results": str(absolute_path(args.baseline_results)), "mapping_version": mapping_version,
         "relevance_source": str(relevance_source),
-        "relevance_model": str(Path(args.relevance_model).resolve()),
+        "relevance_model": str(absolute_path(args.relevance_model)),
         "queries": summaries, "status": "complete",
         "reward_mode": args.reward_mode, "docid_aggregation": "mean",
     }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

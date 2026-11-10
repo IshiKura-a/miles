@@ -2,21 +2,19 @@
 
 from __future__ import annotations
 
+from examples.experimental.generative_retriever.utils.paths import absolute_path
+
 from collections.abc import Callable
 from functools import lru_cache
-import hashlib
-from pathlib import Path
 from typing import Any, cast
 
 import numpy as np
-import pyarrow.parquet as pq
 import torch
 from torch import nn
 import torch.nn.functional as F
 from transformers import T5Config, T5PreTrainedModel
 from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
 
-from examples.experimental.generative_retriever.index.id_text_mapping import is_columnar_index_dir
 from examples.experimental.generative_retriever.model.model_loading import import_slmv3, require_directory
 
 PrefixConstraint = Callable[[int, torch.Tensor], list[int]]
@@ -200,71 +198,15 @@ class SortedU32Constraint:
 
 
 @lru_cache(maxsize=1)
-def load_constraint(slm_root: str, mapping_path: str, code_num: int, code_dim: int) -> PrefixConstraint:
-    slmv3 = import_slmv3(require_directory(slm_root, "SLMv3 source"))
-    mapping = Path(mapping_path).expanduser().resolve()
-    if is_columnar_index_dir(mapping):
-        if code_num != 4 or code_dim != 256:
-            raise ValueError("Columnar u32 docid index requires code_num=4 and code_dim=256")
-        u_path = mapping / "docid_unique.u32.npy"
-        if u_path.is_file():
-            unique_u32 = np.load(u_path, mmap_mode="r")
-        else:
-            table = pq.read_table(mapping / "docid_keywords.parquet", columns=["docid_u32"])
-            unique_u32 = np.unique(table.column("docid_u32").to_numpy(zero_copy_only=False))
-        constraint = SortedU32Constraint(unique_u32, code_dim=code_dim)
-        if len(constraint._level1) != code_dim:
-            raise ValueError("Official mapping must cover the initial codebook used by SLMGR")
-        return constraint
-
-    initial = mapping.stat()
-    cache_key = hashlib.sha256(f"{mapping}:{initial.st_size}:{initial.st_mtime_ns}".encode()).hexdigest()[:16]
-    cache_u32_path = Path(f"/tmp/gr_unique_docids_{cache_key}.u32.npy")
-    if code_num == 4 and code_dim == 256 and cache_u32_path.is_file():
-        unique_u32 = np.load(cache_u32_path, mmap_mode="r")
-        return SortedU32Constraint(unique_u32, code_dim=code_dim)
-    raw_ids: set[bytes] = set()
-    scanned_bytes = 0
-    with mapping.open("rb", buffering=8 * 1024 * 1024) as stream:
-        for line_number, line in enumerate(stream, 1):
-            raw_id, separator, _ = line.partition(b"\t")
-            if not separator:
-                raise ValueError(f"Official mapping row {line_number} has no text column")
-            raw_ids.add(raw_id)
-            scanned_bytes += len(line)
-    final = mapping.stat()
-    if (scanned_bytes, final.st_size, final.st_mtime_ns) != (initial.st_size, initial.st_size, initial.st_mtime_ns):
-        raise RuntimeError("Official mapping changed while loading decoder constraints")
-    docids = []
-    roots = set()
-    packed_list: list[int] = []
-    for raw_id in raw_ids:
-        values = [int(value) for value in raw_id.split()]
-        if len(values) != code_num or any(not i * code_dim <= value < (i + 1) * code_dim
-                                          for i, value in enumerate(values)):
-            raise ValueError(f"Invalid official positional ID: {raw_id!r}")
-        roots.add(values[0])
-        docids.append(" ".join(map(str, values)))
-        if code_num == 4 and code_dim == 256:
-            packed_list.append(
-                (values[0] << 24) | ((values[1] - 256) << 16) | ((values[2] - 512) << 8) | (values[3] - 768)
-            )
-    if roots != set(range(code_dim)):
+def load_constraint(mapping_path: str, code_num: int, code_dim: int) -> PrefixConstraint:
+    mapping = absolute_path(mapping_path)
+    if code_num != 4 or code_dim != 256:
+        raise ValueError("Columnar u32 docid index requires code_num=4 and code_dim=256")
+    unique_u32 = np.load(mapping / "docid_unique.u32.npy", mmap_mode="r")
+    constraint = SortedU32Constraint(unique_u32, code_dim=code_dim)
+    if len(constraint._level1) != code_dim:
         raise ValueError("Official mapping must cover the initial codebook used by SLMGR")
-    del raw_ids
-    if packed_list:
-        unique_arr = np.unique(np.asarray(packed_list, dtype=np.uint32))
-        try:
-            tmp_cache = cache_u32_path.with_suffix(".tmp.npy")
-            np.save(tmp_cache, unique_arr)
-            tmp_cache.replace(cache_u32_path)
-        except Exception:
-            pass
-        del packed_list
-        return SortedU32Constraint(unique_arr, code_dim=code_dim)
-    del packed_list
-    args = slmv3["RunArguments"](infer_mode=2, code_num=code_num, code_dim=code_dim, uniqueid=1)
-    return slmv3["get_restrict_decode_vocab"](args, docid_list=docids, id_bias=2)
+    return constraint
 
 
 def build_generation_model(

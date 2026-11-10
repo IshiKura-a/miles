@@ -14,6 +14,8 @@ Only processes started for this run are stopped on exit.
 
 from __future__ import annotations
 
+from examples.experimental.generative_retriever.utils.paths import absolute_path, symlink_target
+
 import argparse
 import asyncio
 import hashlib
@@ -36,6 +38,7 @@ from ray._private import ray_constants
 from ray._private.node import Node
 from ray._private.parameter import RayParams
 
+from examples.experimental.generative_retriever.index.id_text_mapping import COLUMNAR_INDEX_FILES, is_columnar_index_dir
 from examples.experimental.generative_retriever.runtime.training_common import (
     ScriptArgs, count_records, expanded_path, prepare_prompt_data, required_directory,
 )
@@ -91,7 +94,7 @@ from examples.experimental.generative_retriever.services.baseline_service import
 )
 from miles.utils.external_utils.command_utils import create_run_id
 
-_REPO = Path(__file__).resolve().parents[3]
+_REPO = Path(__file__).absolute().parents[3]
 _MODULE = "examples.experimental.generative_retriever.run_grpo_multinode_async"
 _RESIDENT_MAPPING_PORT = 31480
 _BASELINE_PORT = 31581
@@ -137,13 +140,12 @@ def build_manifest(
     qwen = required_directory(args.qwen_model, "Qwen encoder")
     slm_root = required_directory(args.slm_root, "SLMv3 source")
     relevance = required_directory(args.relevance_model, "relevance model")
-    mapping = Path(os.path.expandvars(args.id_mapping)).resolve()
-    prompt = Path(os.path.expandvars(args.prompt_data)).resolve()
-    if (
-        not mapping.is_file()
-        and not (mapping.is_dir() and (mapping / "docid_keywords.parquet").is_file())
-    ) or not prompt.is_file():
-        raise FileNotFoundError(f"Official mapping or prompt dataset missing: {mapping}, {prompt}")
+    mapping = absolute_path(os.path.expandvars(args.id_mapping))
+    prompt = absolute_path(os.path.expandvars(args.prompt_data))
+    if not is_columnar_index_dir(mapping):
+        raise FileNotFoundError(f"Incomplete official mapping index: {mapping}")
+    if not prompt.is_file():
+        raise FileNotFoundError(f"Prompt dataset is missing: {prompt}")
     mapping_url, mapping_owned = select_mapping_service(mapping, addresses[0], resident_port=_RESIDENT_MAPPING_PORT)
     output = expanded_path(args.output_dir, "output_dir", directory=False)
     run_dir = output / args.run_id
@@ -167,7 +169,7 @@ def build_manifest(
             ).is_file():
                 raise FileNotFoundError("Resume requires the matching rollout dataset state")
             mapping_checkpoint = str(checkpoint_dir / f"iter_{iteration:07d}" / "mapping")
-            if not (Path(mapping_checkpoint) / "overlay.parquet").is_file():
+            if not is_columnar_index_dir(mapping_checkpoint) or not (Path(mapping_checkpoint) / "overlay.parquet").is_file():
                 raise FileNotFoundError("Resume requires the matching mapping overlay checkpoint")
         elif (checkpoint_dir / "latest_checkpointed_iteration.txt").is_file():
             raise FileExistsError(f"Run directory already contains checkpoints; pass --resume: {run_dir}")
@@ -391,7 +393,7 @@ def prepare_node_assets(manifest: Manifest) -> None:
     if not source.is_file():
         raise FileNotFoundError(f"Prompt dataset is missing on this node: {source}")
     if alias.is_symlink():
-        if alias.resolve() != source:
+        if symlink_target(alias) != source:
             raise FileExistsError(f"Prompt alias points to a different dataset: {alias}")
     elif alias.exists():
         raise FileExistsError(f"Prompt alias is not a symlink: {alias}")
@@ -421,16 +423,18 @@ def prepare_node_assets(manifest: Manifest) -> None:
 def validate_run_cluster(manifest: Manifest) -> None:
     require_sglang_abort_patch()
     sglang_root = Path(sys.prefix) / "src/sglang"
-    patch = Path(__file__).resolve().parent / "runtime/patches/sglang-embedding-abort.patch"
+    patch = Path(__file__).absolute().parent / "runtime/patches/sglang-embedding-abort.patch"
     source_files = (
         sglang_root / "python/sglang/srt/entrypoints/openai/serving_embedding.py",
         Path(manifest["slm_root"]) / "model.py",
+        Path(manifest["slm_root"]) / "utils.py",
+        Path(manifest["slm_root"]) / "CustomizedEncoder.py",
         Path(manifest["checkpoint"]) / "pytorch_model.bin.index.json",
         Path(manifest["qwen_model"]) / "model.safetensors.index.json",
     )
     required = (
         (Path(manifest["prompt_source"]), "f"),
-        (Path(manifest["mapping"]), "e"),
+        *((Path(manifest["mapping"]) / name, "f") for name in COLUMNAR_INDEX_FILES),
         (Path(sys.executable), "x"),
         (_REPO / ".venv/activate-rocm.sh", "f"),
     )

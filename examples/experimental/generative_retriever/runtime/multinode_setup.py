@@ -53,10 +53,8 @@ def _record_path(manifest: Manifest) -> Path:
 
 
 def check_resume(manifest: Manifest) -> None:
-    """Check the immutable record, accepting legacy runs with manifest.json."""
+    """Check the immutable record for this run."""
     path = _record_path(manifest)
-    if not path.is_file():
-        path = Path(manifest["run_dir"]) / "manifest.json"
     previous = cast(Manifest, json.loads(path.read_text(encoding="utf-8")))
     if _identity(previous) != _identity(manifest):
         raise ValueError("Resume configuration differs from the original run")

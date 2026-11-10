@@ -14,6 +14,8 @@ Example:
 
 from __future__ import annotations
 
+from examples.experimental.generative_retriever.utils.paths import absolute_path
+
 import argparse
 import ctypes
 import json
@@ -495,9 +497,9 @@ def build_index(
     workers: int = 32,
 ) -> dict[str, Any]:
     started = time.monotonic()
-    na_ss = na_ss.expanduser().resolve()
-    intl_ss = intl_ss.expanduser().resolve()
-    output_dir = output_dir.expanduser().resolve()
+    na_ss = absolute_path(na_ss)
+    intl_ss = absolute_path(intl_ss)
+    output_dir = absolute_path(output_dir)
     if not na_ss.is_file():
         raise FileNotFoundError(f"NA SStream file not found: {na_ss}")
     if not intl_ss.is_file():

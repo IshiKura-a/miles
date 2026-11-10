@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from examples.experimental.generative_retriever.utils.paths import absolute_path
+
 from collections import OrderedDict
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -20,6 +22,7 @@ from threading import Lock
 from typing import Any, Protocol, cast
 
 import numpy as np
+from filelock import FileLock
 import torch
 import torch.nn.functional as F
 import xxhash
@@ -119,8 +122,7 @@ def make_fast_single_chunk_gated_delta_rule(orig_fn):
     return _fast_rule
 
 
-def make_fast_rms_norm_gated(norm_mod: Any):
-    eps = float(getattr(norm_mod, "eps", getattr(norm_mod, "variance_epsilon", 1e-6)))
+def make_fast_rms_norm_gated(norm_mod: Any, eps: float):
 
     def _fast_norm(hidden_states: torch.Tensor, gate: torch.Tensor | None = None) -> torch.Tensor:
         input_dtype = hidden_states.dtype
@@ -152,7 +154,7 @@ def optimize_graphene_pipeline(pipeline: object) -> None:
                     mod.chunk_gated_delta_rule = make_fast_single_chunk_gated_delta_rule(orig_chunk)
                 norm_mod = getattr(mod, "norm", None)
                 if norm_mod is not None and getattr(norm_mod.forward, "__name__", "") != "_fast_norm":
-                    norm_mod.forward = make_fast_rms_norm_gated(norm_mod)
+                    norm_mod.forward = make_fast_rms_norm_gated(norm_mod, float(mod.layer_norm_epsilon))
 
 
 class RelevancePipeline(Protocol):
@@ -328,7 +330,7 @@ class RelevanceScorer:
             )
             padded = missing_texts + [missing_texts[-1]] * (-len(missing_texts) % pad_multiple)
             prompts = [prefix + text for text in padded]
-            batch_size = int(getattr(engine, "batch_size", _TOWER_MAX_BATCH_SIZE))
+            batch_size = int(engine.batch_size)
             chunks: list[torch.Tensor] = []
             for start in range(0, len(prompts), batch_size):
                 token_ids, attention = engine._prepare_batch(prompts[start : start + batch_size])
@@ -466,6 +468,7 @@ class RelevanceScorer:
 def _gpu_worker_loop(
     conn: Connection,
     relevance_model: str,
+    relevance_source: Path,
     device: str,
     batch_size: int,
     cross_batch_size: int,
@@ -476,7 +479,6 @@ def _gpu_worker_loop(
     try:
         if device.startswith("cuda:"):
             torch.cuda.set_device(int(device.split(":", 1)[1]))
-        relevance_source = resolve_relevance_source(relevance_model)
         factory = load_relevance_pipeline_factory(relevance_source)
         pipeline = factory(
             relevance_model,
@@ -539,6 +541,7 @@ class MultiGpuRelevanceScorer:
         relevance_model: str,
         devices: Sequence[str],
         *,
+        relevance_source: str | Path,
         batch_size: int = 8192,
         cross_batch_size: int = _CROSS_CHUNK_SIZE,
         feature_cache_size: int = DEFAULT_QUERY_CACHE_SIZE,
@@ -567,7 +570,7 @@ class MultiGpuRelevanceScorer:
             CacheStats(capacity=keyword_cache_size, size=0, hits=0, misses=0, evictions=0)
             for _ in range(self.num_gpus)
         ]
-        _stage_local_relevance_source(resolve_relevance_source(relevance_model))
+        staged_source = _stage_local_relevance_source(Path(relevance_source))
         ctx = mp.get_context("spawn")
         self._executor = ThreadPoolExecutor(max_workers=self.num_gpus)
         self._conns: list[Connection] = []
@@ -580,6 +583,7 @@ class MultiGpuRelevanceScorer:
                 args=(
                     child_conn,
                     relevance_model,
+                    staged_source,
                     dev,
                     batch_size,
                     cross_batch_size,
@@ -796,7 +800,7 @@ class MultiGpuRelevanceScorer:
 
 
 def _validate_source(path: Path) -> Path:
-    source = path.expanduser().resolve()
+    source = absolute_path(path)
     if not (source / _PIPELINE_PATH).is_file():
         raise FileNotFoundError(f"Graphene pipeline is missing from relevance source: {source}")
     commit_path = source / "GIT_COMMIT.txt"
@@ -808,64 +812,40 @@ def _validate_source(path: Path) -> Path:
     return source
 
 
-def resolve_relevance_source(
-    relevance_model: str | Path,
-    relevance_source: str | Path | None = None,
-) -> Path:
-    if relevance_source is not None:
-        return _validate_source(Path(relevance_source))
-
-    model = Path(relevance_model).expanduser().resolve()
-    pointer = model / "SOURCE_CHECKPOINT.txt"
-    if not pointer.is_file():
-        raise FileNotFoundError(f"Relevance model has no SOURCE_CHECKPOINT.txt: {model}")
-    source_checkpoint = Path(pointer.read_text(encoding="utf-8").strip())
-    direct_source = source_checkpoint / "code"
-    if direct_source.is_dir():
-        return _validate_source(direct_source)
-
+def relevance_source_path(relevance_model: str | Path) -> Path:
     cosmos_root = os.environ.get("cosmos_data_path")
-    marker = "/local/"
-    source_text = os.fspath(source_checkpoint)
-    if not cosmos_root or marker not in source_text:
-        raise FileNotFoundError(
-            "Cannot resolve relevance source snapshot; set cosmos_data_path or pass --relevance-source"
-        )
-    relative_checkpoint = source_text.split(marker, 1)[1]
-    return _validate_source(Path(cosmos_root) / "local" / relative_checkpoint / "code")
+    if not cosmos_root or not cosmos_root.strip():
+        raise ValueError("cosmos_data_path must be set for the relevance source")
+    pointer = Path(relevance_model).expanduser() / "SOURCE_CHECKPOINT.txt"
+    source_checkpoint = pointer.read_text(encoding="utf-8").strip()
+    _, marker, relative = source_checkpoint.partition("/local/")
+    if not marker:
+        raise ValueError(f"Relevance source checkpoint has no /local/ prefix: {source_checkpoint}")
+    return _validate_source(Path(cosmos_root) / "local" / relative / "code")
 
 
 def _stage_local_relevance_source(source: Path) -> Path:
     resolved = _validate_source(source)
     local_root = Path(tempfile.gettempdir())
-    try:
-        if resolved.is_relative_to(local_root):
-            return resolved
-    except ValueError:
-        pass
+    if resolved.is_relative_to(local_root):
+        return resolved
     target = local_root / f"gr_relevance_source_{EXPECTED_GRAPHENE_COMMIT[:12]}"
-    if (target / _PIPELINE_PATH).is_file() and (target / "GIT_COMMIT.txt").is_file():
-        try:
-            return _validate_source(target)
-        except (OSError, ValueError):
-            pass
-    staging = local_root / f".gr_relevance_source_{EXPECTED_GRAPHENE_COMMIT[:12]}.{os.getpid()}"
-    shutil.rmtree(staging, ignore_errors=True)
-    staging.mkdir(parents=True, exist_ok=True)
-    for metadata_name in ("GIT_COMMIT.txt", "SHA256SUMS", "SOURCE_REPOSITORY.txt"):
-        metadata_src = resolved / metadata_name
-        if metadata_src.is_file():
-            shutil.copyfile(metadata_src, staging / metadata_name)
-    shutil.copytree(
-        resolved / "graphene",
-        staging / "graphene",
-        copy_function=shutil.copyfile,
-        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
-    )
-    try:
-        os.replace(staging, target)
-    except OSError:
-        shutil.rmtree(staging, ignore_errors=True)
+    if not target.exists():
+        with FileLock(f"{target}.lock"):
+            if not target.exists():
+                with tempfile.TemporaryDirectory(prefix=f".gr_relevance_source_{EXPECTED_GRAPHENE_COMMIT[:12]}.", dir=local_root) as tmp:
+                    staging = Path(tmp)
+                    for metadata_name in ("GIT_COMMIT.txt", "SHA256SUMS", "SOURCE_REPOSITORY.txt"):
+                        metadata_src = resolved / metadata_name
+                        if metadata_src.is_file():
+                            shutil.copyfile(metadata_src, staging / metadata_name)
+                    shutil.copytree(
+                        resolved / "graphene",
+                        staging / "graphene",
+                        copy_function=shutil.copyfile,
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+                    )
+                    os.replace(staging, target)
     return _validate_source(target)
 
 
