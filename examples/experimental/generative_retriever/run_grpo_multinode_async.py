@@ -428,7 +428,9 @@ def validate_run_cluster(manifest: Manifest) -> None:
         sglang_root / "python/sglang/srt/entrypoints/openai/serving_embedding.py",
         Path(manifest["slm_root"]) / "model.py",
         Path(manifest["slm_root"]) / "utils.py",
-        Path(manifest["slm_root"]) / "CustomizedEncoder.py",
+        Path(manifest["slm_root"]) / "CustomizedEncoder/__init__.py",
+        Path(manifest["slm_root"]) / "CustomizedEncoder/Encoder_QW1216.py",
+        Path(manifest["slm_root"]) / "CustomizedEncoder/Encoder_QW1216text.py",
         Path(manifest["checkpoint"]) / "pytorch_model.bin.index.json",
         Path(manifest["qwen_model"]) / "model.safetensors.index.json",
     )
