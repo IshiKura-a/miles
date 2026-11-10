@@ -191,7 +191,7 @@ async def request_embedding(args: Any, router_url: str, prompt_ids: list[int]) -
                 },
             )
             break
-        except (httpx.ConnectError, httpx.ConnectTimeout) as error:
+        except (httpx.TransportError, httpx.TimeoutException) as error:
             if attempt == _TRANSPORT_ATTEMPTS:
                 raise
             logger.warning(

@@ -6,6 +6,7 @@ from examples.experimental.generative_retriever.utils.paths import absolute_path
 
 from collections.abc import Callable
 from functools import lru_cache
+from threading import Lock
 from typing import Any, cast
 
 import numpy as np
@@ -63,6 +64,7 @@ class SortedU32Constraint:
         self._ends_cpu = torch.from_numpy(ends)
         self._low8_cpu = torch.from_numpy((self._u32 & np.uint32(0xFF)).astype(np.int64))
         self._gpu_tables: dict[torch.device, tuple[torch.Tensor, ...]] = {}
+        self._lock = Lock()
 
     def _tables_for(self, device: torch.device) -> tuple[torch.Tensor, ...]:
         if device.type == "cpu":
@@ -76,18 +78,23 @@ class SortedU32Constraint:
                 self._low8_cpu,
             )
         cached = self._gpu_tables.get(device)
-        if cached is None:
-            cached = (
-                self._l0_cpu.to(device=device, non_blocking=True),
-                self._l1_cpu.to(device=device, non_blocking=True),
-                self._l2_cpu.to(device=device, non_blocking=True),
-                self._u_p24_cpu.to(device=device, non_blocking=True),
-                self._starts_cpu.to(device=device, non_blocking=True),
-                self._ends_cpu.to(device=device, non_blocking=True),
-                self._low8_cpu.to(device=device, non_blocking=True),
-            )
-            self._gpu_tables[device] = cached
-        return cached
+        if cached is not None:
+            return cached
+        with self._lock:
+            cached = self._gpu_tables.get(device)
+            if cached is None:
+                with torch.cuda.device(device):
+                    cached = (
+                        self._l0_cpu.to(device=device),
+                        self._l1_cpu.to(device=device),
+                        self._l2_cpu.to(device=device),
+                        self._u_p24_cpu.to(device=device),
+                        self._starts_cpu.to(device=device),
+                        self._ends_cpu.to(device=device),
+                        self._low8_cpu.to(device=device),
+                    )
+                self._gpu_tables[device] = cached
+            return cached
 
     def _fill_level3_mask(
         self,

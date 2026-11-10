@@ -5,8 +5,10 @@ from __future__ import annotations
 from examples.experimental.generative_retriever.utils.paths import absolute_path
 
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+import fcntl
 import gc
 import importlib
 import logging
@@ -465,6 +467,19 @@ class RelevanceScorer:
         return resolved
 
 
+@contextmanager
+def gpu_exec_lock(lock_fd: int | None) -> Iterator[None]:
+    if lock_fd is None:
+        yield
+        return
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    try:
+        yield
+        torch.cuda.synchronize()
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+
+
 def _gpu_worker_loop(
     conn: Connection,
     relevance_model: str,
@@ -476,9 +491,13 @@ def _gpu_worker_loop(
     keyword_cache_size: int,
     pair_batch_size: int,
 ) -> None:
+    lock_fd: int | None = None
     try:
         if device.startswith("cuda:"):
-            torch.cuda.set_device(int(device.split(":", 1)[1]))
+            gpu_idx = int(device.split(":", 1)[1])
+            torch.cuda.set_device(gpu_idx)
+            lock_path = Path(tempfile.gettempdir()) / f"gr_gpu_exec_{gpu_idx}.lock"
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         factory = load_relevance_pipeline_factory(relevance_source)
         pipeline = factory(
             relevance_model,
@@ -506,7 +525,8 @@ def _gpu_worker_loop(
                 break
             cmd, payload = msg
             if cmd == "encode_queries":
-                q_map, q_delta = scorer.encode_queries_cached(payload)
+                with gpu_exec_lock(lock_fd):
+                    q_map, q_delta = scorer.encode_queries_cached(payload)
                 encoded_u16 = {
                     q: t.contiguous().view(torch.uint16).numpy()
                     for q, t in q_map.items()
@@ -515,9 +535,10 @@ def _gpu_worker_loop(
             elif cmd == "score_pairs":
                 q_u16, keywords, q_indices, k_indices = payload
                 q_tensor = torch.from_numpy(q_u16).view(torch.bfloat16)
-                scores, k_delta = scorer.score_with_query_embeddings(
-                    q_tensor, keywords, q_indices, k_indices,
-                )
+                with gpu_exec_lock(lock_fd):
+                    scores, k_delta = scorer.score_with_query_embeddings(
+                        q_tensor, keywords, q_indices, k_indices,
+                    )
                 conn.send(("ok", (scores, k_delta, scorer.keyword_features.stats())))
             elif cmd == "stats":
                 conn.send(("ok", (scorer.query_features.stats(), scorer.keyword_features.stats())))
@@ -530,6 +551,8 @@ def _gpu_worker_loop(
             pass
         raise
     finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
         conn.close()
 
 
@@ -605,8 +628,13 @@ class MultiGpuRelevanceScorer:
 
     def _call_worker(self, shard_idx: int, cmd: str, payload: Any) -> Any:
         with self._conn_locks[shard_idx]:
+            proc = self._procs[shard_idx]
+            if not proc.is_alive():
+                raise RuntimeError(f"GPU subprocess {self.devices[shard_idx]} exited unexpectedly")
             conn = self._conns[shard_idx]
             conn.send((cmd, payload))
+            if not conn.poll(300.0):
+                raise RuntimeError(f"GPU subprocess {self.devices[shard_idx]} timed out after 300s")
             status, result = conn.recv()
         if status != "ok":
             raise RuntimeError(f"GPU subprocess {self.devices[shard_idx]} error: {result}")

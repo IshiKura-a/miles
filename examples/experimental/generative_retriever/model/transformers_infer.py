@@ -17,6 +17,7 @@ from __future__ import annotations
 from examples.experimental.generative_retriever.utils.paths import absolute_path
 
 import argparse
+from contextlib import AbstractContextManager, nullcontext
 import copy
 from dataclasses import dataclass
 import json
@@ -61,6 +62,10 @@ class GenerationResult:
     positional_docid: list[int]
     rq_codes: list[int]
     token_logprobs: list[float]
+
+
+def _device_context(device: torch.device) -> AbstractContextManager[Any]:
+    return torch.cuda.device(device) if device.type == "cuda" else nullcontext()
 
 
 def _check_transformers_version(checkpoint: Path) -> None:
@@ -119,15 +124,18 @@ class SLMv3Retriever:
             domain_idx=[0],
         )
         load_checkpoint(self.model, self.checkpoint)
-        self.model.eval().to(device=self.device, dtype=torch.bfloat16)
+        self.constraint: PrefixConstraint = load_constraint(
+            str(mapping), run_args.code_num, run_args.code_dim,
+        )
+        with _device_context(self.device):
+            self.model.eval().to(device=self.device, dtype=torch.bfloat16)
+            if isinstance(self.constraint, SortedU32Constraint):
+                self.constraint._tables_for(self.device)
         self.encoder = self.model.encoder_list[0]
         self.processor = self.encoder.processor
         self.tokenizer = self.encoder.tokenizer
         self.code_dim = run_args.code_dim
         self.code_num = run_args.code_num
-        self.constraint: PrefixConstraint = load_constraint(
-            str(mapping), self.code_num, self.code_dim,
-        )
 
     def clone_to_device(self, device: str) -> SLMv3Retriever:
         if device.startswith("cuda") and not torch.cuda.is_available():
@@ -140,7 +148,10 @@ class SLMv3Retriever:
         cloned.qwen_model = self.qwen_model
         cloned.slm_root = self.slm_root
         cloned.device = target_device
-        cloned.model = copy.deepcopy(self.model).to(device=target_device, dtype=torch.bfloat16).eval()
+        with _device_context(target_device):
+            cloned.model = copy.deepcopy(self.model).to(device=target_device, dtype=torch.bfloat16).eval()
+            if isinstance(self.constraint, SortedU32Constraint):
+                self.constraint._tables_for(target_device)
         cloned.encoder = cloned.model.encoder_list[0]
         cloned.processor = copy.deepcopy(self.processor)
         cloned.tokenizer = copy.deepcopy(self.tokenizer)
@@ -188,9 +199,8 @@ class SLMv3Retriever:
             max_length=64,
             return_tensors="pt",
         )
-        inputs = {key: value.to(self.device) for key, value in batch.items()}
-
-        with torch.inference_mode():
+        with _device_context(self.device), torch.inference_mode():
+            inputs = {key: value.to(self.device) for key, value in batch.items()}
             _, hidden_states, attention_mask = self.encoder.infer_embedding(
                 {
                     "input_ids": inputs["input_ids"],

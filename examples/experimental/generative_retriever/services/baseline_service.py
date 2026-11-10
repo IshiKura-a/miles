@@ -1,35 +1,45 @@
-"""Resident two-GPU frozen baseline constrained-beam service."""
+"""Resident multi-GPU frozen baseline constrained-beam service."""
 
 from __future__ import annotations
 
 from examples.experimental.generative_retriever.utils.paths import absolute_path
 
 import argparse
-import logging
-import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import asdict
+import gc
+import logging
+import multiprocessing as mp
+from multiprocessing.connection import Connection
+import os
+from pathlib import Path
+import tempfile
 from threading import Lock
+import time
 from typing import Annotated, Any
 
-import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from filelock import FileLock
 from pydantic import BaseModel, Field, field_validator
+import torch
+import uvicorn
 
-from examples.experimental.generative_retriever.services.lru_cache import LRUCache
 from examples.experimental.generative_retriever.model.model_loading import load_policy_head_checkpoint
 from examples.experimental.generative_retriever.model.transformers_infer import GenerationResult, SLMv3Retriever
+from examples.experimental.generative_retriever.reward.relevance_model import gpu_exec_lock
 from examples.experimental.generative_retriever.reward.relevance_reward import (
     DEFAULT_TRAIN_GROUP_SIZE,
     MAX_EVAL_BATCH_SIZE,
 )
+from examples.experimental.generative_retriever.services.lru_cache import LRUCache
 
 logger = logging.getLogger(__name__)
 BASELINE_SERVICE_API_VERSION = 2
 BASELINE_CACHE_SIZE = 8192
 _SERVICE_API_VERSION = BASELINE_SERVICE_API_VERSION
 _CACHE_SIZE = BASELINE_CACHE_SIZE
+_WORKER_TIMEOUT_SECONDS = 300.0
 
 
 class BaselineRequest(BaseModel):
@@ -47,18 +57,81 @@ class LoadPolicyHeadRequest(BaseModel):
     policy_checkpoint: str
 
 
-class _Worker:
-    def __init__(self, retriever: SLMv3Retriever) -> None:
-        self.retriever = retriever
-        self.lock = Lock()
+def _serialize_results(results: list[GenerationResult]) -> list[dict[str, Any]]:
+    return [
+        {
+            "decoder_token_ids": result.decoder_token_ids,
+            "positional_docid": result.positional_docid,
+            "rq_codes": result.rq_codes,
+            "token_logprobs": result.token_logprobs,
+        }
+        for result in results
+    ]
 
-    def generate(self, queries: list[str], docids_per_query: int) -> list[GenerationResult]:
-        with self.lock:
-            return self.retriever.generate(
-                queries,
-                num_beams=docids_per_query,
-                num_return_sequences=docids_per_query,
+
+def _baseline_worker_loop(
+    conn: Connection,
+    checkpoint: str,
+    qwen_model: str,
+    slm_root: str,
+    id_mapping: str,
+    device: str,
+    policy_checkpoint: str | None,
+) -> None:
+    lock_fd: int | None = None
+    try:
+        if device.startswith("cuda:"):
+            gpu_idx = int(device.split(":", 1)[1])
+            torch.cuda.set_device(gpu_idx)
+            exec_lock_path = Path(tempfile.gettempdir()) / f"gr_gpu_exec_{gpu_idx}.lock"
+            lock_fd = os.open(exec_lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        init_lock_path = Path(tempfile.gettempdir()) / "gr_baseline_init.lock"
+        with FileLock(str(init_lock_path)), gpu_exec_lock(lock_fd):
+            retriever = SLMv3Retriever(
+                checkpoint=checkpoint,
+                qwen_model=qwen_model,
+                slm_root=slm_root,
+                id_mapping=id_mapping,
+                device=device,
             )
+            if policy_checkpoint is not None:
+                load_policy_head_checkpoint(retriever.model, policy_checkpoint)
+                retriever.model.eval()
+        gc.collect()
+        gc.freeze()
+        gc.set_threshold(100_000, 500, 500)
+        conn.send(("ready", None))
+        while True:
+            msg = conn.recv()
+            if msg is None:
+                break
+            cmd, payload = msg
+            if cmd == "generate":
+                queries, docids_per_query = payload
+                with gpu_exec_lock(lock_fd):
+                    generated = retriever.generate(
+                        queries,
+                        num_beams=docids_per_query,
+                        num_return_sequences=docids_per_query,
+                    )
+                conn.send(("ok", _serialize_results(generated)))
+            elif cmd == "load_policy_head":
+                with gpu_exec_lock(lock_fd):
+                    tensor_count = load_policy_head_checkpoint(retriever.model, payload)
+                    retriever.model.eval()
+                conn.send(("ok", tensor_count))
+            else:
+                conn.send(("error", f"Unknown command: {cmd}"))
+    except BaseException as exc:
+        try:
+            conn.send(("error", f"{type(exc).__name__}: {exc}"))
+        except Exception:
+            pass
+        raise
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+        conn.close()
 
 
 class BaselinePool:
@@ -75,52 +148,66 @@ class BaselinePool:
         policy_checkpoint: str | None = None,
     ) -> None:
         self.devices = devices
+        self.worker_count = len(devices)
         self.cache: LRUCache[str, list[dict[str, Any]]] = LRUCache(cache_size)
         self.docids_per_query = docids_per_query
         self._cache_lock = Lock()
-        self.workers = []
-        first_retriever: SLMv3Retriever | None = None
+        ctx = mp.get_context("spawn")
+        self._executor = ThreadPoolExecutor(max_workers=self.worker_count)
+        self._conns: list[Connection] = []
+        self._procs: list[Any] = []
+        self._conn_locks = [Lock() for _ in range(self.worker_count)]
         for device in devices:
-            if first_retriever is None:
-                first_retriever = SLMv3Retriever(
-                    checkpoint=checkpoint,
-                    qwen_model=qwen_model,
-                    slm_root=slm_root,
-                    id_mapping=id_mapping,
-                    device=device,
-                )
-                if policy_checkpoint is not None:
-                    load_policy_head_checkpoint(first_retriever.model, policy_checkpoint)
-                retriever = first_retriever
-            else:
-                retriever = first_retriever.clone_to_device(device)
-            self.workers.append(_Worker(retriever))
-        self._executor = ThreadPoolExecutor(max_workers=len(self.workers))
+            parent_conn, child_conn = ctx.Pipe(duplex=True)
+            proc = ctx.Process(
+                target=_baseline_worker_loop,
+                args=(
+                    child_conn,
+                    checkpoint,
+                    qwen_model,
+                    slm_root,
+                    id_mapping,
+                    device,
+                    policy_checkpoint,
+                ),
+                daemon=True,
+            )
+            proc.start()
+            child_conn.close()
+            self._conns.append(parent_conn)
+            self._procs.append(proc)
+        for idx, conn in enumerate(self._conns):
+            status, detail = conn.recv()
+            if status != "ready":
+                self.close()
+                raise RuntimeError(f"Baseline GPU subprocess {self.devices[idx]} failed to start: {detail}")
+
+    def check_alive(self) -> None:
+        for idx, proc in enumerate(self._procs):
+            if not proc.is_alive():
+                raise RuntimeError(f"Baseline GPU subprocess {self.devices[idx]} is not alive")
+
+    def _call_worker(self, idx: int, cmd: str, payload: Any) -> Any:
+        with self._conn_locks[idx]:
+            proc = self._procs[idx]
+            if not proc.is_alive():
+                raise RuntimeError(f"Baseline GPU subprocess {self.devices[idx]} exited unexpectedly")
+            conn = self._conns[idx]
+            conn.send((cmd, payload))
+            if not conn.poll(_WORKER_TIMEOUT_SECONDS):
+                raise RuntimeError(f"Baseline GPU subprocess {self.devices[idx]} timed out after {_WORKER_TIMEOUT_SECONDS}s")
+            status, result = conn.recv()
+        if status != "ok":
+            raise RuntimeError(f"Baseline GPU subprocess {self.devices[idx]} error: {result}")
+        return result
 
     def load_policy_head(self, policy_checkpoint: str) -> int:
         tensor_count = 0
         with self._cache_lock:
-            for worker in self.workers:
-                with worker.lock:
-                    tensor_count = load_policy_head_checkpoint(
-                        worker.retriever.model,
-                        policy_checkpoint,
-                    )
-                    worker.retriever.model.eval()
+            for idx in range(self.worker_count):
+                tensor_count = int(self._call_worker(idx, "load_policy_head", policy_checkpoint))
             self.cache = LRUCache(self.cache.capacity)
         return tensor_count
-
-    @staticmethod
-    def _serialize(results: list[GenerationResult]) -> list[dict[str, Any]]:
-        return [
-            {
-                "decoder_token_ids": result.decoder_token_ids,
-                "positional_docid": result.positional_docid,
-                "rq_codes": result.rq_codes,
-                "token_logprobs": result.token_logprobs,
-            }
-            for result in results
-        ]
 
     def generate(self, request: BaselineRequest) -> dict[str, Any]:
         started = time.perf_counter()
@@ -134,27 +221,28 @@ class BaselinePool:
                 else:
                     resolved[index] = cached
 
-        buckets: list[list[str]] = [[] for _ in self.workers]
+        buckets: list[list[str]] = [[] for _ in range(self.worker_count)]
         for pending_index, query in enumerate(pending):
-            buckets[pending_index % len(self.workers)].append(query)
+            buckets[pending_index % self.worker_count].append(query)
         futures = []
-        for worker, bucket in zip(self.workers, buckets, strict=True):
+        for idx, bucket in enumerate(buckets):
             if bucket:
                 futures.append((
                     bucket,
                     self._executor.submit(
-                        worker.generate,
-                        bucket,
-                        self.docids_per_query,
+                        self._call_worker,
+                        idx,
+                        "generate",
+                        (bucket, self.docids_per_query),
                     ),
                 ))
         for bucket, future in futures:
-            generated = future.result()
+            generated: list[dict[str, Any]] = future.result()
             if len(generated) != len(bucket) * self.docids_per_query:
                 raise RuntimeError("Baseline worker returned an invalid beam group count")
             for query_index, query in enumerate(bucket):
                 start = query_index * self.docids_per_query
-                rows = self._serialize(generated[start:start + self.docids_per_query])
+                rows = generated[start : start + self.docids_per_query]
                 for index in pending[query]:
                     resolved[index] = rows
                 with self._cache_lock:
@@ -173,6 +261,17 @@ class BaselinePool:
 
     def close(self) -> None:
         self._executor.shutdown(wait=True)
+        for conn in self._conns:
+            try:
+                conn.send(None)
+                conn.close()
+            except Exception:
+                pass
+        for proc in self._procs:
+            if proc.is_alive():
+                proc.join(timeout=10)
+            if proc.is_alive():
+                proc.terminate()
 
 
 def _parse_devices(raw_devices: str) -> tuple[str, ...]:
@@ -225,18 +324,27 @@ def create_app(
             docids_per_query=docids_per_query,
             policy_checkpoint=policy_checkpoint,
         )
-        yield
-        app.state.pool.close()
-        del app.state.pool
+        gc.collect()
+        gc.freeze()
+        gc.set_threshold(100_000, 500, 500)
+        try:
+            yield
+        finally:
+            app.state.pool.close()
+            del app.state.pool
 
     app = FastAPI(lifespan=lifespan)
 
     @app.get("/health")
     def health() -> dict[str, Any]:
-        pool = app.state.pool
+        pool: BaselinePool = app.state.pool
+        try:
+            pool.check_alive()
+        except RuntimeError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
         return {
             "status": "ready",
-            "worker_count": len(pool.workers),
+            "worker_count": pool.worker_count,
             "devices": pool.devices,
             "docids_per_query": pool.docids_per_query,
             "cache": asdict(pool.cache.stats()),
@@ -245,11 +353,17 @@ def create_app(
 
     @app.post("/generate")
     def generate(request: BaselineRequest) -> dict[str, Any]:
-        return app.state.pool.generate(request)
+        try:
+            return app.state.pool.generate(request)
+        except RuntimeError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
 
     @app.post("/load_policy_head")
     def load_policy_head(request: LoadPolicyHeadRequest) -> dict[str, Any]:
-        count = app.state.pool.load_policy_head(request.policy_checkpoint)
+        try:
+            count = app.state.pool.load_policy_head(request.policy_checkpoint)
+        except RuntimeError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
         resolved_service_config["policy_checkpoint"] = str(
             absolute_path(request.policy_checkpoint)
         )
