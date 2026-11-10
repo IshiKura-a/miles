@@ -15,6 +15,7 @@ import httpx
 import uvicorn
 import xxhash
 from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 
 from examples.experimental.generative_retriever.services.mapping_service import SaveMappingRequest
 from examples.experimental.generative_retriever.services.reward_service import (
@@ -28,9 +29,13 @@ from examples.experimental.generative_retriever.reward.relevance_reward import (
 )
 from examples.experimental.generative_retriever.reward.reward_http import post_json_sync
 
-REWARD_ROUTER_API_VERSION = 6
+REWARD_ROUTER_API_VERSION = 7
 _SERVICE_API_VERSION = REWARD_ROUTER_API_VERSION
 logger = logging.getLogger(__name__)
+
+
+class StepRequest(BaseModel):
+    rollout_id: int
 
 
 class RewardRouter:
@@ -58,6 +63,7 @@ class RewardRouter:
         self._routing_lock = Lock()
         self._routed_samples = [0] * len(worker_urls)
         self._prepared_queries = [0] * len(worker_urls)
+        self._step_updates: dict[int, tuple[list[str], dict[str, Any]]] = {}
 
     def _worker_index(self, query: str) -> int:
         scores = [
@@ -167,69 +173,79 @@ class RewardRouter:
         )
         return result
 
-    def commit_step_updates(self) -> dict[str, Any]:
-        started = time.perf_counter()
+    def stage_step_updates(self, rollout_id: int) -> dict[str, int]:
         futures = [
-            self._executor.submit(
-                post_json_sync,
-                self._client,
-                url.removesuffix("/score") + "/harvest_step_delta",
-                {},
-            )
+            self._executor.submit(post_json_sync, self._client, url.removesuffix("/score") + "/harvest_step_delta", {})
             for url in self.worker_urls
         ]
         harvested = [future.result() for future in futures]
-        mapping_urls = list(dict.fromkeys(
-            item["mapping_url"].rstrip("/")
-            for item in harvested
-            if isinstance(item.get("mapping_url"), str) and item["mapping_url"].strip()
-        ))
-        merged_adds: dict[tuple[int, int, int, int], list[str]] = {}
-        merged_rems: dict[tuple[int, int, int, int], list[str]] = {}
-        for item in harvested:
-            for entry in item.get("additions", []):
-                key = tuple(int(v) for v in entry["docid"])
-                bucket = merged_adds.setdefault(key, [])  # type: ignore[arg-type]
-                seen = set(bucket)
-                for kw in entry["keywords"]:
-                    if kw not in seen:
-                        bucket.append(kw)
-                        seen.add(kw)
-            for entry in item.get("removals", []):
-                key = tuple(int(v) for v in entry["docid"])
-                bucket = merged_rems.setdefault(key, [])  # type: ignore[arg-type]
-                seen = set(bucket)
-                for kw in entry["keywords"]:
-                    if kw not in seen:
-                        bucket.append(kw)
-                        seen.add(kw)
-        if not mapping_urls or (not merged_adds and not merged_rems):
-            return {
-                "updated_docids": 0,
-                "added_edges": 0,
-                "removed_edges": 0,
-                "overlay_docids": 0,
-                "latency_seconds": time.perf_counter() - started,
-            }
-        delta_payload = {
-            "additions": [{"docid": list(k), "keywords": v} for k, v in merged_adds.items()],
-            "removals": [{"docid": list(k), "keywords": v} for k, v in merged_rems.items()],
-            "k_max": DOCID_MAX_KEYWORDS,
-        }
-        update_futures = [
-            self._executor.submit(
-                post_json_sync,
-                self._client,
-                f"{m_url}/update_delta",
-                delta_payload,
+        mapping_urls = list(dict.fromkeys(item["mapping_url"].rstrip("/") for item in harvested))
+
+        def resolve(item: dict[str, Any]) -> dict[str, Any]:
+            keywords = list(dict.fromkeys(
+                keyword for kind in ("additions", "removals")
+                for entry in item[kind] for keyword in entry["keywords"]
+            ))
+            if not keywords:
+                return {"additions": [], "removals": []}
+            payload = post_json_sync(
+                self._client, item["mapping_url"].rstrip("/") + "/resolve_keywords", {"keywords": keywords},
             )
-            for m_url in mapping_urls
-        ]
-        results = [future.result() for future in update_futures]
-        return {
-            **results[0],
-            "latency_seconds": time.perf_counter() - started,
+            keyword_ids = dict(zip(keywords, payload["keyword_ids"], strict=True))
+            return {
+                kind: [
+                    {"docid": entry["docid"], "keyword_ids": [keyword_ids[kw] for kw in entry["keywords"]]}
+                    for entry in item[kind]
+                ]
+                for kind in ("additions", "removals")
+            }
+
+        resolved = list(self._executor.map(resolve, harvested))
+        merged: dict[str, dict[tuple[int, ...], list[int]]] = {"additions": {}, "removals": {}}
+        for item in resolved:
+            for kind in merged:
+                for entry in item[kind]:
+                    bucket = merged[kind].setdefault(tuple(entry["docid"]), [])
+                    bucket.extend(kid for kid in entry["keyword_ids"] if kid not in bucket)
+        delta: dict[str, Any] = {
+            kind: [{"docid": list(docid), "keyword_ids": kids} for docid, kids in entries.items()]
+            for kind, entries in merged.items()
         }
+        delta["k_max"] = DOCID_MAX_KEYWORDS
+        with self._routing_lock:
+            if rollout_id in self._step_updates:
+                raise ValueError(f"Updates already staged for rollout {rollout_id}")
+            self._step_updates[rollout_id] = (mapping_urls, delta)
+        return {"staged_docids": sum(len(entries) for entries in merged.values())}
+
+    def commit_step_updates(self, rollout_id: int) -> dict[str, int]:
+        with self._routing_lock:
+            steps = sorted(step for step in self._step_updates if step <= rollout_id)
+        if not steps or steps[-1] != rollout_id:
+            raise ValueError(f"Missing staged mapping updates for rollout {rollout_id}")
+        updated_docids = 0
+        for step in steps:
+            urls, delta = self._step_updates[step]
+            if delta["additions"] or delta["removals"]:
+                futures = [
+                    self._executor.submit(post_json_sync, self._client, url + "/update_delta_ids", delta)
+                    for url in urls
+                ]
+                results = [future.result() for future in futures]
+                updated_docids += results[0]["updated_docids"]
+            with self._routing_lock:
+                del self._step_updates[step]
+        return {"updated_docids": updated_docids}
+
+    def reset_step_updates(self) -> None:
+        futures = [
+            self._executor.submit(post_json_sync, self._client, url.removesuffix("/score") + "/reset_step_updates", {})
+            for url in self.worker_urls
+        ]
+        for future in futures:
+            future.result()
+        with self._routing_lock:
+            self._step_updates.clear()
 
     def save_mapping(self, output_dir: str) -> dict[str, Any]:
         started = time.perf_counter()
@@ -367,10 +383,24 @@ def create_app(
         except (httpx.HTTPError, RuntimeError, ValueError) as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
 
-    @app.post("/commit_step_updates")
-    def commit_step_updates() -> dict[str, Any]:
+    @app.post("/stage_step_updates")
+    def stage_step_updates(request: StepRequest) -> dict[str, Any]:
         try:
-            return app.state.router.commit_step_updates()
+            return app.state.router.stage_step_updates(request.rollout_id)
+        except (httpx.HTTPError, RuntimeError, ValueError) as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+
+    @app.post("/commit_step_updates")
+    def commit_step_updates(request: StepRequest) -> dict[str, Any]:
+        try:
+            return app.state.router.commit_step_updates(request.rollout_id)
+        except (httpx.HTTPError, RuntimeError, ValueError) as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+
+    @app.post("/reset_step_updates")
+    def reset_step_updates() -> None:
+        try:
+            app.state.router.reset_step_updates()
         except (httpx.HTTPError, RuntimeError, ValueError) as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
 

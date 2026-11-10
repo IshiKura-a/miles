@@ -9,7 +9,6 @@ import shlex
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -34,14 +33,17 @@ from examples.experimental.generative_retriever.runtime.prepare_rocm_env import 
     locked_accelerator_env,
 )
 from examples.experimental.generative_retriever.runtime.prepare_sglang_bundle import require_sglang_abort_patch
+from examples.experimental.generative_retriever.runtime.service_processes import (
+    claim_mapping, health_matches, mapping_service_matches, release_mapping, stop_process,
+)
+from examples.experimental.generative_retriever.runtime.training_common import (
+    ScriptArgs, build_algorithm_args, build_optimizer_args, build_sglang_args,
+    expanded_path, prepare_prompt_data, required_directory,
+)
 from examples.experimental.generative_retriever.reward.relevance_reward import (
-    DEFAULT_REWARD_BATCH_SIZE,
-    DEFAULT_TRAIN_GROUP_SIZE,
-    PROMPT_DATASET_ROWS,
     REWARD_MODES,
     REWARD_PAIR_BATCH_SIZE,
     REWARD_TOWER_BATCH_SIZE,
-    RewardMode,
 )
 from examples.experimental.generative_retriever.reward.relevance_model import resolve_relevance_source
 from examples.experimental.generative_retriever.services.baseline_service import (
@@ -68,82 +70,6 @@ _BASELINE_PORT = 30487
 _REWARD_PORT = 30489
 _REWARD_WORKER_PORTS = (30490,)
 _SERVICE_START_TIMEOUT = 1800.0
-_QUERIES_PER_STEP = 4000
-_GLOBAL_BATCH_SIZE = _QUERIES_PER_STEP * DEFAULT_TRAIN_GROUP_SIZE
-_MAX_STEPS = PROMPT_DATASET_ROWS // _QUERIES_PER_STEP
-
-
-def _required_directory(value: str, name: str) -> str:
-    if not value:
-        raise ValueError(f"{name} is required")
-    path = Path(os.path.expandvars(value)).expanduser().resolve()
-    if "$" in os.fspath(path):
-        raise ValueError(f"{name} contains an unresolved environment variable")
-    if not path.is_dir():
-        raise FileNotFoundError(f"{name} directory does not exist: {path}")
-    return str(path)
-
-
-@dataclass
-class ScriptArgs(U.ExecuteTrainConfig):
-    run_id: str = U.create_run_id()
-    checkpoint: str = (
-        "$cosmos_data_path/local/Users/tianchiyang/Checkpoints/ASI_RQ/"
-        "SLMv3-202511-4x256-stage5/epoch1-part24/checkpoint-30553/"
-    )
-    qwen_model: str = "$cosmos_data_path/local/Users/tianchiyang/LLM/Qwen/Qwen3-4B/"
-    slm_root: str = "/home/aiscuser/SLMGR_dev/SLMv3"
-    id_mapping: str = (
-        "$cosmos_data_path/local/User/zihao/online_rl/gr_offline_syn/index/"
-        "slmgrv3_part25_na_intl_20261028_20261029"
-    )
-    prompt_data: str = (
-        "$cosmos_data_path/local/Users/tianchiyang/Data/MZLog/"
-        "TA_PA_UnifiedData_202604to202605_Weekly/TAKeyword/"
-        "train_15M.queryfeat.2026-04-01/Part0.json"
-    )
-    output_dir: str = "$cosmos_data_path/local/User/zihao/online_rl/gr_offline_syn/"
-    service_log_dir: str = "~/.local/state/miles/generative_retriever/"
-    relevance_model: str = (
-        "$cosmos_data_path/local/User/yugao/share/qualitymodel/"
-        "GCQC/GV2.1/ForArcher/Large/"
-    )
-    reward_mode: RewardMode = "discrete_relevance_unique"
-    num_gpus_per_node: int = 8
-    actor_num_gpus_per_node: int = 2
-    rollout_num_gpus: int = 2
-    rollout_num_gpus_per_engine: int = 2
-    sglang_dp_size: int = 2
-    sglang_mem_fraction_static: float = 0.0
-    sglang_server_concurrency: int = 8192
-    rollout_batch_size: int = _QUERIES_PER_STEP
-    n_samples_per_prompt: int = DEFAULT_TRAIN_GROUP_SIZE
-    global_batch_size: int = _GLOBAL_BATCH_SIZE
-    max_tokens_per_gpu: int = 131072
-    reward_timeout: float = 1800.0
-    reward_batch_size: int = DEFAULT_REWARD_BATCH_SIZE
-    reward_request_concurrency: int = 2 * len(_REWARD_DEVICES)
-    prepare_concurrency: int = 2
-    reward_forward_concurrency: int = len(_REWARD_DEVICES)
-    reward_query_cache_size: int = 0
-    reward_keyword_cache_size: int = 0
-    reward_score_cache_size: int = 0
-    num_rollout: int = _MAX_STEPS
-    one_step_async: bool = True
-    temperature: float = 1.0
-    lr: float = 2e-6
-    save_interval: int = 20
-    resume: bool = False
-    extra_args: str = ""
-
-
-def _expanded_path(value: str, name: str, *, directory: bool = True) -> Path:
-    path = Path(os.path.expandvars(value)).expanduser().resolve()
-    if "$" in os.fspath(path):
-        raise ValueError(f"{name} contains an unresolved environment variable")
-    if directory and not path.is_dir():
-        raise FileNotFoundError(f"{name} directory does not exist: {path}")
-    return path
 
 
 def _validate_gpu_topology(args: ScriptArgs) -> None:
@@ -158,74 +84,6 @@ def _validate_gpu_topology(args: ScriptArgs) -> None:
         raise RuntimeError(f"Expected eight visible GPUs, found {torch.cuda.device_count()}")
     if args.actor_num_gpus_per_node != 2 or args.rollout_num_gpus != 2:
         raise ValueError("Learner and train rollout must each use exactly two GPUs")
-
-
-@dataclass(frozen=True)
-class _PromptData:
-    path: Path
-    input_key: str
-    label_key: str | None
-    metadata_key: str | None
-    sample_count: int
-
-
-def _count_records(path: Path) -> int:
-    stat = path.stat()
-    cache_file = Path.home() / ".local/state/miles/generative_retriever/prompt_counts.json"
-    key = f"{path}:{stat.st_size}:{stat.st_mtime_ns}"
-    if cache_file.is_file():
-        try:
-            cached = json.loads(cache_file.read_text(encoding="utf-8"))
-            if isinstance(cached.get(key), int) and cached[key] > 0:
-                return int(cached[key])
-        except Exception:
-            pass
-    if path.name == "Part0.json" and stat.st_size > 1_000_000_000:
-        count = PROMPT_DATASET_ROWS
-    else:
-        with path.open("rb", buffering=16 * 1024 * 1024) as stream:
-            count = sum(bool(line.strip()) for line in stream)
-    if count == 0:
-        raise ValueError(f"Prompt dataset is empty: {path}")
-    try:
-        cache_file.parent.mkdir(parents=True, exist_ok=True)
-        cache_file.write_text(json.dumps({key: count}), encoding="utf-8")
-    except Exception:
-        pass
-    return count
-
-
-def _prepare_prompt_data(source: Path, jsonl_alias: Path) -> _PromptData:
-    with source.open(encoding="utf-8") as stream:
-        first = json.loads(stream.readline())
-    if isinstance(first, dict) and isinstance(first.get("prompt"), str):
-        if source.suffix != ".jsonl":
-            raise ValueError(f"Prompt dataset with prompt fields must use a .jsonl suffix: {source}")
-        return _PromptData(
-            path=source,
-            input_key="prompt",
-            label_key="label",
-            metadata_key="metadata",
-            sample_count=_count_records(source),
-        )
-    if not isinstance(first, dict) or not isinstance(first.get("query"), str):
-        raise ValueError(f"Prompt data must contain either prompt or query fields: {source}")
-    jsonl_alias.parent.mkdir(parents=True, exist_ok=True)
-    if jsonl_alias.is_symlink():
-        if Path(os.readlink(jsonl_alias)) != source and jsonl_alias.resolve() != source:
-            jsonl_alias.unlink()
-            jsonl_alias.symlink_to(source)
-    else:
-        if jsonl_alias.exists():
-            jsonl_alias.unlink()
-        jsonl_alias.symlink_to(source)
-    return _PromptData(
-        path=jsonl_alias,
-        input_key="query",
-        label_key=None,
-        metadata_key=None,
-        sample_count=_count_records(source),
-    )
 
 
 def _wait_for_health(
@@ -257,24 +115,6 @@ def _wait_for_health(
     raise TimeoutError(f"{name} service did not become ready: {last_error}; see {log_path}")
 
 
-def _health_matches(url: str, expected: dict[str, Any]) -> bool:
-    try:
-        with httpx.Client(timeout=30.0, trust_env=False) as client:
-            response = client.get(url)
-    except httpx.ConnectError:
-        return False
-    response.raise_for_status()
-    payload = response.json()
-    mismatches = {
-        key: {"expected": value, "actual": payload.get(key)}
-        for key, value in expected.items()
-        if payload.get(key) != value
-    }
-    if mismatches:
-        raise RuntimeError(f"Resident service configuration mismatch at {url}: {mismatches}")
-    return True
-
-
 def _ensure_resident_services(
     args: ScriptArgs,
     *,
@@ -284,13 +124,14 @@ def _ensure_resident_services(
     mapping: Path,
     service_log_dir: Path,
 ) -> str:
-    relevance_model = _expanded_path(args.relevance_model, "Relevance model")
+    relevance_model = expanded_path(args.relevance_model, "Relevance model")
     relevance_source = resolve_relevance_source(
         relevance_model,
     )
     service_dir = service_log_dir
     service_dir.mkdir(parents=True, exist_ok=True)
-    mapping_url = f"http://127.0.0.1:{_MAPPING_PORT}"
+    mapping_base_url = f"http://127.0.0.1:{_MAPPING_PORT}"
+    mapping_url = f"{mapping_base_url}/runs/single"
     baseline_url = f"http://127.0.0.1:{_BASELINE_PORT}/generate"
     reward_url = f"http://127.0.0.1:{_REWARD_PORT}/score"
     worker_urls = [f"http://127.0.0.1:{port}/score" for port in _REWARD_WORKER_PORTS]
@@ -328,7 +169,7 @@ def _ensure_resident_services(
                 str(_MAPPING_PORT),
             ],
             build_service_env(""),
-            f"{mapping_url}/health",
+            f"{mapping_base_url}/health",
             {
                 "status": "ready",
                 "mapping_version": mapping.name,
@@ -472,7 +313,10 @@ def _ensure_resident_services(
         ]
     ] = []
     for name, command, env, health_url, expected in specs:
-        if _health_matches(health_url, expected):
+        if (
+            mapping_service_matches(mapping_base_url, mapping)
+            if name == "mapping" else health_matches(health_url, expected)
+        ):
             print(f"[service] reusing healthy {name} at {health_url}", flush=True)
             continue
         log_path = service_dir / f"{name}.log"
@@ -502,14 +346,7 @@ def _ensure_resident_services(
             print(f"[service] {name} ready at {health_url}", flush=True)
     except BaseException:
         for _, proc, stream, _, _, _ in started:
-            if proc.poll() is None:
-                proc.terminate()
-            if proc.poll() is None:
-                try:
-                    proc.wait(timeout=30)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=10)
+            stop_process(proc, timeout=30, kill_timeout=10)
             if not stream.closed:
                 stream.close()
         raise
@@ -532,9 +369,9 @@ def execute(args: ScriptArgs) -> None:
     if args.reward_mode not in REWARD_MODES:
         raise ValueError(f"Unknown reward mode: {args.reward_mode!r}")
     _validate_gpu_topology(args)
-    checkpoint = _required_directory(args.checkpoint, "checkpoint")
-    qwen_model = _required_directory(args.qwen_model, "Qwen model")
-    slm_root = _required_directory(args.slm_root, "SLMv3 source")
+    checkpoint = required_directory(args.checkpoint, "checkpoint")
+    qwen_model = required_directory(args.qwen_model, "Qwen model")
+    slm_root = required_directory(args.slm_root, "SLMv3 source")
     mapping = Path(os.path.expandvars(args.id_mapping)).expanduser().resolve()
     if not args.id_mapping or (
         not mapping.is_file() and not (mapping.is_dir() and (mapping / "docid_keywords.parquet").is_file())
@@ -570,9 +407,10 @@ def execute(args: ScriptArgs) -> None:
     if args.rollout_num_gpus % args.rollout_num_gpus_per_engine:
         raise ValueError("rollout_num_gpus must be divisible by rollout_num_gpus_per_engine")
 
-    output_dir = _expanded_path(args.output_dir, "output_dir", directory=False)
+    output_dir = expanded_path(args.output_dir, "output_dir", directory=False)
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir = output_dir / args.run_id / "checkpoints"
+    mapping_checkpoint = None
     if args.resume:
         tracker = checkpoint_dir / "latest_checkpointed_iteration.txt"
         if not tracker.is_file():
@@ -586,13 +424,16 @@ def execute(args: ScriptArgs) -> None:
             checkpoint_dir / "rollout" / f"global_dataset_state_dict_{iteration - 1}.pt"
         ).is_file():
             raise FileNotFoundError("GR resume requires the matching rollout dataset state")
-    service_log_dir = _expanded_path(
+        mapping_checkpoint = str(checkpoint_dir / f"iter_{iteration:07d}" / "mapping")
+        if not (Path(mapping_checkpoint) / "overlay.parquet").is_file():
+            raise FileNotFoundError("GR resume requires the matching mapping overlay checkpoint")
+    service_log_dir = expanded_path(
         args.service_log_dir,
         "service_log_dir",
         directory=False,
     )
     service_log_dir.mkdir(parents=True, exist_ok=True)
-    prompt_data = _prepare_prompt_data(
+    prompt_data = prepare_prompt_data(
         prompt_source,
         output_dir / args.run_id / "prompt_data.jsonl",
     )
@@ -623,24 +464,8 @@ def execute(args: ScriptArgs) -> None:
         )
     )
 
-    optimizer_args = (
-        "--optimizer adam "
-        f"--lr {args.lr} "
-        "--lr-decay-style constant "
-        "--weight-decay 0.1 "
-        "--adam-beta1 0.9 "
-        "--adam-beta2 0.98 "
-    )
-    grpo_args = (
-        "--advantage-estimator grpo "
-        "--kl-coef 0 "
-        "--kl-loss-coef 0 "
-        "--entropy-coef 0 "
-        "--eps-clip 0.2 "
-        "--eps-clip-high 0.28 "
-        "--use-rollout-logprobs "
-        "--skip-actor-forward-only "
-    )
+    optimizer_args = shlex.join(build_optimizer_args(args.lr)) + " "
+    grpo_args = shlex.join(build_algorithm_args()) + " "
     mem_fraction = (
         args.sglang_mem_fraction_static
         if args.sglang_mem_fraction_static > 0
@@ -650,22 +475,13 @@ def execute(args: ScriptArgs) -> None:
             args.rollout_num_gpus,
         )
     )
-    sglang_args = (
-        f"--rollout-num-gpus {args.rollout_num_gpus} "
-        f"--rollout-num-gpus-per-engine {args.rollout_num_gpus_per_engine} "
-        f"--sglang-dp-size {args.sglang_dp_size} "
-        "--sglang-enable-dp-attention "
-        "--sglang-is-embedding "
-        "--sglang-disable-radix-cache "
-        "--sglang-attention-backend triton "
-        "--sglang-disable-cuda-graph "
-        f"--sglang-server-concurrency {args.sglang_server_concurrency} "
-        f"--sglang-mem-fraction-static {mem_fraction} "
-    )
+    sglang_args = shlex.join(build_sglang_args(args, mem_fraction)) + " "
     learner_args = (
         "--train-backend fsdp "
         "--data-source-path "
         "examples.experimental.generative_retriever.index.data_source.GRRolloutDataSource "
+        "--custom-weight-sync-function-path "
+        "examples.experimental.generative_retriever.index.data_source.sync_mapping_on_weight_update "
         "--custom-fsdp-model-factory-path "
         "examples.experimental.generative_retriever.model.fsdp_policy.build_gr_stage5_policy "
         "--weight-sync-include-prefixes "
@@ -757,7 +573,13 @@ def execute(args: ScriptArgs) -> None:
         "NO_PROXY": no_proxy_hosts,
         **cuda_env,
     }
+    mapping_claimed = False
     try:
+        claim_mapping(f"http://127.0.0.1:{_MAPPING_PORT}", "single", mapping_checkpoint)
+        mapping_claimed = True
+        with httpx.Client(timeout=300.0, trust_env=False) as client:
+            response = client.post(reward_url.removesuffix("/score") + "/reset_step_updates")
+            response.raise_for_status()
         if is_rocm():
             os.environ["RAY_ENABLE_UV_RUN_RUNTIME_ENV"] = "0"
             ray_constants.RAY_ENABLE_UV_RUN_RUNTIME_ENV = False
@@ -838,6 +660,8 @@ def execute(args: ScriptArgs) -> None:
                 extra_env_vars=extra_env,
             )
     finally:
+        if mapping_claimed:
+            release_mapping(f"http://127.0.0.1:{_MAPPING_PORT}", "single")
         if original_visible is None:
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         else:

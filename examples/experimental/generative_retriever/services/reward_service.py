@@ -60,7 +60,7 @@ from examples.experimental.generative_retriever.reward.relevance_reward import (
 )
 
 logger = logging.getLogger(__name__)
-REWARD_SERVICE_API_VERSION = 12
+REWARD_SERVICE_API_VERSION = 13
 _SERVICE_API_VERSION = REWARD_SERVICE_API_VERSION
 _QUERY_CACHE_SIZE = DEFAULT_QUERY_CACHE_SIZE
 _KEYWORD_CACHE_SIZE = DEFAULT_KEYWORD_CACHE_SIZE
@@ -587,6 +587,14 @@ class KeywordRewardEngine:
             ),
         }
 
+    def reset_step_updates(self) -> None:
+        with self._lock:
+            self._step_additions.clear()
+            self._step_candidate_queries.clear()
+            self._step_docid_queries.clear()
+            self._step_docid_keywords.clear()
+            self._step_edge_passes.clear()
+
     def harvest_step_delta(self, min_queries: int = DOC2K_PRUNE_MIN_QUERIES) -> dict[str, Any]:
         with self._lock:
             additions = [
@@ -746,6 +754,10 @@ def create_app(
     @app.post("/harvest_step_delta")
     def harvest_step_delta() -> dict[str, Any]:
         return app.state.engine.harvest_step_delta()
+
+    @app.post("/reset_step_updates")
+    def reset_step_updates() -> None:
+        app.state.engine.reset_step_updates()
 
     return app
 

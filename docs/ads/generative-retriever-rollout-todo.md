@@ -224,7 +224,7 @@ R_continuous = continuous_base + unique_bonus
   分别对应 depth 3 / 2 / 1），并以每层权重 `TREE_CREDIT_LEVEL_WEIGHT = 0.25` 分配到 4 个
   decoder token 位置。
 - **耦合 `doc2k` 在线动态映射更新**：
-  每个 rollout step 结束时，各 reward worker 通过 `/harvest_step_delta` 汇总本步的动态映射增量并提交至 `mapping_service`（`/update_delta`）：
+  每个 rollout step 结束时，各 reward worker 通过 `/harvest_step_delta` 汇总本步增量；权重同步后、下一次 rollout 开始前，router 按已训练 step 顺序并发提交至各节点的 `mapping_service`。异步预取的下一步继续使用原权重和原映射，同一 rollout 内映射不变：
   1. **Tail-to-Head 同前缀双头共投注入**：将尾部（rank > `DOC2K_HEAD_RANK_CUTOFF = 64`）同时满足 `PM >= 0.58 and SM >= 0.82` 且双头 Unique 的好词，优先路由至共享 RQ 前缀且词数 `< DOCID_REWARD_FLOOR` 的头部 doc ID，跨步累计被至少 `DOC2K_ADD_MIN_QUERIES = 2` 个不同 query 验证通过后注入（每 query 最多投票 `DOC2K_MAX_ADDS_PER_QUERY = 8` 个，单 doc ID 词数上限 `DOCID_MAX_KEYWORDS = 150`）；
   2. **全桶冗余死词裁剪（零死词守恒）**：对所有词数 `> 1` 的 doc ID，每当跨步累计被至少 `DOC2K_PRUNE_MIN_QUERIES = 5` 个不同 query 召回时，裁剪该窗口内 0 次同时过 PM/SM 阈值且全库度数 `degree > 1` 的冗余词（每桶至少保留 1 个词，全库 `degree == 1` 的唯一归属词原位保留以保证零死词）。
   同时，Baseline `/prepare` 始终查询初始静态映射（`use_initial=True`），保证 $B(q)$ 参照系固定不变。
@@ -402,7 +402,8 @@ CUDA_VISIBLE_DEVICES=4,5 uv run python -m \
 `--hosts` 按「服务/rollout 节点、learner 节点」依次成对排列；每个节点 8 卡，总计 `2n` 台：
 
 - 每对节点（16 卡）分配 8 learner（节点 `2k+1` 的 GPU 0–7）、4 rollout（节点 `2k` 的 GPU 4–7）、4 frozen baseline（节点 `2k` 的 GPU 0–3）和 **16 reward GPU（节点 `2k` 与节点 `2k+1` 的全部 GPU 0–7）**。
-- 每台节点各自在本地启动 `mapping_service`（优先复用本机 `31480` 常驻服务，否则在 `31580` 启动本机专属服务），所有 `/lookup` 均在节点本地内存完成（零跨机查询流量）；每步结束时 `reward_router_service` 汇总全集群 `doc2k` 增量并并发广播 `/update_delta` 至所有节点的 `mapping_service`；每当触发 Checkpoint 保存（[GRRolloutDataSource.save](../../examples/experimental/generative_retriever/index/data_source.py)）时，自动调用 `/save_mapping` 将最新 `doc2k` 索引快照持久化至 `checkpoints/iter_XXXXXXX/mapping/`。
+- 每台节点并行启动或复用本机 `31480` 的 API v3 常驻 `mapping_service`，并由当前 run 独占；`/lookup` 在节点本地完成。run 结束时释放所有权，基础索引继续驻留。新 run 清除旧增量；恢复 run 从匹配的 `mapping/overlay.parquet` 恢复，旧 checkpoint 如缺少该文件则不能恢复。旧版常驻服务不能安全复用，不会被自动停止。
+- 每步汇总增量并暂存，在 rollout 权重同步后按 step 顺序并发更新各节点；预取 rollout 的增量留待下次权重同步。保存 checkpoint 后在对应权重同步时保存匹配的映射快照至 `checkpoints/iter_XXXXXXX/mapping/`。默认每步同步权重；若同步间隔大于一，checkpoint 要等到后续权重同步才包含映射快照，最后一步必须落在同步边界，否则启动时报错。
 - 每步处理 **`8000n` query × `512` sample**（两机 16 卡即 `8,000` query/step，`global_batch_size = 4,096,000n`）。
 - 完整遍历 `15,000,000` 条数据的最大 optimizer step 数为 **`1875 // n`**（例如 `n=1` 为 `1,875` 步，`n=3` 为 `625` 步，`n=4` 六十四卡为 `468` 步）。
 支持 `--num-rollout` 指定不超过该上限的短验收步骤；正式训练省略此参数。
@@ -465,7 +466,10 @@ uv run --no-sync --env-file .env python -m \
 
 全局 reward score 请求并发为 `32n`、prepare 并发为 `4n`，每个 8 卡节点 worker
 的转发并发为 `8`。入口只在端口未占用时建立本次运行所需的 reward/router 服务
-及 Ray 集群，不终止别的任务；run manifest、服务/训练日志、checkpoint
+及 Ray 集群，不终止别的任务；启动时先并行检查所有节点的源码、模型索引及依赖，
+全部通过后才并行分发本机 manifest 和准备本地 SGLang bundle。run 目录保存不可变的
+`manifest-<配置摘要>.json`，供 `--resume` 核对配置；各节点会验证该记录的内容一致。
+旧 run 的 `manifest.json` 仍可用于恢复。服务/训练日志、checkpoint 和该记录
 位于 `$cosmos_data_path/local/User/zihao/online_rl/gr_offline_syn/<run_id>/`。
 成功条件为 `latest_checkpointed_iteration.txt` 等于目标 step 数。
 新多机入口需先以 `--num-rollout 2` 单独 run-id 验收 W&B、GPU 归属和 checkpoint，

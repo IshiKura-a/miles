@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 import math
 from collections import defaultdict
 from typing import Any
@@ -14,8 +13,6 @@ from examples.experimental.generative_retriever.reward.relevance_reward import (
     TREE_CREDIT_LEVEL_WEIGHT,
     TREE_CREDIT_TOP_K,
 )
-
-logger = logging.getLogger(__name__)
 
 
 def _mean_top_k(values: list[float], k: int) -> float:
@@ -65,22 +62,14 @@ def apply_hierarchical_tree_credit(args: Any, samples: list[Any]) -> None:
             sample.reward = TREE_CREDIT_LEVEL_WEIGHT * (v0 + v1 + v2 + r)
 
 
-def commit_coupled_doc2k_updates(args: Any, output: dict[str, Any]) -> None:
+def stage_coupled_doc2k_updates(args: Any, rollout_id: int) -> None:
     reward_url = getattr(args, "generative_retriever_reward_url", None)
     if not isinstance(reward_url, str) or not reward_url:
         return
-    commit_url = reward_url.removesuffix("/score") + "/commit_step_updates"
-    try:
-        with httpx.Client(timeout=60.0, trust_env=False) as client:
-            response = client.post(commit_url, json={})
-            response.raise_for_status()
-            payload = response.json()
-        for key in ("updated_docids", "added_edges", "removed_edges", "overlay_docids"):
-            value = payload.get(key)
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                output[f"rollout/generative_retriever/doc2k/{key}"] = float(value)
-    except Exception as error:
-        logger.warning("Failed to commit step doc2k updates at %s: %s", commit_url, error)
+    stage_url = reward_url.removesuffix("/score") + "/stage_step_updates"
+    with httpx.Client(timeout=300.0, trust_env=False) as client:
+        response = client.post(stage_url, json={"rollout_id": rollout_id})
+        response.raise_for_status()
 
 
 def _add_distribution_metrics(
@@ -170,12 +159,12 @@ def log_rollout(
     rollout_extra_metrics: dict[str, Any] | None,
     rollout_time: float,
 ) -> bool:
-    del rollout_id, rollout_time
+    del rollout_time
+    stage_coupled_doc2k_updates(args, rollout_id)
     if rollout_extra_metrics is None:
         return False
     _add_group_reward_metrics(args, samples, rollout_extra_metrics)
     apply_hierarchical_tree_credit(args, samples)
-    commit_coupled_doc2k_updates(args, rollout_extra_metrics)
     values: dict[str, list[float]] = defaultdict(list)
     for sample in samples:
         metadata = sample.metadata.get("generative_retriever", {})

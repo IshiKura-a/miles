@@ -207,6 +207,9 @@ async def create_training_models(args, inference_controller, rollout_executor):
 
 async def update_weights(actor_model, rollout_executor, *, rollout_id: int | None = None) -> None:
     if (weight_version := await actor_model.update_weights(rollout_id=rollout_id)) is not None:
+        hook_path = getattr(actor_model.args, "custom_weight_sync_function_path", None)
+        if rollout_id is not None and isinstance(hook_path, str) and hook_path:
+            await rollout_executor.run_weight_sync_hook.remote(rollout_id)
         await rollout_executor.set_weight_version.remote(weight_version)
 
 

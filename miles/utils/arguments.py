@@ -817,6 +817,12 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "The return value indicates whether to skip the default logging. "
                 ),
             )
+            parser.add_argument(
+                "--custom-weight-sync-function-path",
+                type=str,
+                default=None,
+                help="Called with (args, data_source, rollout_id) after rollout weights are synchronized.",
+            )
 
             parser.add_argument(
                 "--buffer-filter-path",

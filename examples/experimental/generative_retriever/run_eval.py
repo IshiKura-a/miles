@@ -32,6 +32,7 @@ from examples.experimental.generative_retriever.reward.relevance_reward import (
     DEFAULT_EVAL_GROUP_SIZE,
 )
 from examples.experimental.generative_retriever.runtime.prepare_rocm_env import build_service_env
+from examples.experimental.generative_retriever.runtime.service_processes import stop_process
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _DEFAULT_GENERATOR_DEVICES = "cuda:0,cuda:1,cuda:2,cuda:3"
@@ -256,13 +257,7 @@ def _wait_health(service: _ManagedService, timeout: float = _SERVICE_START_TIMEO
 
 def _stop_services(services: list[_ManagedService]) -> None:
     for service in reversed(services):
-        if service.process.poll() is None:
-            service.process.terminate()
-            try:
-                service.process.wait(timeout=15.0)
-            except subprocess.TimeoutExpired:
-                service.process.kill()
-                service.process.wait(timeout=15.0)
+        stop_process(service.process, timeout=15.0, kill_timeout=15.0)
         service.log_handle.close()
 
 

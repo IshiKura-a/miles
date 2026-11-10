@@ -10,16 +10,17 @@ from __future__ import annotations
 import argparse
 import gc
 import logging
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from threading import RLock
 from typing import Annotated, Any
+from collections.abc import Iterator
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field, StrictInt, field_validator
 
 from examples.experimental.generative_retriever.index.id_text_mapping import (
@@ -31,7 +32,7 @@ from examples.experimental.generative_retriever.index.id_text_mapping import (
 from examples.experimental.generative_retriever.reward.relevance_reward import DOCID_MAX_KEYWORDS
 
 logger = logging.getLogger(__name__)
-MAPPING_SERVICE_API_VERSION = 2
+MAPPING_SERVICE_API_VERSION = 3
 _SERVICE_API_VERSION = MAPPING_SERVICE_API_VERSION
 _NA_LOCALE_ALIASES = frozenset({"NA", "EN-US", "EN-CA", "ES-US", "FR-CA"})
 
@@ -93,6 +94,21 @@ class DeltaMappingRequest(BaseModel):
     k_max: int = DOCID_MAX_KEYWORDS
 
 
+class DeltaMappingIdsRequest(BaseModel):
+    additions: list[DocidKeywordPair] = Field(default_factory=list)
+    removals: list[DocidKeywordPair] = Field(default_factory=list)
+    k_max: int = DOCID_MAX_KEYWORDS
+
+
+class ResolveKeywordsRequest(BaseModel):
+    keywords: list[str]
+
+
+class ClaimMappingRequest(BaseModel):
+    owner: str
+    checkpoint: str | None = None
+
+
 class SaveMappingRequest(BaseModel):
     output_dir: str
 
@@ -108,6 +124,8 @@ class ResidentMapping:
             else path.name
         )
         self._lock = RLock()
+        self._owner: str | None = None
+        self._active_requests = 0
         self._overlay_kw_ids: dict[int, tuple[int, ...]] = {}
         self._text_to_kid: dict[str, int] = {}
         self._decoded_kws: list[str | None] = []
@@ -220,6 +238,59 @@ class ResidentMapping:
         self._text_to_kid[text] = kid
         return text
 
+    @contextmanager
+    def access(self, owner: str | None) -> Iterator[None]:
+        with self._lock:
+            if owner != self._owner:
+                raise ValueError("Mapping service is owned by another run")
+            self._active_requests += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._active_requests -= 1
+
+    def replace_overlay(self, overlay: dict[int, tuple[int, ...]]) -> None:
+        for docid in self._overlay_kw_ids.keys() | overlay.keys():
+            base = self._base_kw_ids_one(docid) or ()
+            previous = set(self._overlay_kw_ids.get(docid, base))
+            current = set(overlay.get(docid, base))
+            for kid in previous - current:
+                self._kw_degree[kid] -= 1
+            for kid in current - previous:
+                self._kw_degree[kid] += 1
+        self._overlay_kw_ids = overlay
+
+    def claim(self, owner: str, checkpoint: str | None) -> None:
+        overlay: dict[int, tuple[int, ...]] = {}
+        if checkpoint is not None:
+            table = pq.read_table(Path(checkpoint) / "overlay.parquet")
+            metadata = table.schema.metadata or {}
+            if metadata.get(b"base_mapping") != str(self.path).encode():
+                raise ValueError("Checkpoint belongs to a different base mapping")
+            overlay = {
+                int(docid): tuple(kids)
+                for docid, kids in zip(
+                    table.column("docid_u32").to_pylist(),
+                    table.column("keyword_ids").to_pylist(), strict=True,
+                )
+            }
+        with self._lock:
+            if not owner or self._owner is not None or self._active_requests:
+                raise ValueError("Mapping service is already in use")
+            self.replace_overlay(overlay)
+            self._owner = owner
+
+    def release(self, owner: str) -> None:
+        with self._lock:
+            if self._owner != owner or self._active_requests:
+                raise ValueError("Mapping service is still in use or owned by another run")
+            self._owner = None
+
+    def resolve_keywords(self, keywords: list[str]) -> list[int]:
+        with self._lock:
+            return [self._text_to_kid[keyword] for keyword in keywords]
+
     def lookup(
         self,
         docids: list[PositionalID],
@@ -257,6 +328,20 @@ class ResidentMapping:
         return LookupResponse(mapping_version=self.version, results=results)
 
     def apply_delta(self, request: DeltaMappingRequest) -> dict[str, int]:
+        def ids(entries: list[DocidKeywordTextPair]) -> list[DocidKeywordPair]:
+            with self._lock:
+                result = []
+                for entry in entries:
+                    kids = [self._text_to_kid[kw] for kw in entry.keywords if kw in self._text_to_kid]
+                    if kids:
+                        result.append(DocidKeywordPair(docid=entry.docid, keyword_ids=kids))
+                return result
+
+        return self.apply_id_delta(DeltaMappingIdsRequest(
+            additions=ids(request.additions), removals=ids(request.removals), k_max=request.k_max,
+        ))
+
+    def apply_id_delta(self, request: DeltaMappingIdsRequest) -> dict[str, int]:
         if request.k_max < 1:
             raise ValueError("k_max must be at least 1")
         with self._lock:
@@ -270,11 +355,7 @@ class ResidentMapping:
                     current_kids = self._base_kw_ids_one(u32)
                     if not current_kids:
                         continue
-                remove_kids = {
-                    self._text_to_kid[kw]
-                    for kw in item.keywords
-                    if kw in self._text_to_kid
-                }
+                remove_kids = set(item.keyword_ids)
                 if not remove_kids or len(current_kids) <= 1:
                     continue
                 filtered_list: list[int] = []
@@ -303,11 +384,10 @@ class ResidentMapping:
                 kid_list = list(current_kids)
                 existing_kids = set(kid_list)
                 changed = False
-                for kw in item.keywords:
+                for kid in item.keyword_ids:
                     if len(kid_list) >= request.k_max:
                         break
-                    kid = self._text_to_kid.get(kw)
-                    if kid is not None and kid not in existing_kids:
+                    if kid not in existing_kids:
                         kid_list.append(kid)
                         existing_kids.add(kid)
                         self._kw_degree[kid] += 1
@@ -331,8 +411,7 @@ class ResidentMapping:
     ) -> dict[str, int]:
         with self._lock:
             max_kw_id = len(self._kw_array)
-            if replace_all:
-                self._overlay_kw_ids.clear()
+            overlay = {} if replace_all else dict(self._overlay_kw_ids)
             for entry in entries:
                 u32 = pack_docid_u32(entry.docid)
                 dedup_kids: list[int] = []
@@ -343,7 +422,8 @@ class ResidentMapping:
                     if kid not in seen:
                         dedup_kids.append(int(kid))
                         seen.add(int(kid))
-                self._overlay_kw_ids[u32] = tuple(dedup_kids)
+                overlay[u32] = tuple(dedup_kids)
+            self.replace_overlay(overlay)
             return {
                 "id_count": int(len(self._unique_docids_u32)),
                 "overlay_docids": len(self._overlay_kw_ids),
@@ -410,6 +490,13 @@ class ResidentMapping:
         dst_kw = target_dir / "keywords.parquet"
         if not dst_kw.exists() and src_kw.is_file():
             dst_kw.symlink_to(src_kw)
+        overlay_table = pa.table({
+            "docid_u32": pa.array(list(overlay_snapshot), type=pa.uint32()),
+            "keyword_ids": pa.array(list(overlay_snapshot.values()), type=pa.list_(pa.uint32())),
+        }).replace_schema_metadata({b"base_mapping": str(self.path).encode()})
+        temporary = target_dir / "overlay.parquet.tmp"
+        pq.write_table(overlay_table, temporary, compression="zstd")
+        temporary.replace(target_dir / "overlay.parquet")
         return {
             "output_dir": str(target_dir),
             "id_count": int(len(unique_docids)),
@@ -441,35 +528,79 @@ def create_app(mapping: str | Path) -> FastAPI:
                     "mapping": str(path),
                 }}
 
+    @app.get("/runs/{owner}/health")
+    def run_health(owner: str) -> dict[str, Any]:
+        try:
+            with app.state.mapping.access(owner):
+                return health()
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post("/claim")
+    def claim(request: ClaimMappingRequest) -> None:
+        try:
+            app.state.mapping.claim(request.owner, request.checkpoint)
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post("/release")
+    def release(request: ClaimMappingRequest) -> None:
+        try:
+            app.state.mapping.release(request.owner)
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
     @app.post("/lookup", response_model=LookupResponse)
-    def lookup(request: LookupRequest) -> LookupResponse:
-        return app.state.mapping.lookup(
-            request.docids,
-            market=request.market,
-            use_initial=request.use_initial,
-        )
+    @app.post("/runs/{owner}/lookup", response_model=LookupResponse)
+    def lookup(request: LookupRequest, http_request: Request) -> LookupResponse:
+        try:
+            with app.state.mapping.access(http_request.path_params.get("owner")):
+                return app.state.mapping.lookup(
+                    request.docids, market=request.market, use_initial=request.use_initial,
+                )
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post("/runs/{owner}/resolve_keywords")
+    def resolve_keywords(request: ResolveKeywordsRequest, http_request: Request) -> dict[str, list[int]]:
+        try:
+            with app.state.mapping.access(http_request.path_params["owner"]):
+                return {"keyword_ids": app.state.mapping.resolve_keywords(request.keywords)}
+        except (ValueError, KeyError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
 
     @app.post("/update_delta")
-    def update_delta(request: DeltaMappingRequest) -> dict[str, int]:
+    @app.post("/runs/{owner}/update_delta")
+    def update_delta(request: DeltaMappingRequest, http_request: Request) -> dict[str, int]:
         try:
-            return app.state.mapping.apply_delta(request)
+            with app.state.mapping.access(http_request.path_params.get("owner")):
+                return app.state.mapping.apply_delta(request)
+        except (ValueError, KeyError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post("/runs/{owner}/update_delta_ids")
+    def update_delta_ids(request: DeltaMappingIdsRequest, http_request: Request) -> dict[str, int]:
+        try:
+            with app.state.mapping.access(http_request.path_params["owner"]):
+                return app.state.mapping.apply_id_delta(request)
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.post("/update")
-    def update(request: UpdateMappingRequest) -> dict[str, int]:
+    @app.post("/runs/{owner}/update")
+    def update(request: UpdateMappingRequest, http_request: Request) -> dict[str, int]:
         try:
-            return app.state.mapping.update_docid_mappings(
-                request.entries,
-                replace_all=request.replace_all,
-            )
+            with app.state.mapping.access(http_request.path_params.get("owner")):
+                return app.state.mapping.update_docid_mappings(request.entries, replace_all=request.replace_all)
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.post("/save")
-    def save(request: SaveMappingRequest) -> dict[str, Any]:
+    @app.post("/runs/{owner}/save")
+    def save(request: SaveMappingRequest, http_request: Request) -> dict[str, Any]:
         try:
-            return app.state.mapping.save_docid_mappings(request.output_dir)
+            with app.state.mapping.access(http_request.path_params.get("owner")):
+                return app.state.mapping.save_docid_mappings(request.output_dir)
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 

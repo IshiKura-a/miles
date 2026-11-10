@@ -1,6 +1,8 @@
 import asyncio
+from collections.abc import Callable
 import logging
 import time
+from typing import cast
 
 import ray
 
@@ -275,6 +277,10 @@ class RolloutExecutor:
             logger.warning(message)
         self.weight_version = weight_version
         self._rollouts_since_weight_version_publish = 0
+
+    def run_weight_sync_hook(self, rollout_id: int) -> None:
+        hook = cast(Callable, load_function(self.args.custom_weight_sync_function_path))
+        hook(self.args, self.data_source, rollout_id)
 
     def set_train_parallel_config(self, config: dict):
         self.train_parallel_config = config

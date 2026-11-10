@@ -2,18 +2,22 @@
 
 from __future__ import annotations
 
-import logging
 from pathlib import Path
+from typing import Any
 
 import httpx
 import torch
 
 from miles.rollout.data_source import RolloutDataSourceWithBuffer
 
-logger = logging.getLogger(__name__)
-
 
 class GRRolloutDataSource(RolloutDataSourceWithBuffer):
+    def __init__(self, args: Any) -> None:
+        if args.save and args.num_rollout is not None and args.num_rollout % args.update_weights_interval:
+            raise ValueError("The final GR checkpoint must coincide with a rollout weight update")
+        super().__init__(args)
+        self.pending_mapping_checkpoints: list[int] = []
+
     def _completed_position(self, rollout_id: int) -> int:
         if self.dataset is None:
             raise ValueError("GR resume requires a global prompt dataset")
@@ -39,24 +43,20 @@ class GRRolloutDataSource(RolloutDataSourceWithBuffer):
             },
             path,
         )
-        reward_url = getattr(self.args, "generative_retriever_reward_url", None)
-        if isinstance(reward_url, str) and reward_url:
-            save_mapping_url = reward_url.removesuffix("/score") + "/save_mapping"
-            mapping_output_dir = str(save_root / f"iter_{rollout_id + 1:07d}" / "mapping")
-            try:
-                with httpx.Client(timeout=600.0, trust_env=False) as client:
-                    response = client.post(
-                        save_mapping_url,
-                        json={"output_dir": mapping_output_dir},
-                    )
+        self.pending_mapping_checkpoints.append(rollout_id)
+
+    def sync_mapping(self, rollout_id: int) -> None:
+        reward_url = self.args.generative_retriever_reward_url.removesuffix("/score")
+        pending = [step for step in self.pending_mapping_checkpoints if step <= rollout_id]
+        with httpx.Client(timeout=600.0, trust_env=False) as client:
+            for step in sorted(set(pending + [rollout_id])):
+                response = client.post(f"{reward_url}/commit_step_updates", json={"rollout_id": step})
+                response.raise_for_status()
+                if step in pending:
+                    output_dir = Path(self.args.save) / f"iter_{step + 1:07d}" / "mapping"
+                    response = client.post(f"{reward_url}/save_mapping", json={"output_dir": str(output_dir)})
                     response.raise_for_status()
-            except Exception as error:
-                logger.warning(
-                    "Failed to save coupled doc2k index at %s -> %s: %s",
-                    save_mapping_url,
-                    mapping_output_dir,
-                    error,
-                )
+                    self.pending_mapping_checkpoints.remove(step)
 
     def load(self, rollout_id: int | None = None) -> None:
         if self.args.load is None:
@@ -72,3 +72,7 @@ class GRRolloutDataSource(RolloutDataSourceWithBuffer):
             raise ValueError("GR rollout checkpoint has an invalid prompt cursor")
         self.sample_offset = self.sample_group_index = position
         self.sample_index = position * self.args.n_samples_per_prompt
+
+
+def sync_mapping_on_weight_update(args: Any, data_source: GRRolloutDataSource, rollout_id: int) -> None:
+    data_source.sync_mapping(rollout_id)
