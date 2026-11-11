@@ -73,10 +73,10 @@ _QWEN3_4B_KV_HEADS = 8
 _QWEN3_4B_HEAD_DIM = 128
 _MIN_MEM_FRACTION = 0.15
 _MAX_MEM_FRACTION = 0.70
-MIN_QUERY_CACHE_SIZE = 16384
-MIN_SCORE_CACHE_SIZE = 1048576
-MAX_SCORE_CACHE_SIZE = 8388608
-MAX_KEYWORD_CACHE_SIZE = 16777216
+MIN_QUERY_CACHE_SIZE = 65536
+MIN_SCORE_CACHE_SIZE = 4194304
+MAX_SCORE_CACHE_SIZE = 16777216
+MAX_KEYWORD_CACHE_SIZE = 67108864
 
 
 def _run(argv: list[str], *, cwd: Path = _REPO, env: dict[str, str] | None = None) -> None:
@@ -160,6 +160,7 @@ def rocm_runtime_env(venv: Path | None = None) -> dict[str, str]:
         "HSA_NO_SCRATCH_RECLAIM": "1",
         "GPU_MAX_HW_QUEUES": "1",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+        "GPU_PINNED_MIN_XFER_SIZE": "100000",
         "PYTORCH_ROCM_ARCH": "gfx942",
         "GPU_ARCHS": "gfx942",
         "GPU_ARCH": "gfx942",
@@ -237,6 +238,7 @@ def _write_activate_script(venv: Path) -> Path:
         'export HSA_NO_SCRATCH_RECLAIM="1"\n'
         'export GPU_MAX_HW_QUEUES="1"\n'
         'export CUDA_DEVICE_MAX_CONNECTIONS="1"\n'
+        'export GPU_PINNED_MIN_XFER_SIZE="100000"\n'
         'export PYTORCH_ROCM_ARCH="gfx942"\n'
         'export GPU_ARCHS="gfx942"\n'
         'export GPU_ARCH="gfx942"\n'

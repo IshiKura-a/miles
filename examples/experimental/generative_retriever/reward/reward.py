@@ -161,13 +161,17 @@ def sample_payload(sample: Sample) -> dict[str, Any]:
     if not isinstance(docid_tokens, list) or not all(isinstance(token, int) for token in docid_tokens):
         raise ValueError("generative retriever reward requires generated integer docid_tokens")
 
-    return {
+    payload: dict[str, Any] = {
         "prompt": sample.prompt,
         "response": sample.response,
         "label": sample.label,
         "docid_tokens": docid_tokens,
         "metadata": metadata,
     }
+    baseline_docids = retriever_metadata.pop("baseline_docids", None)
+    if baseline_docids is not None:
+        payload["baseline_docids"] = baseline_docids
+    return payload
 
 
 def parse_rewards(

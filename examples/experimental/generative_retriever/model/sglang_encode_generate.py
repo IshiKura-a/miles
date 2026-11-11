@@ -141,6 +141,20 @@ def add_arguments(parser: Any) -> None:
     parser.add_argument("--generative-retriever-prepare-concurrency", type=int, default=1)
 
 
+def _validate_token_slice(raw_tokens: list[Any], docid_size: int, docid_dim: int) -> list[int]:
+    token_ids = [int(value) for value in raw_tokens]
+    if any(isinstance(value, bool) or float(value) != token_id
+           for value, token_id in zip(raw_tokens, token_ids, strict=True)):
+        raise ValueError(f"GR SGLang returned non-integral token ids: {raw_tokens!r}")
+    for position, token_id in enumerate(token_ids):
+        low = DOCID_TOKEN_OFFSET + position * docid_dim
+        if not low <= token_id < low + docid_dim:
+            raise ValueError(
+                f"GR SGLang returned token {token_id} outside position {position} codebook"
+            )
+    return token_ids
+
+
 def parse_embedding(
     output: dict[str, Any],
     docid_size: int,
@@ -149,29 +163,46 @@ def parse_embedding(
     beam_rank: int = 0,
 ) -> tuple[list[int], list[float]]:
     raw = output.get("embedding")
-    expected = num_return_sequences * docid_size * 2
-    if not isinstance(raw, list) or len(raw) != expected:
+    expected_2 = num_return_sequences * docid_size * 2
+    expected_3 = num_return_sequences * docid_size * 3
+    if not isinstance(raw, list) or len(raw) not in (expected_2, expected_3):
         raise ValueError(
-            f"GR SGLang /encode must return {expected} beam values, got {raw!r}"
+            f"GR SGLang /encode must return {expected_2} or {expected_3} beam values, got {raw!r}"
         )
     if not 0 <= beam_rank < num_return_sequences:
         raise ValueError("GR beam rank is outside the returned beam group")
-    start = beam_rank * docid_size * 2
-    raw = raw[start:start + docid_size * 2]
-    token_ids = [int(value) for value in raw[:docid_size]]
-    if any(isinstance(value, bool) or float(value) != token_id
-           for value, token_id in zip(raw[:docid_size], token_ids, strict=True)):
-        raise ValueError(f"GR SGLang returned non-integral token ids: {raw[:docid_size]!r}")
-    for position, token_id in enumerate(token_ids):
-        start = DOCID_TOKEN_OFFSET + position * docid_dim
-        if not start <= token_id < start + docid_dim:
-            raise ValueError(
-                f"GR SGLang returned token {token_id} outside position {position} codebook"
-            )
-    logprobs = [float(value) for value in raw[docid_size:]]
+    stride = docid_size * (3 if len(raw) == expected_3 else 2)
+    start = beam_rank * stride
+    beam_raw = raw[start : start + docid_size * 2]
+    token_ids = _validate_token_slice(beam_raw[:docid_size], docid_size, docid_dim)
+    logprobs = [float(value) for value in beam_raw[docid_size:]]
     if not all(math.isfinite(logprob) for logprob in logprobs):
         raise ValueError(f"GR SGLang returned non-finite logprobs: {logprobs!r}")
     return token_ids, logprobs
+
+
+def parse_baseline_docids(
+    output: dict[str, Any],
+    docid_size: int,
+    docid_dim: int,
+    num_return_sequences: int,
+) -> list[tuple[int, int, int, int]] | None:
+    raw = output.get("embedding")
+    expected_3 = num_return_sequences * docid_size * 3
+    if not isinstance(raw, list) or len(raw) != expected_3:
+        return None
+    stride = docid_size * 3
+    docids: list[tuple[int, int, int, int]] = []
+    for rank in range(num_return_sequences):
+        start = rank * stride + docid_size * 2
+        token_ids = _validate_token_slice(raw[start : start + docid_size], docid_size, docid_dim)
+        docids.append((
+            token_ids[0] - DOCID_TOKEN_OFFSET,
+            token_ids[1] - DOCID_TOKEN_OFFSET,
+            token_ids[2] - DOCID_TOKEN_OFFSET,
+            token_ids[3] - DOCID_TOKEN_OFFSET,
+        ))
+    return docids
 
 
 def resolve_engine_url(args: Any) -> str:
@@ -216,17 +247,18 @@ async def request_embedding_and_prepare(
     prompt_ids: list[int],
     query: str,
 ) -> tuple[dict[str, Any], dict[str, float]]:
+    embedding = await request_embedding(args, router_url, prompt_ids)
+    raw = embedding.get("embedding")
+    if isinstance(raw, list) and len(raw) == args.n_samples_per_prompt * _DOCID_SIZE * 3:
+        return embedding, {}
     prepare_url = args.generative_retriever_reward_prepare_url
     if not prepare_url:
         raise ValueError("--generative-retriever-reward-prepare-url is required")
-    embedding, prepare_metrics = await asyncio.gather(
-        request_embedding(args, router_url, prompt_ids),
-        get_prepare_batcher(
-            prepare_url,
-            args.generative_retriever_reward_timeout,
-            args.generative_retriever_prepare_concurrency,
-        ).submit(query),
-    )
+    prepare_metrics = await get_prepare_batcher(
+        prepare_url,
+        args.generative_retriever_reward_timeout,
+        args.generative_retriever_prepare_concurrency,
+    ).submit(query)
     return embedding, prepare_metrics
 
 
@@ -270,8 +302,12 @@ def populate_beam_sample(
         code - position * _DOCID_DIM
         for position, code in enumerate(positional_docid)
     ]
-    if beam_rank == 0 and prepare_metrics:
-        metadata["prepare_metrics"] = prepare_metrics
+    if beam_rank == 0:
+        baseline_docids = parse_baseline_docids(output, _DOCID_SIZE, _DOCID_DIM, group_size)
+        if baseline_docids is not None:
+            metadata["baseline_docids"] = baseline_docids
+        if prepare_metrics:
+            metadata["prepare_metrics"] = prepare_metrics
 
 
 def validate_pending_sample(sample: Sample, *, evaluation: bool) -> str:

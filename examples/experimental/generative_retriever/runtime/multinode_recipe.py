@@ -23,7 +23,7 @@ _REPO = Path(__file__).absolute().parents[4]
 # Each pair has one rollout node and one learner node.
 REWARD_GPUS_PER_NODE = 8
 _LEARNER_GPUS_PER_NODE = 8
-ROLLOUT_GPUS_PER_PAIR = 4
+ROLLOUT_GPUS_PER_PAIR = 16
 REWARD_NODES_PER_PAIR = 2
 
 # Batch size and step limit scale with the number of node pairs.
@@ -82,7 +82,6 @@ def build_multinode_train_args(
     args: ScriptArgs, *, addresses: list[str], bundle: Path, prompt: Path,
     reward_url: str, checkpoint_dir: Path, resume: bool,
 ) -> list[str]:
-    pairs = len(addresses) // 2
     blocks = [
         [
             "--hf-checkpoint", str(bundle),
@@ -125,7 +124,10 @@ def build_multinode_train_args(
         ],
         build_optimizer_args(args.lr) + build_algorithm_args(),
         [
-            "--actor-num-nodes", str(pairs),
+            "--colocate",
+            "--no-offload-train",
+            "--no-offload-rollout",
+            "--actor-num-nodes", str(len(addresses)),
             "--actor-num-gpus-per-node", str(args.actor_num_gpus_per_node),
             "--num-gpus-per-node", str(args.num_gpus_per_node),
         ] + build_sglang_args(args, args.sglang_mem_fraction_static),
@@ -158,6 +160,7 @@ def build_multinode_runtime_env(
         **{key: os.environ[key] for key in inherited if key in os.environ},
         "GPU_MAX_HW_QUEUES": "1",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+        "GPU_PINNED_MIN_XFER_SIZE": "100000",
         "GR_CHECKPOINT": checkpoint,
         "GR_QWEN_MODEL": qwen,
         "GR_SLM_ROOT": slm_root,

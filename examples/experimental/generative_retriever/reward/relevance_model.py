@@ -136,6 +136,35 @@ def make_fast_rms_norm_gated(norm_mod: Any, eps: float):
     return _fast_norm
 
 
+def _make_fast_prepare_batch(engine: Any):
+    tokenizer = engine.tokenizer
+    max_len = int(engine.max_length)
+    pad_id = int(tokenizer.pad_token_id)
+    add_emb = bool(getattr(engine, "add_embedding_token", False))
+    dev = engine.device
+
+    def _fast_prepare_batch(texts: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
+        tokenized = tokenizer(texts, padding=False, truncation=True, max_length=max_len)["input_ids"]
+        n = len(tokenized)
+        ids_np = np.full((n, max_len), pad_id, dtype=np.int64)
+        att_np = np.zeros((n, max_len), dtype=np.int64)
+        for i, row in enumerate(tokenized):
+            if add_emb and row and row[-1] != pad_id:
+                row = list(row[: max_len - 1]) + [pad_id]
+            else:
+                row = row[:max_len]
+            k = len(row)
+            if k > 0:
+                arr = np.asarray(row, dtype=np.int64)
+                ids_np[i, max_len - k :] = arr
+                att_np[i, max_len - k :] = (arr != pad_id).astype(np.int64)
+            if add_emb:
+                att_np[i, -1] = 1
+        return torch.from_numpy(ids_np).to(device=dev), torch.from_numpy(att_np).to(device=dev)
+
+    return _fast_prepare_batch
+
+
 def optimize_graphene_pipeline(pipeline: object) -> None:
     for attr in ("query_engine", "keyword_engine"):
         engine: Any = getattr(pipeline, attr, None)
@@ -145,6 +174,7 @@ def optimize_graphene_pipeline(pipeline: object) -> None:
         cur_batch_size = getattr(engine, "batch_size", None)
         if isinstance(cur_batch_size, int):
             engine.batch_size = min(cur_batch_size, _TOWER_MAX_BATCH_SIZE)
+        engine._prepare_batch = _make_fast_prepare_batch(engine)
         for mod in model.modules():
             if type(mod).__name__ == "Qwen3_5GatedDeltaNet":
                 if getattr(mod, "causal_conv1d_fn", None) is None:
@@ -336,10 +366,10 @@ class RelevanceScorer:
                 token_ids, attention = engine._prepare_batch(prompts[start : start + batch_size])
                 chunks.append(engine.model(token_ids, attention).to(dtype=table.dtype))
             encoded = torch.cat(chunks, dim=0)[: len(missing_texts)]
-            if encoded.ndim != 3 or not bool(torch.isfinite(encoded).all()):
+            if encoded.ndim != 3:
                 raise RuntimeError("Official relevance model returned invalid GPU tower features")
             storage = table.ensure_storage(encoded.shape[1], encoded.shape[2])
-            slot_tensor = torch.tensor(missing_slots, dtype=torch.long, device=storage.device)
+            slot_tensor = torch.tensor(missing_slots, dtype=torch.long).to(device=storage.device)
             storage[slot_tensor] = encoded
         storage = table.ensure_storage(table.num_tokens, table.feature_dim)
         return storage, slot_map, delta
@@ -352,8 +382,10 @@ class RelevanceScorer:
         if not unique_queries:
             return {}, {"hits": 0, "misses": 0, "evictions": 0}
         q_storage, q_map, q_delta = self._encode_gpu_table(unique_queries, query=True)
-        slots = torch.tensor([q_map[q] for q in unique_queries], dtype=torch.long, device=q_storage.device)
+        slots = torch.tensor([q_map[q] for q in unique_queries], dtype=torch.long).to(device=q_storage.device)
         fetched = q_storage[slots].detach().cpu()
+        if not bool(torch.isfinite(fetched).all()):
+            raise RuntimeError("Official relevance model returned non-finite query features")
         return (
             {query: fetched[idx] for idx, query in enumerate(unique_queries)},
             q_delta,
@@ -368,8 +400,8 @@ class RelevanceScorer:
         k_slots: list[int],
     ) -> np.ndarray:
         device = k_storage.device
-        q_idx = torch.tensor(q_indices, dtype=torch.long, device=device)
-        k_idx = torch.tensor(k_slots, dtype=torch.long, device=device)
+        q_idx = torch.tensor(q_indices, dtype=torch.long).to(device=device)
+        k_idx = torch.tensor(k_slots, dtype=torch.long).to(device=device)
         cross_chunk = max(_CROSS_CHUNK_SIZE, int(self.pipeline.cross_batch_size))
         scores_gpu: list[torch.Tensor] = []
         for start in range(0, len(q_indices), cross_chunk):
@@ -377,14 +409,14 @@ class RelevanceScorer:
             scores_gpu.append(
                 self.pipeline.cross_model(q_embeds_gpu[q_idx[start:end]], k_storage[k_idx[start:end]]).float()
             )
-        all_scores = torch.cat(scores_gpu, dim=0)
+        all_scores_cpu = torch.cat(scores_gpu, dim=0).cpu().numpy()
         if (
-            all_scores.shape != (len(q_indices), GRAPHENE_NUM_SCORE_HEADS)
-            or not bool(torch.isfinite(all_scores).all())
-            or not bool(((all_scores >= 0) & (all_scores <= 1)).all())
+            all_scores_cpu.shape != (len(q_indices), GRAPHENE_NUM_SCORE_HEADS)
+            or not bool(np.isfinite(all_scores_cpu).all())
+            or not bool(((all_scores_cpu >= 0.0) & (all_scores_cpu <= 1.0)).all())
         ):
             raise RuntimeError("Official relevance model returned invalid scores")
-        return all_scores[:, 1:3].cpu().numpy()
+        return all_scores_cpu[:, 1:3]
 
     @torch.no_grad()
     def score_with_query_embeddings(
@@ -579,7 +611,7 @@ class MultiGpuRelevanceScorer:
         self._conn_locks = [Lock() for _ in range(self.num_gpus)]
         saved_vis = {
             k: os.environ.get(k)
-            for k in ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES")
+            for k in ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES")
         }
         try:
             for dev in self.devices:
@@ -587,6 +619,7 @@ class MultiGpuRelevanceScorer:
                     gpu_id = dev.split(":", 1)[1]
                     os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
                     os.environ["HIP_VISIBLE_DEVICES"] = gpu_id
+                    os.environ["ROCR_VISIBLE_DEVICES"] = gpu_id
                     os.environ["NVIDIA_VISIBLE_DEVICES"] = gpu_id
                 parent_conn, child_conn = ctx.Pipe(duplex=True)
                 proc = ctx.Process(

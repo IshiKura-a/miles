@@ -85,6 +85,7 @@ def _parse_devices(raw_devices: str | Sequence[str]) -> tuple[str, ...]:
 class RewardSample(BaseModel):
     prompt: str
     docid_tokens: tuple[StrictInt, StrictInt, StrictInt, StrictInt]
+    baseline_docids: list[tuple[StrictInt, StrictInt, StrictInt, StrictInt]] | None = None
 
     @field_validator("prompt")
     @classmethod
@@ -301,7 +302,9 @@ class KeywordRewardEngine:
         return query_docids
 
     def _prepare_baselines(
-        self, queries: list[str],
+        self,
+        queries: list[str],
+        precomputed_docids: dict[str, list[tuple[int, int, int, int]]] | None = None,
     ) -> tuple[dict[str, BaselineSets], dict[str, dict[str, int]]]:
         started = time.perf_counter()
         baselines: dict[str, BaselineSets] = {}
@@ -325,9 +328,22 @@ class KeywordRewardEngine:
         if owned:
             missing_queries = list(owned)
             try:
-                if not self.baseline_url:
-                    raise KeyError(f"Prepared baseline missing for queries {missing_queries!r}")
-                query_docids = self._generate_baseline_docids(missing_queries)
+                query_docids: dict[str, list[tuple[int, int, int, int]]] = {}
+                need_rpc: list[str] = []
+                for q in missing_queries:
+                    if precomputed_docids and q in precomputed_docids:
+                        rows = precomputed_docids[q]
+                        if len(rows) != self.docids_per_query or len(set(rows)) != self.docids_per_query:
+                            raise ValueError(f"Precomputed baseline must have {self.docids_per_query} distinct doc IDs")
+                        for d in rows:
+                            validate_docid(d)
+                        query_docids[q] = rows
+                    else:
+                        need_rpc.append(q)
+                if need_rpc:
+                    if not self.baseline_url:
+                        raise KeyError(f"Prepared baseline missing for queries {need_rpc!r}")
+                    query_docids.update(self._generate_baseline_docids(need_rpc))
                 generated_at = time.perf_counter()
                 mapping = self._lookup_docids(
                     [
@@ -415,11 +431,17 @@ class KeywordRewardEngine:
             )
             for sample in request.samples
         ]
+        precomputed_baselines = {
+            sample.prompt: sample.baseline_docids
+            for sample in request.samples
+            if sample.baseline_docids is not None
+        }
         mapping = self._lookup_docids(docids)
         mapped_at = time.perf_counter()
-        baselines, baseline_delta = self._prepare_baselines([
-            sample.prompt for sample in request.samples
-        ])
+        baselines, baseline_delta = self._prepare_baselines(
+            [sample.prompt for sample in request.samples],
+            precomputed_docids=precomputed_baselines,
+        )
         prepared_at = time.perf_counter()
         sample_keywords = [
             list(dict.fromkeys(mapping[docid]))
@@ -775,7 +797,7 @@ def create_app(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--baseline-url", required=True)
+    parser.add_argument("--baseline-url", default="")
     parser.add_argument("--mapping-url", required=True)
     parser.add_argument("--mapping-version", required=True)
     parser.add_argument("--relevance-model", required=True)

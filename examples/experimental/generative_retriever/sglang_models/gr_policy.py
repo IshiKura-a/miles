@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Iterable
 from typing import Any, cast
 
@@ -24,7 +25,7 @@ from sglang.srt.models.qwen3_classification import Qwen3ForPooledOutput
 
 
 class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
-    """Frozen Qwen3 encoder with an updateable SLMv3 Stage5 policy head."""
+    """Frozen Qwen3 encoder with an updateable SLMv3 Stage5 policy head and frozen baseline head."""
 
     def __init__(
         self,
@@ -47,7 +48,7 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
         if self.decoding_mode not in {"beam", "beam_sample", "sample"}:
             raise ValueError("GR decoding_mode must be 'beam', 'beam_sample', or 'sample'")
         if self.decoding_mode in {"beam", "beam_sample"} and not 1 <= self.num_return_sequences <= self.num_beams:
-            raise ValueError("Require 1 <= num_return_sequences <= num_beams")
+            raise ValueError("Require 1 <= num_return_sequences <= self.num_beams")
         self.constraint = load_constraint(
             raw_gr_config["id_mapping"], self.docid_size, self.docid_dim,
         )
@@ -82,6 +83,27 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
             projection=self.docEnc2decoder, decoder=self.decoder, lm_head=self.lm_head,
         )
         object.__setattr__(self, "_generation_model", generation_model)
+
+        self.baseline_docEnc2decoder = copy.deepcopy(self.docEnc2decoder)
+        self.baseline_docid_embedding = copy.deepcopy(self.docid_embedding)
+        self.baseline_decoder = copy.deepcopy(self.decoder)
+        self.baseline_decoder.embed_tokens = self.baseline_docid_embedding
+        self.baseline_lm_head = copy.deepcopy(self.lm_head)
+        for mod in (
+            self.baseline_docEnc2decoder,
+            self.baseline_docid_embedding,
+            self.baseline_decoder,
+            self.baseline_lm_head,
+        ):
+            mod.requires_grad_(False)
+        baseline_generation_model = build_generation_model(
+            slm_root=raw_gr_config["slm_root"], config=decoder_config,
+            projection=self.baseline_docEnc2decoder,
+            decoder=self.baseline_decoder,
+            lm_head=self.baseline_lm_head,
+        )
+        object.__setattr__(self, "_baseline_generation_model", baseline_generation_model)
+        self._baseline_initialized = False
 
     @staticmethod
     def _split_hidden_states(
@@ -131,7 +153,17 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
                 code_num=self.docid_size, num_return_sequences=self.num_return_sequences,
                 temperature=self.temperature,
             )
-        packed = torch.cat((token_ids.float(), token_logprobs.float()), dim=-1).flatten(1)
+        baseline_ids, _ = generate_beams(
+            self._baseline_generation_model, hidden_states, attention_mask, self.constraint,
+            code_num=self.docid_size, num_beams=self.num_beams,
+            num_return_sequences=self.num_return_sequences,
+            do_sample=False,
+            temperature=1.0,
+        )
+        packed = torch.cat(
+            (token_ids.float(), token_logprobs.float(), baseline_ids.float()),
+            dim=-1,
+        ).flatten(1)
         return self._dp_compatible_output(packed)
 
     @staticmethod
@@ -154,7 +186,7 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
             raise ValueError("GRQwen3ForDocIDGeneration only supports embedding-mode rollout")
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         if hidden_states.shape[0] == 0:
-            packed_width = self.num_return_sequences * self.docid_size * 2
+            packed_width = self.num_return_sequences * self.docid_size * 3
             return self._dp_compatible_output(
                 hidden_states.new_empty((0, packed_width)),
             )
@@ -163,6 +195,7 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         params = dict(self.named_parameters())
+        loaded_head_keys: list[str] = []
         for original_name, loaded_weight in weights:
             if original_name.startswith("encoder_list.0.model.encoder."):
                 qwen_name = original_name.removeprefix("encoder_list.0.model.encoder.")
@@ -182,6 +215,15 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
                 raise KeyError(f"GR rollout parameter not found: {target_name}")
             loader = getattr(parameter, "weight_loader", default_weight_loader)
             loader(parameter, loaded_weight)
+            if not self._baseline_initialized:
+                baseline_target = f"baseline_{target_name}"
+                baseline_param = params.get(baseline_target)
+                if baseline_param is not None:
+                    b_loader = getattr(baseline_param, "weight_loader", default_weight_loader)
+                    b_loader(baseline_param, loaded_weight)
+                    loaded_head_keys.append(baseline_target)
+        if not self._baseline_initialized and loaded_head_keys:
+            self._baseline_initialized = True
 
 
 EntryClass = GRQwen3ForDocIDGeneration

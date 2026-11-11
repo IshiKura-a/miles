@@ -269,8 +269,7 @@ def run_service_node(manifest: Manifest, index: int) -> None:
                 processes, "mapping", "mapping_service", host, _RESIDENT_MAPPING_PORT,
                 ["--mapping", mapping], persistent=True,
             )
-        if index % 2 == 0:
-            baseline = start_baseline(processes, manifest, host)
+        baseline = None
         reward_health = []
         pairs = len(manifest["hosts"]) // 2
         query_cache, kw_cache, score_cache = derive_reward_cache_sizes(
@@ -471,7 +470,7 @@ def run_worker(manifest: Manifest, index: int) -> None:
 
 
 def run_training(manifest: Manifest) -> None:
-    from train_async import train
+    from train import train
     from miles.utils.arguments import parse_args
     from miles.utils.tracking_utils.tracking import finish_tracking
 
@@ -480,11 +479,9 @@ def run_training(manifest: Manifest) -> None:
         raise RuntimeError("WANDB_API_KEY must be set in the training driver")
     runtime_env = {"env_vars": manifest["runtime_env"]}
     ray.init(address=manifest["ray_address"], runtime_env=runtime_env)
-    sys.argv = [str(_REPO / "train_async.py"), *manifest["train_argv"]]
+    sys.argv = [str(_REPO / "train.py"), *manifest["train_argv"]]
     try:
         args = parse_args()
-        args.actor_node_ips = manifest["addresses"][1::2]
-        args.rollout_node_ips = manifest["addresses"][::2]
         try:
             asyncio.run(train(args))
         finally:
@@ -566,23 +563,7 @@ def run_cluster(manifest: Manifest) -> None:
             if time.monotonic() > deadline:
                 raise TimeoutError(f"Expected {required} Ray GPUs across all nodes")
             time.sleep(2)
-        reservations = [
-            # Ray's decorator supplies .options/.remote dynamically.
-            ReserveServiceGpus.options(  # pyright: ignore[reportFunctionMemberAccess]
-                num_gpus=4, num_cpus=0,
-                resources={f"node:{host}": 0.001},
-            ).remote()
-            for host in manifest["addresses"][::2]
-        ]
-        for host, actor in zip(manifest["addresses"][::2], reservations, strict=True):
-            assigned = sorted(ray.get(actor.gpu_ids.remote()))  # pyright: ignore[reportFunctionMemberAccess]
-            if assigned != [0, 1, 2, 3]:
-                raise RuntimeError(f"Service node {host} GPU reservation was {assigned}, not 0-3")
-        for index, host in enumerate(manifest["addresses"][::2]):
-            wait_health(
-                processes, host, f"baseline-{index}", _BASELINE_PORT,
-                {"worker_count": 4, "docids_per_query": SAMPLES_PER_PROMPT},
-            )
+        # All 64 GPUs are colocated for rollout, baseline, reward, and training.
         for node, host in enumerate(manifest["addresses"]):
             wait_health(
                 processes, host, f"mapping-{node}", _RESIDENT_MAPPING_PORT,
