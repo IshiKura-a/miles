@@ -61,7 +61,7 @@ def build_multinode_recipe(run_id: str, pairs: int, num_rollout: int) -> ScriptA
         rollout_batch_size=QUERIES_PER_STEP_PER_PAIR * pairs,
         rollout_max_in_flight_groups=IN_FLIGHT_GROUPS_PER_PAIR * pairs,
         n_samples_per_prompt=SAMPLES_PER_PROMPT,
-        global_batch_size=(QUERIES_PER_STEP_PER_PAIR * SAMPLES_PER_PROMPT * pairs) // 4,
+        global_batch_size=QUERIES_PER_STEP_PER_PAIR * SAMPLES_PER_PROMPT * pairs,
         actor_num_gpus_per_node=_LEARNER_GPUS_PER_NODE,
         rollout_num_gpus=ROLLOUT_GPUS_PER_PAIR * pairs,
         rollout_num_gpus_per_engine=1,
