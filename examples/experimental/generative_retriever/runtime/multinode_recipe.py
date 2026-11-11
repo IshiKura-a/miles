@@ -27,8 +27,8 @@ ROLLOUT_GPUS_PER_PAIR = 16
 REWARD_NODES_PER_PAIR = 2
 
 # Batch size and step limit scale with the number of node pairs.
-QUERIES_PER_STEP_PER_PAIR = 8_000
-IN_FLIGHT_GROUPS_PER_PAIR = 1_024
+QUERIES_PER_STEP_PER_PAIR = 16_000
+IN_FLIGHT_GROUPS_PER_PAIR = 2_048
 SAMPLES_PER_PROMPT = DEFAULT_TRAIN_GROUP_SIZE
 MAX_STEPS_PER_PAIR = PROMPT_DATASET_ROWS // QUERIES_PER_STEP_PER_PAIR
 
@@ -61,12 +61,12 @@ def build_multinode_recipe(run_id: str, pairs: int, num_rollout: int) -> ScriptA
         rollout_batch_size=QUERIES_PER_STEP_PER_PAIR * pairs,
         rollout_max_in_flight_groups=IN_FLIGHT_GROUPS_PER_PAIR * pairs,
         n_samples_per_prompt=SAMPLES_PER_PROMPT,
-        global_batch_size=QUERIES_PER_STEP_PER_PAIR * SAMPLES_PER_PROMPT * pairs,
+        global_batch_size=(QUERIES_PER_STEP_PER_PAIR * SAMPLES_PER_PROMPT * pairs) // 4,
         actor_num_gpus_per_node=_LEARNER_GPUS_PER_NODE,
         rollout_num_gpus=ROLLOUT_GPUS_PER_PAIR * pairs,
         rollout_num_gpus_per_engine=1,
         sglang_dp_size=1,
-        max_tokens_per_gpu=131072,
+        max_tokens_per_gpu=524288,
         sglang_mem_fraction_static=mem_fraction,
         sglang_server_concurrency=_SGLANG_CONCURRENCY_PER_PAIR * pairs,
         reward_timeout=1800,

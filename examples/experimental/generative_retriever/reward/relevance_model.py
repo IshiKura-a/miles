@@ -604,6 +604,7 @@ class MultiGpuRelevanceScorer:
             for _ in range(self.num_gpus)
         ]
         staged_source = _stage_local_relevance_source(Path(relevance_source))
+        staged_model = _stage_local_relevance_model(relevance_model)
         ctx = mp.get_context("spawn")
         self._executor = ThreadPoolExecutor(max_workers=self.num_gpus)
         self._conns: list[Connection] = []
@@ -617,16 +618,16 @@ class MultiGpuRelevanceScorer:
             for dev in self.devices:
                 if dev.startswith("cuda:"):
                     gpu_id = dev.split(":", 1)[1]
-                    os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
-                    os.environ["HIP_VISIBLE_DEVICES"] = gpu_id
+                    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+                    os.environ.pop("HIP_VISIBLE_DEVICES", None)
+                    os.environ.pop("NVIDIA_VISIBLE_DEVICES", None)
                     os.environ["ROCR_VISIBLE_DEVICES"] = gpu_id
-                    os.environ["NVIDIA_VISIBLE_DEVICES"] = gpu_id
                 parent_conn, child_conn = ctx.Pipe(duplex=True)
                 proc = ctx.Process(
                     target=_gpu_worker_loop,
                     args=(
                         child_conn,
-                        relevance_model,
+                        staged_model,
                         staged_source,
                         dev,
                         batch_size,
@@ -880,6 +881,45 @@ def relevance_source_path(relevance_model: str | Path) -> Path:
     if not marker:
         raise ValueError(f"Relevance source checkpoint has no /local/ prefix: {source_checkpoint}")
     return _validate_source(Path(cosmos_root) / "local" / relative / "code")
+
+
+_RELEVANCE_SUBDIRS = ("checkpoint-query", "checkpoint-keyword", "checkpoint-cross-large")
+_RELEVANCE_FILES = (
+    "chat_template.jinja",
+    "config.json",
+    "model.safetensors",
+    "tokenizer.json",
+    "tokenizer_config.json",
+)
+
+
+def _stage_local_relevance_model(model_dir: str | Path) -> str:
+    resolved = absolute_path(model_dir)
+    local_root = Path(tempfile.gettempdir())
+    if resolved.is_relative_to(local_root):
+        return os.fspath(resolved)
+    target = local_root / f"gr_relevance_model_{resolved.name}"
+    sentinel = target / ".staged_ok"
+    if not sentinel.is_file():
+        with FileLock(f"{target}.lock"):
+            if not sentinel.is_file():
+                target.mkdir(parents=True, exist_ok=True)
+                src_ptr = resolved / "SOURCE_CHECKPOINT.txt"
+                dst_ptr = target / "SOURCE_CHECKPOINT.txt"
+                if not dst_ptr.is_file() and src_ptr.is_file():
+                    shutil.copyfile(src_ptr, dst_ptr)
+                for sub in _RELEVANCE_SUBDIRS:
+                    sub_dst = target / sub
+                    sub_dst.mkdir(parents=True, exist_ok=True)
+                    sub_src = resolved / sub
+                    for fname in _RELEVANCE_FILES:
+                        f_dst = sub_dst / fname
+                        if not f_dst.is_file():
+                            f_src = sub_src / fname
+                            if f_src.is_file():
+                                shutil.copyfile(f_src, f_dst)
+                sentinel.write_text(os.fspath(resolved), encoding="utf-8")
+    return os.fspath(target)
 
 
 def _stage_local_relevance_source(source: Path) -> Path:
