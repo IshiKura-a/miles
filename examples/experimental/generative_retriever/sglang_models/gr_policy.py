@@ -164,6 +164,7 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
             (token_ids.float(), token_logprobs.float(), baseline_ids.float()),
             dim=-1,
         ).flatten(1)
+        del token_ids, token_logprobs, baseline_ids
         return self._dp_compatible_output(packed)
 
     @staticmethod

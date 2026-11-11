@@ -554,6 +554,9 @@ def _gpu_worker_loop(
                 conn.send(("ok", (scores, k_delta, scorer.keyword_features.stats())))
             elif cmd == "stats":
                 conn.send(("ok", (scorer.query_features.stats(), scorer.keyword_features.stats())))
+            elif cmd == "empty_cache":
+                torch.cuda.empty_cache()
+                conn.send(("ok", None))
             else:
                 conn.send(("error", f"Unknown command: {cmd}"))
     except BaseException as exc:
@@ -842,6 +845,14 @@ class MultiGpuRelevanceScorer:
     def score(self, pairs: list[tuple[str, str]]) -> dict[tuple[str, str], tuple[float, float]]:
         resolved, _ = self.score_with_deltas(pairs)
         return resolved
+
+    def empty_cache(self) -> None:
+        futures = [
+            self._executor.submit(self._call_worker, idx, "empty_cache", None)
+            for idx in range(self.num_gpus)
+        ]
+        for future in futures:
+            future.result()
 
     def close(self) -> None:
         self._executor.shutdown(wait=True)

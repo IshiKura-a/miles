@@ -708,6 +708,7 @@ class KeywordRewardEngine:
             self._step_edge_passes.clear()
 
     def harvest_step_delta(self, min_queries: int = DOC2K_PRUNE_MIN_QUERIES) -> dict[str, Any]:
+        self.scorer.empty_cache()
         with self._lock:
             additions = [
                 {"docid": list(docid), "keywords": list(keywords)}

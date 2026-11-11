@@ -66,7 +66,7 @@ def build_multinode_recipe(run_id: str, pairs: int, num_rollout: int) -> ScriptA
         rollout_num_gpus=ROLLOUT_GPUS_PER_PAIR * pairs,
         rollout_num_gpus_per_engine=1,
         sglang_dp_size=1,
-        max_tokens_per_gpu=524288,
+        max_tokens_per_gpu=262144,
         sglang_mem_fraction_static=mem_fraction,
         sglang_server_concurrency=_SGLANG_CONCURRENCY_PER_PAIR * pairs,
         reward_timeout=1800,
