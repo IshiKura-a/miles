@@ -156,6 +156,8 @@ def build_multinode_runtime_env(
     )
     return {
         **{key: os.environ[key] for key in inherited if key in os.environ},
+        "GPU_MAX_HW_QUEUES": "1",
+        "CUDA_DEVICE_MAX_CONNECTIONS": "1",
         "GR_CHECKPOINT": checkpoint,
         "GR_QWEN_MODEL": qwen,
         "GR_SLM_ROOT": slm_root,

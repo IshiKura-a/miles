@@ -477,18 +477,21 @@ def _gpu_worker_loop(
     pair_batch_size: int,
 ) -> None:
     try:
-        if device.startswith("cuda:"):
-            torch.cuda.set_device(int(device.split(":", 1)[1]))
-        factory = load_relevance_pipeline_factory(relevance_source)
-        pipeline = factory(
-            relevance_model,
-            cup="large",
-            device=device,
-            dtype="bf16",
-            batch_size=batch_size,
-            cross_batch_size=cross_batch_size,
-            show_progress=False,
-        )
+        local_device = "cuda:0" if device.startswith("cuda") else device
+        if local_device.startswith("cuda:"):
+            torch.cuda.set_device(0)
+        init_lock_path = Path(tempfile.gettempdir()) / "gr_relevance_init.lock"
+        with FileLock(str(init_lock_path)):
+            factory = load_relevance_pipeline_factory(relevance_source)
+            pipeline = factory(
+                relevance_model,
+                cup="large",
+                device=local_device,
+                dtype="bf16",
+                batch_size=batch_size,
+                cross_batch_size=cross_batch_size,
+                show_progress=False,
+            )
         scorer = RelevanceScorer(
             pipeline,
             feature_cache_size=query_cache_size,
@@ -576,27 +579,43 @@ class MultiGpuRelevanceScorer:
         self._conns: list[Connection] = []
         self._procs: list[Any] = []
         self._conn_locks = [Lock() for _ in range(self.num_gpus)]
-        for dev in self.devices:
-            parent_conn, child_conn = ctx.Pipe(duplex=True)
-            proc = ctx.Process(
-                target=_gpu_worker_loop,
-                args=(
-                    child_conn,
-                    relevance_model,
-                    staged_source,
-                    dev,
-                    batch_size,
-                    cross_batch_size,
-                    per_gpu_q_cache,
-                    keyword_cache_size,
-                    pair_batch_size,
-                ),
-                daemon=True,
-            )
-            proc.start()
-            child_conn.close()
-            self._conns.append(parent_conn)
-            self._procs.append(proc)
+        saved_vis = {
+            k: os.environ.get(k)
+            for k in ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES")
+        }
+        try:
+            for dev in self.devices:
+                if dev.startswith("cuda:"):
+                    gpu_id = dev.split(":", 1)[1]
+                    os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
+                    os.environ["HIP_VISIBLE_DEVICES"] = gpu_id
+                    os.environ["NVIDIA_VISIBLE_DEVICES"] = gpu_id
+                parent_conn, child_conn = ctx.Pipe(duplex=True)
+                proc = ctx.Process(
+                    target=_gpu_worker_loop,
+                    args=(
+                        child_conn,
+                        relevance_model,
+                        staged_source,
+                        dev,
+                        batch_size,
+                        cross_batch_size,
+                        per_gpu_q_cache,
+                        keyword_cache_size,
+                        pair_batch_size,
+                    ),
+                    daemon=True,
+                )
+                proc.start()
+                child_conn.close()
+                self._conns.append(parent_conn)
+                self._procs.append(proc)
+        finally:
+            for k, v in saved_vis.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
         for idx, conn in enumerate(self._conns):
             status, detail = conn.recv()
             if status != "ready":

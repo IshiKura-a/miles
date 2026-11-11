@@ -12,6 +12,7 @@ import gc
 import logging
 import multiprocessing as mp
 from multiprocessing.connection import Connection
+import os
 from pathlib import Path
 import tempfile
 from threading import Lock
@@ -77,8 +78,9 @@ def _baseline_worker_loop(
     policy_checkpoint: str | None,
 ) -> None:
     try:
-        if device.startswith("cuda:"):
-            torch.cuda.set_device(int(device.split(":", 1)[1]))
+        local_device = "cuda:0" if device.startswith("cuda") else device
+        if local_device.startswith("cuda:"):
+            torch.cuda.set_device(0)
         init_lock_path = Path(tempfile.gettempdir()) / "gr_baseline_init.lock"
         with FileLock(str(init_lock_path)):
             retriever = SLMv3Retriever(
@@ -86,7 +88,7 @@ def _baseline_worker_loop(
                 qwen_model=qwen_model,
                 slm_root=slm_root,
                 id_mapping=id_mapping,
-                device=device,
+                device=local_device,
             )
             if policy_checkpoint is not None:
                 load_policy_head_checkpoint(retriever.model, policy_checkpoint)
@@ -147,25 +149,41 @@ class BaselinePool:
         self._conns: list[Connection] = []
         self._procs: list[Any] = []
         self._conn_locks = [Lock() for _ in range(self.worker_count)]
-        for device in devices:
-            parent_conn, child_conn = ctx.Pipe(duplex=True)
-            proc = ctx.Process(
-                target=_baseline_worker_loop,
-                args=(
-                    child_conn,
-                    checkpoint,
-                    qwen_model,
-                    slm_root,
-                    id_mapping,
-                    device,
-                    policy_checkpoint,
-                ),
-                daemon=True,
-            )
-            proc.start()
-            child_conn.close()
-            self._conns.append(parent_conn)
-            self._procs.append(proc)
+        saved_vis = {
+            k: os.environ.get(k)
+            for k in ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES")
+        }
+        try:
+            for device in devices:
+                if device.startswith("cuda:"):
+                    gpu_id = device.split(":", 1)[1]
+                    os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
+                    os.environ["HIP_VISIBLE_DEVICES"] = gpu_id
+                    os.environ["NVIDIA_VISIBLE_DEVICES"] = gpu_id
+                parent_conn, child_conn = ctx.Pipe(duplex=True)
+                proc = ctx.Process(
+                    target=_baseline_worker_loop,
+                    args=(
+                        child_conn,
+                        checkpoint,
+                        qwen_model,
+                        slm_root,
+                        id_mapping,
+                        device,
+                        policy_checkpoint,
+                    ),
+                    daemon=True,
+                )
+                proc.start()
+                child_conn.close()
+                self._conns.append(parent_conn)
+                self._procs.append(proc)
+        finally:
+            for k, v in saved_vis.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
         for idx, conn in enumerate(self._conns):
             status, detail = conn.recv()
             if status != "ready":

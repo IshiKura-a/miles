@@ -158,6 +158,8 @@ def rocm_runtime_env(venv: Path | None = None) -> dict[str, str]:
         "CPATH": f"{rocm_home / 'include'}:{os.environ.get('CPATH', '')}".rstrip(":"),
         "CMAKE_PREFIX_PATH": f"{rocm_home}:{os.environ.get('CMAKE_PREFIX_PATH', '')}".rstrip(":"),
         "HSA_NO_SCRATCH_RECLAIM": "1",
+        "GPU_MAX_HW_QUEUES": "1",
+        "CUDA_DEVICE_MAX_CONNECTIONS": "1",
         "PYTORCH_ROCM_ARCH": "gfx942",
         "GPU_ARCHS": "gfx942",
         "GPU_ARCH": "gfx942",
@@ -233,6 +235,8 @@ def _write_activate_script(venv: Path) -> Path:
         'export CPATH="$ROCM_HOME/include${CPATH:+:$CPATH}"\n'
         'export CMAKE_PREFIX_PATH="$ROCM_HOME${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"\n'
         'export HSA_NO_SCRATCH_RECLAIM="1"\n'
+        'export GPU_MAX_HW_QUEUES="1"\n'
+        'export CUDA_DEVICE_MAX_CONNECTIONS="1"\n'
         'export PYTORCH_ROCM_ARCH="gfx942"\n'
         'export GPU_ARCHS="gfx942"\n'
         'export GPU_ARCH="gfx942"\n'
