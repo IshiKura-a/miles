@@ -480,18 +480,16 @@ def _gpu_worker_loop(
         local_device = "cuda:0" if device.startswith("cuda") else device
         if local_device.startswith("cuda:"):
             torch.cuda.set_device(0)
-        init_lock_path = Path(tempfile.gettempdir()) / "gr_relevance_init.lock"
-        with FileLock(str(init_lock_path)):
-            factory = load_relevance_pipeline_factory(relevance_source)
-            pipeline = factory(
-                relevance_model,
-                cup="large",
-                device=local_device,
-                dtype="bf16",
-                batch_size=batch_size,
-                cross_batch_size=cross_batch_size,
-                show_progress=False,
-            )
+        factory = load_relevance_pipeline_factory(relevance_source)
+        pipeline = factory(
+            relevance_model,
+            cup="large",
+            device=local_device,
+            dtype="bf16",
+            batch_size=batch_size,
+            cross_batch_size=cross_batch_size,
+            show_progress=False,
+        )
         scorer = RelevanceScorer(
             pipeline,
             feature_cache_size=query_cache_size,
