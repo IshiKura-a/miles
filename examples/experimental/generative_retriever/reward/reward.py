@@ -114,14 +114,18 @@ class RewardBatcher(AsyncRequestBatcher[list[dict[str, Any]], BatchResult]):
         requests: list[PendingBatchRequest[list[dict[str, Any]], BatchResult]],
         result: BatchResult,
     ) -> None:
+        first_valid_detail = next((d for d in result.details if d), None)
         offset = 0
         for index, request in enumerate(requests):
             end = offset + len(request.payload)
             if not request.future.done():
+                sub_details = list(result.details[offset:end])
+                if sub_details and not any(sub_details) and first_valid_detail is not None:
+                    sub_details[0] = first_valid_detail
                 request.future.set_result(
                     BatchResult(
                         rewards=result.rewards[offset:end],
-                        details=result.details[offset:end],
+                        details=sub_details,
                         cache=result.cache if index == 0 else {},
                         request_metrics=result.request_metrics if index == 0 else {},
                     )

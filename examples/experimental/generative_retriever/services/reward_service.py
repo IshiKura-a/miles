@@ -529,6 +529,7 @@ class KeywordRewardEngine:
             query_group_indices.setdefault(sample.prompt, []).append(idx)
         rewards = []
         details = []
+        query_metrics_acc: dict[str, dict[str, float]] = {}
         include_inline_keywords = len(request.samples) <= _INLINE_KEYWORDS_SAMPLE_LIMIT
         sample_unique_good: list[list[str]] = []
         local_docid_queries: dict[tuple[int, int, int, int], set[str]] = {}
@@ -597,13 +598,13 @@ class KeywordRewardEngine:
                     detail_entry["keywords"] = inline_kws
                 details.append(detail_entry)
             else:
-                if not details:
-                    batch_metrics_acc = {k: float(v) for k, v in metrics.items()}
-                    details.append({"metrics": batch_metrics_acc})
+                q_acc = query_metrics_acc.get(sample.prompt)
+                if q_acc is None:
+                    query_metrics_acc[sample.prompt] = {k: float(v) for k, v in metrics.items()}
                 else:
                     for k, v in metrics.items():
-                        batch_metrics_acc[k] += float(v)
-                    details.append({})
+                        q_acc[k] += float(v)
+                details.append({})
             logger.debug("reward_mode=%s docid=%s keywords=%d reward=%f",
                         request.reward_mode, docid, len(keywords), value)
 
@@ -678,8 +679,14 @@ class KeywordRewardEngine:
             finished - started,
         )
         if not include_inline_keywords and details:
-            inv_n = 1.0 / float(len(details))
-            details[0] = {"metrics": {k: v * inv_n for k, v in batch_metrics_acc.items()}}
+            for q_text, q_indices in query_group_indices.items():
+                if q_indices and q_text in query_metrics_acc:
+                    inv_n = 1.0 / float(len(q_indices))
+                    q_avg = {k: v * inv_n for k, v in query_metrics_acc[q_text].items()}
+                    details[q_indices[0]] = {"metrics": q_avg}
+                    for qi in q_indices:
+                        if qi % self.docids_per_query == 0 or request.samples[qi].baseline_docids is not None:
+                            details[qi] = {"metrics": q_avg}
         return {
             "rewards": rewards,
             "details": details,
