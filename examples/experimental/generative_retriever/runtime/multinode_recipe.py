@@ -64,6 +64,8 @@ def build_multinode_recipe(run_id: str, pairs: int, num_rollout: int) -> ScriptA
         global_batch_size=QUERIES_PER_STEP_PER_PAIR * SAMPLES_PER_PROMPT * pairs,
         actor_num_gpus_per_node=_LEARNER_GPUS_PER_NODE,
         rollout_num_gpus=ROLLOUT_GPUS_PER_PAIR * pairs,
+        rollout_num_gpus_per_engine=1,
+        sglang_dp_size=1,
         max_tokens_per_gpu=131072,
         sglang_mem_fraction_static=mem_fraction,
         sglang_server_concurrency=_SGLANG_CONCURRENCY_PER_PAIR * pairs,

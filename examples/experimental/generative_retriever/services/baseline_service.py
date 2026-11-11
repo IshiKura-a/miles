@@ -12,13 +12,13 @@ import gc
 import logging
 import multiprocessing as mp
 from multiprocessing.connection import Connection
-import os
 from pathlib import Path
 import tempfile
 from threading import Lock
 import time
 from typing import Annotated, Any
 
+import anyio.to_thread
 from fastapi import FastAPI, HTTPException
 from filelock import FileLock
 from pydantic import BaseModel, Field, field_validator
@@ -27,7 +27,6 @@ import uvicorn
 
 from examples.experimental.generative_retriever.model.model_loading import load_policy_head_checkpoint
 from examples.experimental.generative_retriever.model.transformers_infer import GenerationResult, SLMv3Retriever
-from examples.experimental.generative_retriever.reward.relevance_model import gpu_exec_lock
 from examples.experimental.generative_retriever.reward.relevance_reward import (
     DEFAULT_TRAIN_GROUP_SIZE,
     MAX_EVAL_BATCH_SIZE,
@@ -39,7 +38,6 @@ BASELINE_SERVICE_API_VERSION = 2
 BASELINE_CACHE_SIZE = 8192
 _SERVICE_API_VERSION = BASELINE_SERVICE_API_VERSION
 _CACHE_SIZE = BASELINE_CACHE_SIZE
-_WORKER_TIMEOUT_SECONDS = 300.0
 
 
 class BaselineRequest(BaseModel):
@@ -78,15 +76,11 @@ def _baseline_worker_loop(
     device: str,
     policy_checkpoint: str | None,
 ) -> None:
-    lock_fd: int | None = None
     try:
         if device.startswith("cuda:"):
-            gpu_idx = int(device.split(":", 1)[1])
-            torch.cuda.set_device(gpu_idx)
-            exec_lock_path = Path(tempfile.gettempdir()) / f"gr_gpu_exec_{gpu_idx}.lock"
-            lock_fd = os.open(exec_lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            torch.cuda.set_device(int(device.split(":", 1)[1]))
         init_lock_path = Path(tempfile.gettempdir()) / "gr_baseline_init.lock"
-        with FileLock(str(init_lock_path)), gpu_exec_lock(lock_fd):
+        with FileLock(str(init_lock_path)):
             retriever = SLMv3Retriever(
                 checkpoint=checkpoint,
                 qwen_model=qwen_model,
@@ -108,17 +102,15 @@ def _baseline_worker_loop(
             cmd, payload = msg
             if cmd == "generate":
                 queries, docids_per_query = payload
-                with gpu_exec_lock(lock_fd):
-                    generated = retriever.generate(
-                        queries,
-                        num_beams=docids_per_query,
-                        num_return_sequences=docids_per_query,
-                    )
+                generated = retriever.generate(
+                    queries,
+                    num_beams=docids_per_query,
+                    num_return_sequences=docids_per_query,
+                )
                 conn.send(("ok", _serialize_results(generated)))
             elif cmd == "load_policy_head":
-                with gpu_exec_lock(lock_fd):
-                    tensor_count = load_policy_head_checkpoint(retriever.model, payload)
-                    retriever.model.eval()
+                tensor_count = load_policy_head_checkpoint(retriever.model, payload)
+                retriever.model.eval()
                 conn.send(("ok", tensor_count))
             else:
                 conn.send(("error", f"Unknown command: {cmd}"))
@@ -129,8 +121,6 @@ def _baseline_worker_loop(
             pass
         raise
     finally:
-        if lock_fd is not None:
-            os.close(lock_fd)
         conn.close()
 
 
@@ -194,8 +184,6 @@ class BaselinePool:
                 raise RuntimeError(f"Baseline GPU subprocess {self.devices[idx]} exited unexpectedly")
             conn = self._conns[idx]
             conn.send((cmd, payload))
-            if not conn.poll(_WORKER_TIMEOUT_SECONDS):
-                raise RuntimeError(f"Baseline GPU subprocess {self.devices[idx]} timed out after {_WORKER_TIMEOUT_SECONDS}s")
             status, result = conn.recv()
         if status != "ok":
             raise RuntimeError(f"Baseline GPU subprocess {self.devices[idx]} error: {result}")
@@ -314,6 +302,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        anyio.to_thread.current_default_thread_limiter().total_tokens = 1024
         app.state.pool = BaselinePool(
             checkpoint=checkpoint,
             qwen_model=qwen_model,

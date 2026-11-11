@@ -16,7 +16,6 @@ from miles.utils.types import Sample
 from examples.experimental.generative_retriever.reward.relevance_reward import (
     DEFAULT_REWARD_BATCH_SIZE,
     DOCID_TOKEN_OFFSET,
-    MAX_DOCIDS_PER_QUERY,
     QUERY_MAX_TOKENS,
     REWARD_MODES,
     RQ_CODE_DIM,
@@ -33,7 +32,7 @@ _PREPARE_BATCHERS: WeakKeyDictionary[
 ] = WeakKeyDictionary()
 _DOCID_SIZE = RQ_CODE_NUM
 _DOCID_DIM = RQ_CODE_DIM
-_MAX_PREPARE_QUERIES = MAX_DOCIDS_PER_QUERY
+_MAX_PREPARE_QUERIES = 64
 _PREPARE_BATCH_WAIT_SECONDS = 0.01
 _TRANSPORT_ATTEMPTS = 3
 _RETRY_DELAY_SECONDS = 0.5

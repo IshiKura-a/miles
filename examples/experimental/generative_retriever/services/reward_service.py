@@ -25,6 +25,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Annotated, Any
 
+import anyio.to_thread
 import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException
@@ -203,8 +204,8 @@ class KeywordRewardEngine:
         self._lock = Lock()
         self._baseline_inflight: dict[str, Future[BaselineSets]] = {}
         self._client = httpx.Client(
-            timeout=300.0,
-            limits=httpx.Limits(max_connections=128, max_keepalive_connections=0),
+            timeout=900.0,
+            limits=httpx.Limits(max_connections=1024, max_keepalive_connections=0),
             trust_env=False,
         )
         self._step_additions: dict[tuple[int, int, int, int], list[str]] = {}
@@ -672,6 +673,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        anyio.to_thread.current_default_thread_limiter().total_tokens = 1024
         app.state.engine = KeywordRewardEngine(
             baseline_url,
             mapping_url,
@@ -700,6 +702,10 @@ def create_app(
     @app.get("/health")
     def health() -> dict[str, Any]:
         engine = app.state.engine
+        try:
+            engine.scorer.check_alive()
+        except RuntimeError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
         return {
             "status": "ready",
             "mode": "worker",

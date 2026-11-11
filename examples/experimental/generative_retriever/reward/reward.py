@@ -95,16 +95,15 @@ class RewardBatcher(AsyncRequestBatcher[list[dict[str, Any]], BatchResult]):
         requests: list[PendingBatchRequest[list[dict[str, Any]], BatchResult]],
     ) -> None:
         payloads = [payload for request in requests for payload in request.payload]
-        async with asyncio.timeout(self._timeout_seconds):
-            response = await post_json_async(
-                self._url,
-                {"samples": payloads, "reward_mode": self._mode},
-                timeout=self._timeout_seconds,
-            )
-            rewards, details, cache, request_metrics = parse_rewards(
-                response,
-                expected_count=len(payloads),
-            )
+        response = await post_json_async(
+            self._url,
+            {"samples": payloads, "reward_mode": self._mode},
+            timeout=self._timeout_seconds,
+        )
+        rewards, details, cache, request_metrics = parse_rewards(
+            response,
+            expected_count=len(payloads),
+        )
         result = BatchResult(rewards, details, cache, request_metrics)
         self.resolve_requests(requests, result)
 

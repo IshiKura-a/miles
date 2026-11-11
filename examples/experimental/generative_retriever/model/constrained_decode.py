@@ -116,9 +116,8 @@ class SortedU32Constraint:
         s = torch.where(matched, starts[idx_clamped], 0)
         e = torch.where(matched, ends[idx_clamped], 0)
         lengths = e - s
-        max_len = int(lengths.max().item()) if lengths.numel() > 0 else 0
-        if max_len > 0:
-            offsets = torch.arange(max_len, device=mask_2d.device).unsqueeze(0)
+        if lengths.numel() > 0:
+            offsets = torch.arange(d, device=mask_2d.device).unsqueeze(0)
             valid_off = offsets < lengths.unsqueeze(1)
             gather_pos = (s.unsqueeze(1) + offsets).clamp(max=low8.shape[0] - 1)
             vals = low8[gather_pos] + (2 + 3 * d)

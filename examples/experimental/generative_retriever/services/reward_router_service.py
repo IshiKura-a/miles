@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from threading import Lock
 from typing import Any
 
+import anyio.to_thread
 import httpx
 import uvicorn
 import xxhash
@@ -348,6 +349,7 @@ def create_app(
     request_model = reward_request_model(max_samples_per_request)
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        anyio.to_thread.current_default_thread_limiter().total_tokens = 1024
         app.state.router = RewardRouter(
             worker_urls, max_samples_per_request=max_samples_per_request,
             forward_concurrency=forward_concurrency,
