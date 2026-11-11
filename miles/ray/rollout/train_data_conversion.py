@@ -221,8 +221,24 @@ def _normalize_rewards_by_rollout(
     if not samples:
         return []
 
-    normalized_rewards = torch.empty(len(raw_rewards), dtype=torch.float)
     has_compacted_rollouts = any(sample.rollout_id is not None for sample in samples)
+    g_size = args.n_samples_per_prompt
+    if (
+        not has_compacted_rollouts
+        and prompt_group_sizes is None
+        and g_size > 1
+        and len(samples) % g_size == 0
+        and samples[0].group_index is not None
+        and samples[-1].group_index == samples[0].group_index + (len(samples) // g_size) - 1
+    ):
+        r_mat = torch.tensor(raw_rewards, dtype=torch.float32).view(-1, g_size)
+        centered = r_mat - r_mat.mean(dim=1, keepdim=True)
+        if args.advantage_estimator in ["grpo", "gspo"] and args.grpo_std_normalization:
+            std = r_mat.std(dim=1, keepdim=True)
+            centered = torch.where(std > 0, centered / (std + 1e-6), centered)
+        return centered.reshape(-1).tolist()
+
+    normalized_rewards = torch.empty(len(raw_rewards), dtype=torch.float)
     for prompt_segments in _reward_group_segments(args, samples, prompt_group_sizes):
         if not has_compacted_rollouts:
             rollout_rewards = torch.tensor(
@@ -372,53 +388,55 @@ def split_train_data_by_dp_raw(args, data: dict[str, Any], *, dp_size: int) -> l
 
 def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, Any]]:
     """Package one rollout_data shard per DP rank from precomputed partitions."""
+    dp_size = len(partitions)
+    is_strided = all(
+        isinstance(p, range) and p.start == i and p.step == dp_size
+        for i, p in enumerate(partitions)
+    )
     shards = []
-
-    for i in range(len(partitions)):
-        rollout_data = {}
-        partition = partitions[i]
-        rollout_data["partition"] = partition
-        for key in [
-            "tokens",
-            "multimodal_train_inputs",
-            "response_lengths",
-            "rewards",
-            "truncated",
-            "loss_masks",
-            "round_number",
-            "sample_indices",
-            "rollout_ids",
-            "rollout_mask_sums",
-            "rollout_log_probs",
-            "rollout_sampling_mask_ids",
-            "rollout_sampling_mask_offsets",
-            "rollout_routed_experts",
-            "rollout_indexer_topk",
-            "prompt",
-            "teacher_log_probs",
-            "opd_reverse_kl",
-            "seq_witness_ids",
-            "weight_versions",
-            "adapter_slots",
-            "loss_weights",
-            "advantages",
-            "target_tokens",
-        ]:
-            if key not in data:
-                continue
-            val = [data[key][j] for j in partition]
-            rollout_data[key] = val
-        # keys that need to be splited at train side
-        for key in [
-            "raw_reward",
-            "total_lengths",
-            "dynamic_global_batch_size",
-            "prompt_group_sizes",
-            "loss_fn",
-            "loss_fn_config",
-        ]:
-            if key not in data:
-                continue
+    slice_keys = [
+        "tokens",
+        "multimodal_train_inputs",
+        "response_lengths",
+        "rewards",
+        "raw_reward",
+        "total_lengths",
+        "truncated",
+        "loss_masks",
+        "round_number",
+        "sample_indices",
+        "rollout_ids",
+        "rollout_mask_sums",
+        "rollout_log_probs",
+        "rollout_sampling_mask_ids",
+        "rollout_sampling_mask_offsets",
+        "rollout_routed_experts",
+        "rollout_indexer_topk",
+        "prompt",
+        "teacher_log_probs",
+        "opd_reverse_kl",
+        "seq_witness_ids",
+        "weight_versions",
+        "adapter_slots",
+        "loss_weights",
+        "advantages",
+        "target_tokens",
+    ]
+    present_keys = [k for k in slice_keys if k in data]
+    scalar_keys = [
+        k for k in ("dynamic_global_batch_size", "prompt_group_sizes", "loss_fn", "loss_fn_config")
+        if k in data
+    ]
+    for i, partition in enumerate(partitions):
+        rollout_data = {"partition": None}
+        if is_strided:
+            for key in present_keys:
+                rollout_data[key] = data[key][i::dp_size]
+        else:
+            for key in present_keys:
+                col = data[key]
+                rollout_data[key] = [col[j] for j in partition]
+        for key in scalar_keys:
             rollout_data[key] = data[key]
         if "adapter_slots" in rollout_data:
             rollout_data["n_adapters"] = args.multi_lora_n_adapters
@@ -429,11 +447,12 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
 def process_rollout_data_shard(args, rollout_data):
     """Train-side completion of the DP split: drop the ``partition`` key and
     reorder the batch-global ``total_lengths`` into this shard's row order."""
-    partition = rollout_data.pop("partition")
+    partition = rollout_data.pop("partition", None)
     total_lengths = rollout_data["total_lengths"]
 
     # save the seqlen of the whole rollout batch
     Timer().seq_lens = total_lengths
-    rollout_data["total_lengths"] = [total_lengths[i] for i in partition]
+    if partition is not None:
+        rollout_data["total_lengths"] = [total_lengths[i] for i in partition]
 
     return rollout_data

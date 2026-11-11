@@ -455,7 +455,7 @@ def run_worker(manifest: Manifest, index: int) -> None:
         RayParams(
             gcs_address=manifest["ray_address"],
             node_ip_address=manifest["addresses"][index],
-            num_cpus=64, num_gpus=8, object_store_memory=32 * 2**30,
+            num_cpus=64, num_gpus=8, object_store_memory=128 * 2**30,
             temp_dir=ray_temp_path(manifest["run_id"]), include_dashboard=False,
         ),
         head=False, shutdown_at_exit=True, spawn_reaper=True,
@@ -539,7 +539,7 @@ def run_cluster(manifest: Manifest) -> None:
         head = Node(
             RayParams(
                 node_ip_address=manifest["head_ip"], gcs_server_port=_RAY_PORT,
-                num_cpus=32, num_gpus=8, object_store_memory=32 * 2**30,
+                num_cpus=32, num_gpus=8, object_store_memory=128 * 2**30,
                 temp_dir=ray_temp_path(manifest["run_id"]), include_dashboard=False,
             ),
             head=True, shutdown_at_exit=True, spawn_reaper=True,

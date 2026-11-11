@@ -105,38 +105,83 @@ def add_group_reward_metrics(
     samples: list[Any],
     output: dict[str, Any],
 ) -> None:
-    groups: dict[int, list[float]] = defaultdict(list)
-    for sample in samples:
-        if sample.group_index is not None:
-            groups[int(sample.group_index)].append(float(sample.get_reward_value(args)))
-    if not groups:
-        return
-
-    stds = []
-    ranges = []
-    unique_counts = []
-    top_gaps = []
-    group_advantage_abs_means = []
-    advantage_abs_sum = 0.0
-    advantage_abs_count = 0
-    advantage_abs_max = 0.0
-    zero_std_groups = 0
-    for rewards in groups.values():
-        data = np.asarray(rewards, dtype=np.float64)
-        reward_std = float(np.std(data, ddof=1)) if data.size > 1 else 0.0
-        stds.append(reward_std)
-        ranges.append(float(np.max(data) - np.min(data)))
-        unique_counts.append(float(np.unique(data).size))
-        ordered = np.sort(data)
-        top_gaps.append(float(ordered[-1] - ordered[-2]) if ordered.size > 1 else 0.0)
-        zero_std_groups += int(np.all(data == data[0]))
+    g_size = getattr(args, "n_samples_per_prompt", 0)
+    if (
+        samples
+        and g_size > 1
+        and len(samples) % g_size == 0
+        and samples[0].group_index is not None
+        and samples[-1].group_index == samples[0].group_index + (len(samples) // g_size) - 1
+    ):
+        flat_r = np.fromiter(
+            (float(s.reward if isinstance(s.reward, (int, float)) else s.get_reward_value(args)) for s in samples),
+            dtype=np.float64,
+            count=len(samples),
+        )
+        mat = flat_r.reshape(-1, g_size)
+        num_groups = mat.shape[0]
+        stds_arr = np.std(mat, axis=1, ddof=1)
+        ordered_mat = np.sort(mat, axis=1)
+        ranges_arr = ordered_mat[:, -1] - ordered_mat[:, 0]
+        top_gaps_arr = ordered_mat[:, -1] - ordered_mat[:, -2]
+        unique_counts_arr = 1.0 + np.sum(ordered_mat[:, 1:] != ordered_mat[:, :-1], axis=1).astype(np.float64)
+        zero_std_groups = int(np.sum(ranges_arr == 0.0))
+        stds = stds_arr.tolist()
+        ranges = ranges_arr.tolist()
+        unique_counts = unique_counts_arr.tolist()
+        top_gaps = top_gaps_arr.tolist()
+        group_advantage_abs_means = []
+        advantage_abs_sum = 0.0
+        advantage_abs_count = 0
+        advantage_abs_max = 0.0
         if args.advantage_estimator == "grpo" and args.kl_coef == 0:
-            normalized = normalize_group_rewards(args, data, reward_std)
-            absolute = np.abs(normalized)
-            advantage_abs_sum += float(np.sum(absolute))
-            advantage_abs_count += int(absolute.size)
-            advantage_abs_max = max(advantage_abs_max, float(np.max(absolute)))
-            group_advantage_abs_means.append(float(np.mean(absolute)))
+            centered = mat - np.mean(mat, axis=1, keepdims=True)
+            if args.rewards_normalization and args.grpo_std_normalization:
+                denom = np.where(stds_arr[:, None] > 0, stds_arr[:, None] + 1e-6, 1.0)
+                norm_mat = centered / denom if args.rewards_normalization else mat
+            elif args.rewards_normalization:
+                norm_mat = centered
+            else:
+                norm_mat = mat
+            abs_mat = np.abs(norm_mat)
+            advantage_abs_sum = float(np.sum(abs_mat))
+            advantage_abs_count = int(abs_mat.size)
+            advantage_abs_max = float(np.max(abs_mat))
+            group_advantage_abs_means = np.mean(abs_mat, axis=1).tolist()
+        groups = range(num_groups)
+    else:
+        groups_dict: dict[int, list[float]] = defaultdict(list)
+        for sample in samples:
+            if sample.group_index is not None:
+                groups_dict[int(sample.group_index)].append(float(sample.get_reward_value(args)))
+        if not groups_dict:
+            return
+        stds = []
+        ranges = []
+        unique_counts = []
+        top_gaps = []
+        group_advantage_abs_means = []
+        advantage_abs_sum = 0.0
+        advantage_abs_count = 0
+        advantage_abs_max = 0.0
+        zero_std_groups = 0
+        for rewards in groups_dict.values():
+            data = np.asarray(rewards, dtype=np.float64)
+            reward_std = float(np.std(data, ddof=1)) if data.size > 1 else 0.0
+            stds.append(reward_std)
+            ranges.append(float(np.max(data) - np.min(data)))
+            unique_counts.append(float(np.unique(data).size))
+            ordered = np.sort(data)
+            top_gaps.append(float(ordered[-1] - ordered[-2]) if ordered.size > 1 else 0.0)
+            zero_std_groups += int(np.all(data == data[0]))
+            if args.advantage_estimator == "grpo" and args.kl_coef == 0:
+                normalized = normalize_group_rewards(args, data, reward_std)
+                absolute = np.abs(normalized)
+                advantage_abs_sum += float(np.sum(absolute))
+                advantage_abs_count += int(absolute.size)
+                advantage_abs_max = max(advantage_abs_max, float(np.max(absolute)))
+                group_advantage_abs_means.append(float(np.mean(absolute)))
+        groups = groups_dict
 
     prefix = "rollout/generative_retriever/group_reward"
     add_distribution_metrics(output, f"{prefix}/std", stds)
