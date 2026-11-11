@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import numpy as np
 import logging
 import math
 from typing import Any
@@ -218,6 +220,7 @@ async def request_embedding(args: Any, router_url: str, prompt_ids: list[int]) -
                 json={
                     "model": args.hf_checkpoint,
                     "input": prompt_ids,
+                    "encoding_format": "base64",
                 },
             )
             break
@@ -236,6 +239,9 @@ async def request_embedding(args: Any, router_url: str, prompt_ids: list[int]) -
     if not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], dict):
         raise ValueError("GR router returned an invalid embeddings response")
     embedding = data[0].get("embedding")
+    if isinstance(embedding, str):
+        arr = np.frombuffer(base64.b64decode(embedding), dtype="<f4")
+        return {"embedding_np": arr}
     if not isinstance(embedding, list):
         raise ValueError("GR router response is missing an embedding list")
     return {"embedding": embedding}
@@ -248,6 +254,9 @@ async def request_embedding_and_prepare(
     query: str,
 ) -> tuple[dict[str, Any], dict[str, float]]:
     embedding = await request_embedding(args, router_url, prompt_ids)
+    raw_np = embedding.get("embedding_np")
+    if raw_np is not None and raw_np.size == args.n_samples_per_prompt * _DOCID_SIZE * 3:
+        return embedding, {}
     raw = embedding.get("embedding")
     if isinstance(raw, list) and len(raw) == args.n_samples_per_prompt * _DOCID_SIZE * 3:
         return embedding, {}
@@ -351,6 +360,80 @@ async def generate_group_samples(
         prompt_ids,
         query,
     )
+    raw_np = output.get("embedding_np")
+    expected_2 = group_size * _DOCID_SIZE * 2
+    expected_3 = group_size * _DOCID_SIZE * 3
+    if not evaluation and raw_np is not None and raw_np.size in (expected_2, expected_3):
+        cols = 12 if raw_np.size == expected_3 else 8
+        mat = raw_np.reshape(group_size, cols)
+        tok_mat = mat[:, :4].astype(np.int64).tolist()
+        lp_mat = mat[:, 4:8].astype(np.float64).tolist()
+        pos_mat = (mat[:, :4].astype(np.int64) - DOCID_TOKEN_OFFSET).tolist()
+        baseline_docids_np: list[tuple[int, int, int, int]] | None = None
+        if cols == 12:
+            b_mat = (mat[:, 8:12].astype(np.int64) - DOCID_TOKEN_OFFSET).tolist()
+            baseline_docids_np = [(r[0], r[1], r[2], r[3]) for r in b_mat]
+        for beam_rank, sample in enumerate(group):
+            token_ids = tok_mat[beam_rank]
+            positional_docid = pos_mat[beam_rank]
+            sample.tokens = prompt_ids + token_ids
+            sample.response_length = _DOCID_SIZE
+            sample.rollout_log_probs = lp_mat[beam_rank]
+            sample.response = f"{positional_docid[0]},{positional_docid[1]},{positional_docid[2]},{positional_docid[3]}"
+            sample.status = Sample.Status.COMPLETED
+            metadata = sample.metadata.setdefault("generative_retriever", {})
+            metadata["docid_tokens"] = token_ids
+            metadata["beam_rank"] = beam_rank
+            metadata["positional_docid"] = positional_docid
+        if baseline_docids_np is not None:
+            group[0].metadata["generative_retriever"]["baseline_docids"] = baseline_docids_np
+        if prepare_metrics:
+            group[0].metadata["generative_retriever"]["prepare_metrics"] = prepare_metrics
+        return group
+
+    raw = output.get("embedding")
+    if not evaluation and isinstance(raw, list) and len(raw) in (expected_2, expected_3):
+        stride = _DOCID_SIZE * (3 if len(raw) == expected_3 else 2)
+        baseline_docids: list[tuple[int, int, int, int]] | None = [] if len(raw) == expected_3 else None
+        for beam_rank, sample in enumerate(group):
+            start = beam_rank * stride
+            t0 = int(raw[start])
+            t1 = int(raw[start + 1])
+            t2 = int(raw[start + 2])
+            t3 = int(raw[start + 3])
+            token_ids = [t0, t1, t2, t3]
+            logprobs = [
+                float(raw[start + 4]),
+                float(raw[start + 5]),
+                float(raw[start + 6]),
+                float(raw[start + 7]),
+            ]
+            p0 = t0 - DOCID_TOKEN_OFFSET
+            p1 = t1 - DOCID_TOKEN_OFFSET
+            p2 = t2 - DOCID_TOKEN_OFFSET
+            p3 = t3 - DOCID_TOKEN_OFFSET
+            positional_docid = [p0, p1, p2, p3]
+            sample.tokens = prompt_ids + token_ids
+            sample.response_length = _DOCID_SIZE
+            sample.rollout_log_probs = logprobs
+            sample.response = f"{p0},{p1},{p2},{p3}"
+            sample.status = Sample.Status.COMPLETED
+            metadata = sample.metadata.setdefault("generative_retriever", {})
+            metadata["docid_tokens"] = token_ids
+            metadata["beam_rank"] = beam_rank
+            metadata["positional_docid"] = positional_docid
+            if baseline_docids is not None:
+                b0 = int(raw[start + 8]) - DOCID_TOKEN_OFFSET
+                b1 = int(raw[start + 9]) - DOCID_TOKEN_OFFSET
+                b2 = int(raw[start + 10]) - DOCID_TOKEN_OFFSET
+                b3 = int(raw[start + 11]) - DOCID_TOKEN_OFFSET
+                baseline_docids.append((b0, b1, b2, b3))
+        if baseline_docids is not None:
+            group[0].metadata["generative_retriever"]["baseline_docids"] = baseline_docids
+        if prepare_metrics:
+            group[0].metadata["generative_retriever"]["prepare_metrics"] = prepare_metrics
+        return group
+
     for beam_rank, sample in enumerate(group):
         populate_beam_sample(
             sample,
@@ -381,6 +464,8 @@ async def generate_single_sample(
         prompt_ids,
         query,
     )
+    if "embedding_np" in output and "embedding" not in output:
+        output["embedding"] = output["embedding_np"].tolist()
     populate_beam_sample(
         sample,
         prompt_ids=prompt_ids,

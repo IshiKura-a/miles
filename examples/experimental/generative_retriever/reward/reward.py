@@ -12,6 +12,7 @@ import asyncio
 from collections.abc import Sequence
 from dataclasses import dataclass
 import math
+import xxhash
 from typing import Any
 from weakref import WeakKeyDictionary
 
@@ -23,7 +24,8 @@ from examples.experimental.generative_retriever.reward.reward_http import (
     post_json_async,
 )
 
-_MAX_REWARD_SAMPLES_PER_REQUEST = 2048
+_MAX_REWARD_SAMPLES_PER_REQUEST = 4096
+_NUM_REWARD_SHARDS = 8
 _REWARD_BATCH_WAIT_SECONDS = 0.01
 _INLINE_METRICS_SAMPLE_LIMIT = 16
 _NUMERIC_COMPONENTS = (
@@ -128,7 +130,7 @@ class RewardBatcher(AsyncRequestBatcher[list[dict[str, Any]], BatchResult]):
 
 
 _BATCHERS: WeakKeyDictionary[
-    asyncio.AbstractEventLoop, dict[tuple[str, str, float, int, int], RewardBatcher]
+    asyncio.AbstractEventLoop, dict[tuple[str, str, float, int, int, int], RewardBatcher]
 ] = WeakKeyDictionary()
 
 
@@ -139,14 +141,16 @@ def get_reward_batcher(
     *,
     max_samples: int = _MAX_REWARD_SAMPLES_PER_REQUEST,
     concurrency: int = 1,
+    shard: int = 0,
 ) -> RewardBatcher:
     loop = asyncio.get_running_loop()
     batchers = _BATCHERS.setdefault(loop, {})
-    key = (url, mode, timeout_seconds, max_samples, concurrency)
+    per_shard_conc = max(1, concurrency // _NUM_REWARD_SHARDS)
+    key = (url, mode, timeout_seconds, max_samples, per_shard_conc, shard)
     batcher = batchers.get(key)
     if batcher is None:
         batcher = RewardBatcher(
-            url, mode, timeout_seconds, max_samples=max_samples, concurrency=concurrency,
+            url, mode, timeout_seconds, max_samples=max_samples, concurrency=per_shard_conc,
         )
         batchers[key] = batcher
     return batcher
@@ -163,10 +167,7 @@ def sample_payload(sample: Sample) -> dict[str, Any]:
 
     payload: dict[str, Any] = {
         "prompt": sample.prompt,
-        "response": sample.response,
-        "label": sample.label,
         "docid_tokens": docid_tokens,
-        "metadata": metadata,
     }
     baseline_docids = retriever_metadata.pop("baseline_docids", None)
     if baseline_docids is not None:
@@ -283,9 +284,9 @@ def attach_request_metrics(
     collect_cache_metrics("", cache, "cache_gauge")
     collect_cache_metrics("", request_metrics.get("cache", {}), "cache_delta")
     routed_samples = request_metrics.get("routing", {})
-    for worker, value in routed_samples.items():
-        if isinstance(value, int) and not isinstance(value, bool):
-            metrics[f"routing_delta/{worker}/samples"] = value
+    total_routed = sum(v for v in routed_samples.values() if isinstance(v, int) and not isinstance(v, bool))
+    if total_routed > 0:
+        metrics["routing_delta/samples"] = total_routed
 
 
 def store_chunk_breakdown(
@@ -300,7 +301,8 @@ def store_chunk_breakdown(
             sample.metadata.setdefault("generative_retriever", {})["reward_metrics"] = metrics
         return
 
-    detail_metrics = [extract_detail_metrics(detail) for detail in result.details]
+    non_empty = [detail for detail in result.details if detail]
+    detail_metrics = [extract_detail_metrics(detail) for detail in non_empty]
     count = float(len(detail_metrics))
     aggregated: dict[str, Any] = {
         key: math.fsum(float(item[key]) for item in detail_metrics) / count
@@ -331,12 +333,16 @@ async def reward(args: Any, samples: Sample | list[Sample], **kwargs: Any) -> fl
     rewards: list[float] = []
     max_samples = args.generative_retriever_reward_batch_size
     concurrency = args.generative_retriever_reward_concurrency
-    batcher = get_reward_batcher(
-        url, mode, timeout_seconds, max_samples=max_samples, concurrency=concurrency,
-    )
     chunks = [batch[start:start + max_samples] for start in range(0, len(batch), max_samples)]
     results = await asyncio.gather(*(
-        batcher.submit([sample_payload(sample) for sample in chunk])
+        get_reward_batcher(
+            url,
+            mode,
+            timeout_seconds,
+            max_samples=max_samples,
+            concurrency=concurrency,
+            shard=xxhash.xxh64_intdigest(chunk[0].prompt) % _NUM_REWARD_SHARDS,
+        ).submit([sample_payload(sample) for sample in chunk])
         for chunk in chunks
     ))
     for sample_chunk, result in zip(chunks, results, strict=True):

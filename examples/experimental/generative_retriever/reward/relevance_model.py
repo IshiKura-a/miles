@@ -872,10 +872,14 @@ def _validate_source(path: Path) -> Path:
 
 
 def relevance_source_path(relevance_model: str | Path) -> Path:
+    local_target = Path(tempfile.gettempdir()) / f"gr_relevance_source_{EXPECTED_GRAPHENE_COMMIT[:12]}"
+    if local_target.is_dir():
+        return _validate_source(local_target)
     cosmos_root = os.environ.get("cosmos_data_path")
     if not cosmos_root or not cosmos_root.strip():
         raise ValueError("cosmos_data_path must be set for the relevance source")
-    pointer = Path(relevance_model).expanduser() / "SOURCE_CHECKPOINT.txt"
+    staged_model = Path(_stage_local_relevance_model(relevance_model))
+    pointer = staged_model / "SOURCE_CHECKPOINT.txt"
     source_checkpoint = pointer.read_text(encoding="utf-8").strip()
     _, marker, relative = source_checkpoint.partition("/local/")
     if not marker:

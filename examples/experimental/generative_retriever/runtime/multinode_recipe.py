@@ -28,7 +28,7 @@ REWARD_NODES_PER_PAIR = 2
 
 # Batch size and step limit scale with the number of node pairs.
 QUERIES_PER_STEP_PER_PAIR = 16_000
-IN_FLIGHT_GROUPS_PER_PAIR = 2_048
+IN_FLIGHT_GROUPS_PER_PAIR = 512
 SAMPLES_PER_PROMPT = DEFAULT_TRAIN_GROUP_SIZE
 MAX_STEPS_PER_PAIR = PROMPT_DATASET_ROWS // QUERIES_PER_STEP_PER_PAIR
 
@@ -70,7 +70,7 @@ def build_multinode_recipe(run_id: str, pairs: int, num_rollout: int) -> ScriptA
         sglang_mem_fraction_static=mem_fraction,
         sglang_server_concurrency=_SGLANG_CONCURRENCY_PER_PAIR * pairs,
         reward_timeout=1800,
-        reward_request_concurrency=2 * REWARD_NODES_PER_PAIR * REWARD_GPUS_PER_NODE * pairs,
+        reward_request_concurrency=2 * REWARD_NODES_PER_PAIR * pairs,
         prepare_concurrency=2 * REWARD_NODES_PER_PAIR * pairs,
         reward_query_cache_size=query_cache,
         reward_keyword_cache_size=kw_cache,

@@ -252,7 +252,7 @@ def run_service_node(manifest: Manifest, index: int) -> None:
     baseline_host = manifest["addresses"][(index // 2) * 2]
     baseline_url = f"http://{baseline_host}:{_BASELINE_PORT}/generate"
     mapping = manifest["mapping"]
-    processes = ProcessSupervisor(Path(manifest["run_dir"]) / f"services-{index}")
+    processes = ProcessSupervisor(Path(f"/tmp/gr_logs_{manifest['run_id']}") / f"services-{index}")
     previous_handler = signal.signal(signal.SIGTERM, exit_on_sigterm)
     baseline: tuple[subprocess.Popen[str], dict[str, object]] | None = None
     mapping_process: subprocess.Popen[str] | None = None
@@ -497,7 +497,7 @@ def run_cluster(manifest: Manifest) -> None:
     validate_run_cluster(manifest)
     run_dir.mkdir(parents=True, exist_ok=True)
     prepare_prompt_data(Path(manifest["prompt_source"]), run_dir / "prompt_data.jsonl")
-    processes = ProcessSupervisor(run_dir)
+    processes = ProcessSupervisor(Path(f"/tmp/gr_logs_{manifest['run_id']}"))
     local_dir = tempfile.TemporaryDirectory(prefix="gr_manifest_", dir="/tmp")
     path = Path(local_dir.name) / "manifest.json"
     head: Node | None = None
@@ -533,7 +533,7 @@ def run_cluster(manifest: Manifest) -> None:
             manifest["head_ip"], _ROUTER_PORT,
             ["--worker-urls", ",".join(worker_urls),
              "--max-samples-per-request", str(DEFAULT_REWARD_BATCH_SIZE),
-             "--forward-concurrency", str(REWARD_GPUS_PER_NODE)],
+             "--forward-concurrency", "2"],
         )
         os.environ.update(manifest["runtime_env"])
         head = Node(

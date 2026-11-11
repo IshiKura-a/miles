@@ -436,24 +436,90 @@ class KeywordRewardEngine:
             for sample in request.samples
             if sample.baseline_docids is not None
         }
-        mapping = self._lookup_docids(docids)
-        mapped_at = time.perf_counter()
-        baselines, baseline_delta = self._prepare_baselines(
-            [sample.prompt for sample in request.samples],
-            precomputed_docids=precomputed_baselines,
-        )
-        prepared_at = time.perf_counter()
-        sample_keywords = [
-            list(dict.fromkeys(mapping[docid]))
-            for docid in docids
-        ]
-        pairs = [
-            (sample.prompt, keyword)
-            for sample, keywords in zip(request.samples, sample_keywords, strict=True)
-            for keyword in keywords
-        ]
-        pair_scores, scoring_delta = self._score_pairs_local(pairs)
-        scored_at = time.perf_counter()
+        unique_queries = list(dict.fromkeys(sample.prompt for sample in request.samples))
+        baselines: dict[str, BaselineSets] = {}
+        missing_b_queries: list[str] = []
+        if precomputed_baselines and all(q in precomputed_baselines for q in unique_queries):
+            with self._lock:
+                for q in unique_queries:
+                    b_cached = self.baselines.get(q)
+                    if b_cached is not None:
+                        baselines[q] = b_cached
+                    else:
+                        missing_b_queries.append(q)
+            b_docids_flat: list[tuple[int, int, int, int]] = []
+            for q in missing_b_queries:
+                rows = precomputed_baselines[q]
+                if len(rows) != self.docids_per_query or len(set(rows)) != self.docids_per_query:
+                    raise ValueError(f"Precomputed baseline must have {self.docids_per_query} distinct doc IDs")
+                for d in rows:
+                    validate_docid(d)
+                b_docids_flat.extend(rows)
+            mapping = self._lookup_docids(docids)
+            b_mapping = self._lookup_docids(b_docids_flat, use_initial=True) if b_docids_flat else {}
+            mapped_at = time.perf_counter()
+            prepared_at = mapped_at
+            sample_keywords = [
+                list(dict.fromkeys(mapping[docid]))
+                for docid in docids
+            ]
+            b_query_keywords = {
+                q: list(dict.fromkeys(
+                    kw for d in precomputed_baselines[q] for kw in b_mapping[d]
+                ))
+                for q in missing_b_queries
+            }
+            pairs = [
+                (q, kw)
+                for q in missing_b_queries
+                for kw in b_query_keywords[q]
+            ] + [
+                (sample.prompt, keyword)
+                for sample, keywords in zip(request.samples, sample_keywords, strict=True)
+                for keyword in keywords
+            ]
+            pair_scores, scoring_delta = self._score_pairs_local(pairs)
+            scored_at = time.perf_counter()
+            built_b = {
+                q: build_baseline_set({kw: pair_scores[(q, kw)] for kw in b_query_keywords[q]})
+                for q in missing_b_queries
+            }
+            with self._lock:
+                b_ev_before = self.baselines.stats().evictions
+                for q, b_set in built_b.items():
+                    self.baselines.put(q, b_set)
+                    self._baseline_queries.add(q)
+                    baselines[q] = b_set
+                b_ev = self.baselines.stats().evictions - b_ev_before
+            baseline_delta = {
+                "baseline": {
+                    "hits": len(unique_queries) - len(missing_b_queries),
+                    "misses": len(missing_b_queries),
+                    "evictions": b_ev,
+                },
+                "reward": {"hits": 0, "misses": 0, "evictions": 0},
+                "query_features": {"hits": 0, "misses": 0, "evictions": 0},
+                "keyword_features": {"hits": 0, "misses": 0, "evictions": 0},
+            }
+        else:
+            mapping = self._lookup_docids(docids)
+            mapped_at = time.perf_counter()
+            baselines, baseline_delta = self._prepare_baselines(
+                unique_queries,
+                precomputed_docids=precomputed_baselines,
+            )
+            prepared_at = time.perf_counter()
+            sample_keywords = [
+                list(dict.fromkeys(mapping[docid]))
+                for docid in docids
+            ]
+            pairs = [
+                (sample.prompt, keyword)
+                for sample, keywords in zip(request.samples, sample_keywords, strict=True)
+                for keyword in keywords
+            ]
+            pair_scores, scoring_delta = self._score_pairs_local(pairs)
+            scored_at = time.perf_counter()
         query_kw_freq: dict[str, dict[str, int]] = {}
         query_group_indices: dict[str, list[int]] = {}
         for idx, (sample, keywords) in enumerate(zip(request.samples, sample_keywords, strict=True)):
@@ -521,14 +587,23 @@ class KeywordRewardEngine:
                     edge = (docid, kw)
                     local_edge_passes[edge] = local_edge_passes.get(edge, 0) + 1
             rewards.append(value)
-            detail_entry: dict[str, Any] = {
-                "query": sample.prompt, "docid": docid, "keyword_count": len(keywords),
-                "aggregation": f"floor_{DOCID_REWARD_FLOOR}", "reward": value,
-                "metrics": metrics,
-            }
-            if inline_kws is not None:
-                detail_entry["keywords"] = inline_kws
-            details.append(detail_entry)
+            if include_inline_keywords:
+                detail_entry: dict[str, Any] = {
+                    "query": sample.prompt, "docid": docid, "keyword_count": len(keywords),
+                    "aggregation": f"floor_{DOCID_REWARD_FLOOR}", "reward": value,
+                    "metrics": metrics,
+                }
+                if inline_kws is not None:
+                    detail_entry["keywords"] = inline_kws
+                details.append(detail_entry)
+            else:
+                if not details:
+                    batch_metrics_acc = {k: float(v) for k, v in metrics.items()}
+                    details.append({"metrics": batch_metrics_acc})
+                else:
+                    for k, v in metrics.items():
+                        batch_metrics_acc[k] += float(v)
+                    details.append({})
             logger.debug("reward_mode=%s docid=%s keywords=%d reward=%f",
                         request.reward_mode, docid, len(keywords), value)
 
@@ -602,6 +677,9 @@ class KeywordRewardEngine:
             prepared_at - mapped_at, scored_at - prepared_at, finished - scored_at,
             finished - started,
         )
+        if not include_inline_keywords and details:
+            inv_n = 1.0 / float(len(details))
+            details[0] = {"metrics": {k: v * inv_n for k, v in batch_metrics_acc.items()}}
         return {
             "rewards": rewards,
             "details": details,

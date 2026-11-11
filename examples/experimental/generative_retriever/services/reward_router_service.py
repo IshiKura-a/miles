@@ -67,11 +67,7 @@ class RewardRouter:
         self._step_updates: dict[int, tuple[list[str], dict[str, Any]]] = {}
 
     def _worker_index(self, query: str) -> int:
-        scores = [
-            xxhash.xxh64_intdigest(f"{query}\0{worker_url}")
-            for worker_url in self.worker_urls
-        ]
-        return max(range(len(scores)), key=scores.__getitem__)
+        return xxhash.xxh64_intdigest(query) % len(self.worker_urls)
 
     def _post(self, url: str, request: RewardRequest | BaselinePrepareRequest) -> dict[str, Any]:
         return post_json_sync(self._client, url, request.model_dump(mode="json"))
@@ -276,16 +272,25 @@ class RewardRouter:
             raise ValueError("Reward worker returned an invalid mapping version")
         if any(response.get("mapping_version") != version for response in responses.values()):
             raise ValueError("Reward workers use different mappings")
+        merged_cache: dict[str, dict[str, int]] = {}
+        merged_delta: dict[str, dict[str, int]] = {}
+        for response in responses.values():
+            for table_name, table_stats in response.get("cache", {}).items():
+                if isinstance(table_stats, dict):
+                    dst = merged_cache.setdefault(table_name, {})
+                    for k, v in table_stats.items():
+                        if isinstance(v, int) and not isinstance(v, bool):
+                            dst[k] = dst.get(k, 0) + v
+            for table_name, table_delta in response.get("cache_delta", {}).items():
+                if isinstance(table_delta, dict):
+                    dst = merged_delta.setdefault(table_name, {})
+                    for k, v in table_delta.items():
+                        if isinstance(v, int) and not isinstance(v, bool):
+                            dst[k] = dst.get(k, 0) + v
         return {
             "mapping_version": version,
-            "cache": {
-                f"worker_{index}": response["cache"]
-                for index, response in responses.items()
-            },
-            "cache_delta": {
-                f"worker_{index}": response["cache_delta"]
-                for index, response in responses.items()
-            },
+            "cache": merged_cache,
+            "cache_delta": merged_delta,
             "latency_seconds": max(response["latency_seconds"] for response in responses.values()),
         }
 
@@ -344,7 +349,7 @@ class RewardRouter:
 
 def create_app(
     worker_urls: tuple[str, ...], *,
-    max_samples_per_request: int = 2048, forward_concurrency: int = 1,
+    max_samples_per_request: int = 4096, forward_concurrency: int = 1,
 ) -> FastAPI:
     request_model = reward_request_model(max_samples_per_request)
     @asynccontextmanager
@@ -424,7 +429,7 @@ def main() -> None:
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=30489)
-    parser.add_argument("--max-samples-per-request", type=int, default=2048)
+    parser.add_argument("--max-samples-per-request", type=int, default=4096)
     parser.add_argument("--forward-concurrency", type=int, default=1)
     args = parser.parse_args()
     worker_urls = tuple(args.worker_urls.split(","))

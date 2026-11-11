@@ -205,10 +205,20 @@ class SortedU32Constraint:
 
 @lru_cache(maxsize=1)
 def load_constraint(mapping_path: str, code_num: int, code_dim: int) -> PrefixConstraint:
+    import shutil, tempfile
+    from pathlib import Path
+    from filelock import FileLock
     mapping = absolute_path(mapping_path)
     if code_num != 4 or code_dim != 256:
         raise ValueError("Columnar u32 docid index requires code_num=4 and code_dim=256")
-    unique_u32 = np.load(mapping / "docid_unique.u32.npy", mmap_mode="r")
+    local_u32 = Path(tempfile.gettempdir()) / f"gr_docid_unique_{mapping.name}.u32.npy"
+    if not local_u32.is_file():
+        with FileLock(f"{local_u32}.lock"):
+            if not local_u32.is_file():
+                tmp_u32 = local_u32.with_suffix(".tmp.npy")
+                shutil.copyfile(mapping / "docid_unique.u32.npy", tmp_u32)
+                tmp_u32.replace(local_u32)
+    unique_u32 = np.load(local_u32)
     constraint = SortedU32Constraint(unique_u32, code_dim=code_dim)
     if len(constraint._level1) != code_dim:
         raise ValueError("Official mapping must cover the initial codebook used by SLMGR")

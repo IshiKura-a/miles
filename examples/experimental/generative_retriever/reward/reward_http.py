@@ -164,23 +164,36 @@ def json_object(response: httpx.Response) -> dict[str, Any]:
     return payload
 
 
+from weakref import WeakKeyDictionary
+_ASYNC_CLIENTS: WeakKeyDictionary[asyncio.AbstractEventLoop, httpx.AsyncClient] = WeakKeyDictionary()
+
+
+def _get_async_client(timeout: float) -> httpx.AsyncClient:
+    loop = asyncio.get_running_loop()
+    client = _ASYNC_CLIENTS.get(loop)
+    if client is None or client.is_closed:
+        client = httpx.AsyncClient(
+            timeout=timeout,
+            limits=httpx.Limits(max_connections=1024, max_keepalive_connections=256),
+            trust_env=False,
+        )
+        _ASYNC_CLIENTS[loop] = client
+    return client
+
+
 async def post_json_async(url: str, payload: dict[str, Any], *, timeout: float) -> dict[str, Any]:
-    async with httpx.AsyncClient(
-        timeout=timeout,
-        limits=httpx.Limits(max_keepalive_connections=0),
-        trust_env=False,
-    ) as client:
-        attempt = 1
-        while True:
-            try:
-                response = await client.post(url, json=payload)
-                response.raise_for_status()
-                return json_object(response)
-            except httpx.HTTPError as error:
-                if not should_retry(error, attempt, url):
-                    raise
-                await asyncio.sleep(_RETRY_DELAY_SECONDS * 2 ** (attempt - 1))
-                attempt += 1
+    client = _get_async_client(timeout)
+    attempt = 1
+    while True:
+        try:
+            response = await client.post(url, json=payload, timeout=timeout)
+            response.raise_for_status()
+            return json_object(response)
+        except httpx.HTTPError as error:
+            if not should_retry(error, attempt, url):
+                raise
+            await asyncio.sleep(_RETRY_DELAY_SECONDS * 2 ** (attempt - 1))
+            attempt += 1
 
 
 def post_json_sync(client: httpx.Client, url: str, payload: dict[str, Any]) -> dict[str, Any]:
