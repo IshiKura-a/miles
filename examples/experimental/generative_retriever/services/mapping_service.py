@@ -263,18 +263,26 @@ class ResidentMapping:
         """Fast vectorized lookup from packed uint32 docids to deduplicated keyword lists."""
         u32_list: list[int] = packed_u32.tolist()
         out: dict[int, list[str]] = {}
-        overlay_map = None if use_initial else self._overlay_kw_ids
+        overlay_map = self._overlay_kw_ids
         cache = self._docid_kw_cache
         missing_u32: list[int] = []
         for u32_int in u32_list:
-            if overlay_map and u32_int in overlay_map:
-                out[u32_int] = list(dict.fromkeys(self._decode_kid(int(k)) for k in overlay_map[u32_int]))
-            else:
+            if not use_initial and u32_int in overlay_map:
+                cached = cache.get(u32_int)
+                if cached is not None:
+                    out[u32_int] = cached
+                else:
+                    kws = [self._decode_kid(int(k)) for k in dict.fromkeys(overlay_map[u32_int])]
+                    cache[u32_int] = kws
+                    out[u32_int] = kws
+            elif not use_initial or u32_int not in overlay_map:
                 cached = cache.get(u32_int)
                 if cached is not None:
                     out[u32_int] = cached
                 else:
                     missing_u32.append(u32_int)
+            else:
+                missing_u32.append(u32_int)
         if missing_u32:
             missing_arr = np.asarray(missing_u32, dtype=np.uint32)
             positions = np.searchsorted(self._unique_docids_u32, missing_arr)
@@ -285,76 +293,11 @@ class ResidentMapping:
                     raise LookupError(f"Official mapping packed u32 ID not found: {u32_int}")
                 start = int(self._csr_offsets[idx])
                 end = int(self._csr_offsets[idx + 1])
-                kws = list(dict.fromkeys(self._decode_kid(int(k)) for k in self._csr_kw_ids[start:end]))
-                cache[u32_int] = kws
+                kws = [self._decode_kid(int(k)) for k in dict.fromkeys(int(x) for x in self._csr_kw_ids[start:end])]
+                if not use_initial or u32_int not in overlay_map:
+                    cache[u32_int] = kws
                 out[u32_int] = kws
         return out
-
-    def claim(self, owner: str, checkpoint: str | None) -> None:
-        overlay: dict[int, tuple[int, ...]] = {}
-        if checkpoint is not None:
-            table = pq.read_table(Path(checkpoint) / "overlay.parquet")
-            metadata = table.schema.metadata or {}
-            if metadata.get(b"base_mapping") != str(self.path).encode():
-                raise ValueError("Checkpoint belongs to a different base mapping")
-            overlay = {
-                int(docid): tuple(kids)
-                for docid, kids in zip(
-                    table.column("docid_u32").to_pylist(),
-                    table.column("keyword_ids").to_pylist(), strict=True,
-                )
-            }
-        with self._lock:
-            if not owner or self._owner is not None or self._active_requests:
-                raise ValueError("Mapping service is already in use")
-            self.replace_overlay(overlay)
-            self._owner = owner
-
-    def release(self, owner: str) -> None:
-        with self._lock:
-            if self._owner != owner or self._active_requests:
-                raise ValueError("Mapping service is still in use or owned by another run")
-            self._owner = None
-
-    def resolve_keywords(self, keywords: list[str]) -> list[int]:
-        with self._lock:
-            return [self._text_to_kid[keyword] for keyword in keywords]
-
-    def lookup(
-        self,
-        docids: list[PositionalID],
-        *,
-        market: str | None = None,
-        use_initial: bool = False,
-    ) -> LookupResponse:
-        target_mkt = market.strip().upper() if market else None
-        packed_targets = np.asarray([pack_docid_u32(d) for d in docids], dtype=np.uint32)
-        positions = np.searchsorted(self._unique_docids_u32, packed_targets)
-        results = []
-        n_unique = len(self._unique_docids_u32)
-        overlay_map = None if use_initial else self._overlay_kw_ids
-        for docid, target_u32, pos in zip(docids, packed_targets, positions, strict=True):
-            u32_int = int(target_u32)
-            overlay_kids = None if overlay_map is None else overlay_map.get(u32_int)
-            if overlay_kids is not None:
-                kw_ids_iter: Any = overlay_kids
-            else:
-                idx = int(pos)
-                if idx >= n_unique or int(self._unique_docids_u32[idx]) != u32_int:
-                    logger.warning("Columnar mapping ID not found: %s", docid)
-                    results.append(KeywordResult(docid=docid, keywords=[], status="not_found"))
-                    continue
-                start = int(self._csr_offsets[idx])
-                end = int(self._csr_offsets[idx + 1])
-                kw_ids_iter = self._csr_kw_ids[start:end]
-            texts = []
-            for raw_kid in kw_ids_iter:
-                kid = int(raw_kid)
-                if target_mkt is not None and not self._market_allows(kid, target_mkt):
-                    continue
-                texts.append(self._decode_kid(kid))
-            results.append(KeywordResult(docid=docid, keywords=texts, status="ok"))
-        return LookupResponse(mapping_version=self.version, results=results)
 
     def lookup_u32_with_kids(
         self,
@@ -369,12 +312,13 @@ class ResidentMapping:
         for u32_int in u32_list:
             ov = overlay_map.get(u32_int)
             if ov is not None:
-                out_kids[u32_int] = ov
+                dedup_ov = tuple(dict.fromkeys(int(k) for k in ov))
+                out_kids[u32_int] = dedup_ov
                 cached = cache.get(u32_int)
-                if cached is not None:
+                if cached is not None and len(cached) == len(dedup_ov):
                     out_kws[u32_int] = cached
                 else:
-                    kws = list(dict.fromkeys(self._decode_kid(int(k)) for k in ov))
+                    kws = [self._decode_kid(k) for k in dedup_ov]
                     cache[u32_int] = kws
                     out_kws[u32_int] = kws
             else:
@@ -389,13 +333,13 @@ class ResidentMapping:
                     raise LookupError(f"Official mapping packed u32 ID not found: {u32_int}")
                 start = int(self._csr_offsets[idx])
                 end = int(self._csr_offsets[idx + 1])
-                raw_kids = tuple(int(k) for k in self._csr_kw_ids[start:end])
+                raw_kids = tuple(dict.fromkeys(int(k) for k in self._csr_kw_ids[start:end]))
                 out_kids[u32_int] = raw_kids
                 cached = cache.get(u32_int)
-                if cached is not None:
+                if cached is not None and len(cached) == len(raw_kids):
                     out_kws[u32_int] = cached
                 else:
-                    kws = list(dict.fromkeys(self._decode_kid(k) for k in raw_kids))
+                    kws = [self._decode_kid(k) for k in raw_kids]
                     cache[u32_int] = kws
                     out_kws[u32_int] = kws
         return out_kws, out_kids

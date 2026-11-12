@@ -529,9 +529,13 @@ class FSDPTrainRayActor(TrainRayActor):
                 self.optimizer.zero_grad(set_to_none=True)
 
                 losses_reduced = []
-                for _ in self.prof.iterate_train_actor(
-                    tqdm(range(num_microbatches[step_id]), desc="actor_train", disable=dist.get_rank() != 0)
+                total_mbs = num_microbatches[step_id]
+                for mb_idx in self.prof.iterate_train_actor(
+                    tqdm(range(total_mbs), desc="actor_train", disable=dist.get_rank() != 0)
                 ):
+                    is_last_mb = (mb_idx == total_mbs - 1)
+                    if hasattr(self.model, "set_requires_gradient_sync"):
+                        self.model.set_requires_gradient_sync(is_last_mb)
                     batch = get_batch(
                         data_iterator,
                         [

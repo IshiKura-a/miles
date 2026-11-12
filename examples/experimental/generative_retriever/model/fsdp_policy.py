@@ -100,7 +100,7 @@ class GRStage5Policy(nn.Module):
     def _sync_global_doc2k_votes(self) -> None:
         if not dist.is_initialized():
             return
-        local_gpu = int(torch.cuda.current_device()) if torch.cuda.is_available() else (dist.get_rank() % 8)
+        local_gpu = dist.get_rank() % 8
         local_path = Path(tempfile.gettempdir()) / f"gr_doc2k_local_gpu{local_gpu}.pkl"
         local_payload: dict[str, Any] | None = None
         if local_path.is_file():

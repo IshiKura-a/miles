@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 from collections.abc import Iterable
 import os
+import sys
 import pickle
 from pathlib import Path
 import shutil
@@ -103,6 +104,31 @@ IN_PROCESS_METRIC_KEYS: tuple[str, ...] = (
     "cache_delta/keyword_features/hits",
     "cache_delta/keyword_features/misses",
 )
+def _resolve_physical_gpu_id(device: torch.device | None = None) -> int:
+    argv = sys.argv
+    for idx, arg in enumerate(argv[:-1]):
+        if arg == "--base-gpu-id":
+            try:
+                return int(argv[idx + 1])
+            except ValueError:
+                pass
+        if arg.startswith("--base-gpu-id="):
+            try:
+                return int(arg.split("=", 1)[1])
+            except ValueError:
+                pass
+    for env_key in ("ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
+        val = os.environ.get(env_key, "").strip()
+        if val and "," not in val:
+            try:
+                return int(val)
+            except ValueError:
+                pass
+    if device is not None and device.type == "cuda" and device.index is not None:
+        return int(device.index)
+    return int(torch.cuda.current_device()) if torch.cuda.is_available() else 0
+
+
 _PROMPT_PREFIX = 'Given the user Query: "'
 _PROMPT_SUFFIX = '", summarize it in one token:'
 
@@ -304,7 +330,7 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
         self._step_edge_passes: dict[tuple[int, int], int] = {}
         self._query_seq_id = 0
         self._doc2k_sync_step = 0
-        self._local_gpu_id = int(torch.cuda.current_device()) if torch.cuda.is_available() else 0
+        self._local_gpu_id = _resolve_physical_gpu_id()
 
     def _ensure_in_process_reward_engine(self, device: torch.device) -> None:
         if self._relevance_scorer is not None:
@@ -646,7 +672,7 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
         credited_t = torch.from_numpy(credited_mat).to(device=device).unsqueeze(-1)
         raw_t = torch.from_numpy(raw_mat).to(device=device).unsqueeze(-1)
         core = torch.cat((token_ids.float(), token_logprobs.float(), credited_t, raw_t), dim=-1).flatten(1)
-        self._local_gpu_id = int(token_ids.device.index or 0) if token_ids.device.type == "cuda" else 0
+        self._local_gpu_id = _resolve_physical_gpu_id(token_ids.device)
         self._stage_local_doc2k_votes()
         self._has_uncommitted_rollout = True
         metrics_t = torch.from_numpy(metrics_mat).to(device=device)
