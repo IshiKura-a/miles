@@ -51,7 +51,7 @@ class GRRolloutDataSource(RolloutDataSourceWithBuffer):
                     index=base_index + rank,
                     prompt=prompt_sample.prompt,
                     label=prompt_sample.label,
-                    metadata=dict(base_metadata) if base_metadata else {},
+                    metadata=dict(base_metadata) if (rank == 0 and base_metadata) else {},
                 )
                 for rank in range(group_size)
             ]
@@ -88,7 +88,11 @@ class GRRolloutDataSource(RolloutDataSourceWithBuffer):
         self.pending_mapping_checkpoints.append(rollout_id)
 
     def sync_mapping(self, rollout_id: int) -> None:
-        reward_url = self.args.generative_retriever_reward_url.removesuffix("/score")
+        raw_url = getattr(self.args, "generative_retriever_reward_url", None)
+        if not isinstance(raw_url, str) or not raw_url:
+            self.pending_mapping_checkpoints.clear()
+            return
+        reward_url = raw_url.removesuffix("/score")
         pending = [step for step in self.pending_mapping_checkpoints if step <= rollout_id]
         with httpx.Client(timeout=600.0, trust_env=False) as client:
             for step in sorted(set(pending + [rollout_id])):

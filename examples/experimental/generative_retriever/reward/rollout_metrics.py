@@ -2,17 +2,24 @@
 
 from __future__ import annotations
 
-import math
 from collections import defaultdict
+import logging
+import math
 from typing import Any
 
 import httpx
 import numpy as np
+import torch
 
 from examples.experimental.generative_retriever.reward.relevance_reward import (
+    RQ_CODE_NUM,
     TREE_CREDIT_LEVEL_WEIGHT,
     TREE_CREDIT_TOP_K,
 )
+from miles.utils.metric_utils import compute_rollout_step
+from miles.utils.tracking_utils import tracking
+
+logger = logging.getLogger(__name__)
 
 
 def mean_top_k(values: list[float], k: int) -> float:
@@ -24,7 +31,106 @@ def mean_top_k(values: list[float], k: int) -> float:
     return math.fsum(top_values) / len(top_values)
 
 
+def _topk_mean_from_sorted_rewards(
+    s_keys: np.ndarray,
+    s_rewards: np.ndarray,
+    ord1: np.ndarray,
+    k: int,
+) -> np.ndarray:
+    num_groups, group_size = s_keys.shape
+    rows = np.arange(num_groups)[:, None]
+    ord2 = np.argsort(s_keys, axis=1, kind="mergesort")
+    k_s = s_keys[rows, ord2]
+    r_s = s_rewards[rows, ord2]
+    full_ord = ord1[rows, ord2]
+
+    is_start = np.ones((num_groups, group_size), dtype=bool)
+    is_start[:, 1:] = k_s[:, 1:] != k_s[:, :-1]
+    idx = np.arange(group_size, dtype=np.int32)[None, :]
+    start_pos = np.maximum.accumulate(np.where(is_start, idx, 0), axis=1)
+    valid = (idx - start_pos) < k
+
+    cs_r = np.cumsum(np.where(valid, r_s, 0.0), axis=1)
+    cs_c = np.cumsum(valid.astype(np.int32), axis=1)
+
+    is_end = np.ones((num_groups, group_size), dtype=bool)
+    is_end[:, :-1] = is_start[:, 1:]
+    end_pos = np.minimum.accumulate(
+        np.where(is_end[:, ::-1], idx[:, ::-1], group_size - 1),
+        axis=1,
+    )[:, ::-1]
+
+    prev_pos = np.maximum(0, start_pos - 1)
+    has_prev = start_pos > 0
+    group_sum = np.take_along_axis(cs_r, end_pos, axis=1) - np.where(
+        has_prev, np.take_along_axis(cs_r, prev_pos, axis=1), 0.0
+    )
+    group_cnt = np.maximum(
+        1,
+        np.take_along_axis(cs_c, end_pos, axis=1)
+        - np.where(has_prev, np.take_along_axis(cs_c, prev_pos, axis=1), 0),
+    )
+    means_sorted = group_sum / group_cnt.astype(np.float64)
+
+    out = np.empty_like(means_sorted)
+    out[rows, full_ord] = means_sorted
+    return out
+
+
+def _is_regular_group_layout(samples: list[Any], g_size: int) -> bool:
+    return (
+        bool(samples)
+        and g_size > 1
+        and len(samples) % g_size == 0
+        and samples[0].group_index is not None
+        and samples[-1].group_index == samples[0].group_index + (len(samples) // g_size) - 1
+    )
+
+
 def apply_hierarchical_tree_credit(args: Any, samples: list[Any]) -> None:
+    if not samples:
+        return
+    g_size = getattr(args, "n_samples_per_prompt", 0)
+    first_meta = (
+        samples[0].metadata.get("generative_retriever", {})
+        if isinstance(samples[0].metadata, dict)
+        else {}
+    )
+    if _is_regular_group_layout(samples, g_size) and "group_raw_rewards" in first_meta:
+        num_groups = len(samples) // g_size
+        raw_1d: list[float] = []
+        for g in range(num_groups):
+            g_meta = samples[g * g_size].metadata["generative_retriever"]
+            raw_1d.extend(g_meta.pop("group_raw_rewards"))
+        first_meta["batch_raw_rewards_1d"] = raw_1d
+        return
+
+    if _is_regular_group_layout(samples, g_size) and "group_u32" in first_meta:
+        num_groups = len(samples) // g_size
+        u32_mat = np.stack(
+            [samples[g * g_size].metadata["generative_retriever"]["group_u32"] for g in range(num_groups)],
+            axis=0,
+        )
+        raw_flat = np.fromiter(
+            (float(s.reward if isinstance(s.reward, (int, float)) else s.get_reward_value(args)) for s in samples),
+            dtype=np.float64,
+            count=len(samples),
+        )
+        first_meta["batch_raw_rewards_1d"] = raw_flat.tolist()
+        r_mat = raw_flat.reshape(num_groups, g_size)
+        rows = np.arange(num_groups)[:, None]
+        ord1 = np.argsort(-r_mat, axis=1, kind="mergesort")
+        u_sorted = u32_mat[rows, ord1]
+        r_sorted = r_mat[rows, ord1]
+        k0, k1, k2 = TREE_CREDIT_TOP_K
+        v0 = _topk_mean_from_sorted_rewards(u_sorted >> np.uint32(24), r_sorted, ord1, k0)
+        v1 = _topk_mean_from_sorted_rewards(u_sorted >> np.uint32(16), r_sorted, ord1, k1)
+        v2 = _topk_mean_from_sorted_rewards(u_sorted >> np.uint32(8), r_sorted, ord1, k2)
+        credited_flat = (TREE_CREDIT_LEVEL_WEIGHT * (v0 + v1 + v2 + r_mat)).reshape(-1).tolist()
+        for sample, val in zip(samples, credited_flat, strict=True):
+            sample.reward = val
+        return
+
     grouped: dict[int, list[tuple[Any, tuple[int, int, int, int], float]]] = defaultdict(list)
     for sample in samples:
         if sample.group_index is None:
@@ -63,7 +169,7 @@ def apply_hierarchical_tree_credit(args: Any, samples: list[Any]) -> None:
 
 
 def stage_coupled_doc2k_updates(args: Any, rollout_id: int) -> None:
-    reward_url = args.generative_retriever_reward_url
+    reward_url = getattr(args, "generative_retriever_reward_url", None)
     if not isinstance(reward_url, str) or not reward_url:
         return
     stage_url = reward_url.removesuffix("/score") + "/stage_step_updates"
@@ -75,11 +181,11 @@ def stage_coupled_doc2k_updates(args: Any, rollout_id: int) -> None:
 def add_distribution_metrics(
     output: dict[str, Any],
     prefix: str,
-    values: list[float],
+    values: list[float] | np.ndarray,
 ) -> None:
-    if not values:
-        return
     data = np.asarray(values, dtype=np.float64)
+    if data.size == 0:
+        return
     p10, median, p90 = np.quantile(data, [0.10, 0.50, 0.90])
     output.update({
         f"{prefix}/mean": float(np.mean(data)),
@@ -106,13 +212,7 @@ def add_group_reward_metrics(
     output: dict[str, Any],
 ) -> None:
     g_size = getattr(args, "n_samples_per_prompt", 0)
-    if (
-        samples
-        and g_size > 1
-        and len(samples) % g_size == 0
-        and samples[0].group_index is not None
-        and samples[-1].group_index == samples[0].group_index + (len(samples) // g_size) - 1
-    ):
+    if _is_regular_group_layout(samples, g_size):
         flat_r = np.fromiter(
             (float(s.reward if isinstance(s.reward, (int, float)) else s.get_reward_value(args)) for s in samples),
             dtype=np.float64,
@@ -126,11 +226,11 @@ def add_group_reward_metrics(
         top_gaps_arr = ordered_mat[:, -1] - ordered_mat[:, -2]
         unique_counts_arr = 1.0 + np.sum(ordered_mat[:, 1:] != ordered_mat[:, :-1], axis=1).astype(np.float64)
         zero_std_groups = int(np.sum(ranges_arr == 0.0))
-        stds = stds_arr.tolist()
-        ranges = ranges_arr.tolist()
-        unique_counts = unique_counts_arr.tolist()
-        top_gaps = top_gaps_arr.tolist()
-        group_advantage_abs_means = []
+        stds: list[float] | np.ndarray = stds_arr
+        ranges: list[float] | np.ndarray = ranges_arr
+        unique_counts: list[float] | np.ndarray = unique_counts_arr
+        top_gaps: list[float] | np.ndarray = top_gaps_arr
+        group_advantage_abs_means: list[float] | np.ndarray = []
         advantage_abs_sum = 0.0
         advantage_abs_count = 0
         advantage_abs_max = 0.0
@@ -138,7 +238,7 @@ def add_group_reward_metrics(
             centered = mat - np.mean(mat, axis=1, keepdims=True)
             if args.rewards_normalization and args.grpo_std_normalization:
                 denom = np.where(stds_arr[:, None] > 0, stds_arr[:, None] + 1e-6, 1.0)
-                norm_mat = centered / denom if args.rewards_normalization else mat
+                norm_mat = centered / denom
             elif args.rewards_normalization:
                 norm_mat = centered
             else:
@@ -147,8 +247,8 @@ def add_group_reward_metrics(
             advantage_abs_sum = float(np.sum(abs_mat))
             advantage_abs_count = int(abs_mat.size)
             advantage_abs_max = float(np.max(abs_mat))
-            group_advantage_abs_means = np.mean(abs_mat, axis=1).tolist()
-        groups = range(num_groups)
+            group_advantage_abs_means = np.mean(abs_mat, axis=1)
+        group_count = num_groups
     else:
         groups_dict: dict[int, list[float]] = defaultdict(list)
         for sample in samples:
@@ -181,16 +281,16 @@ def add_group_reward_metrics(
                 advantage_abs_count += int(absolute.size)
                 advantage_abs_max = max(advantage_abs_max, float(np.max(absolute)))
                 group_advantage_abs_means.append(float(np.mean(absolute)))
-        groups = groups_dict
+        group_count = len(groups_dict)
 
     prefix = "rollout/generative_retriever/group_reward"
     add_distribution_metrics(output, f"{prefix}/std", stds)
     add_distribution_metrics(output, f"{prefix}/range", ranges)
     add_distribution_metrics(output, f"{prefix}/unique_count", unique_counts)
     add_distribution_metrics(output, f"{prefix}/top1_top2_gap", top_gaps)
-    output[f"{prefix}/group_count"] = len(groups)
+    output[f"{prefix}/group_count"] = group_count
     output[f"{prefix}/zero_std_count"] = zero_std_groups
-    output[f"{prefix}/zero_std_fraction"] = zero_std_groups / len(groups)
+    output[f"{prefix}/zero_std_fraction"] = zero_std_groups / group_count
     if advantage_abs_count > 0:
         add_distribution_metrics(
             output,
@@ -201,6 +301,58 @@ def add_group_reward_metrics(
         output[f"{prefix}/advantage_abs/max"] = advantage_abs_max
 
 
+def convert_gr_samples_to_train_data(args: Any, samples: list[Any]) -> dict[str, Any]:
+    """Fast vectorized conversion of GR rollout samples to train_data."""
+    n = len(samples)
+    g_size = args.n_samples_per_prompt
+    first_meta = (
+        samples[0].metadata.get("generative_retriever", {})
+        if (samples and isinstance(samples[0].metadata, dict))
+        else {}
+    )
+    raw_rewards = first_meta.pop("batch_raw_rewards_1d", None)
+    if raw_rewards is None:
+        raw_rewards = [
+            float(s.metadata["raw_reward"]) if (s.metadata and "raw_reward" in s.metadata) else float(s.get_reward_value(args))
+            for s in samples
+        ]
+    rewards_t = torch.tensor(
+        [float(s.reward if isinstance(s.reward, (int, float)) else s.get_reward_value(args)) for s in samples],
+        dtype=torch.float32,
+    )
+    if args.rewards_normalization and n % g_size == 0:
+        r_mat = rewards_t.view(-1, g_size)
+        centered = r_mat - r_mat.mean(dim=1, keepdim=True)
+        if args.advantage_estimator in ["grpo", "gspo"] and args.grpo_std_normalization:
+            std = r_mat.std(dim=1, keepdim=True)
+            centered = torch.where(std > 0, centered / (std + 1e-6), centered)
+        norm_rewards = centered.reshape(-1).tolist()
+    else:
+        norm_rewards = rewards_t.tolist()
+
+    tokens = [s.tokens for s in samples]
+    if n > 0 and n % g_size == 0:
+        total_lengths = [len(samples[g].tokens) for g in range(0, n, g_size) for _ in range(g_size)]
+    else:
+        total_lengths = [len(t) for t in tokens]
+    base_idx = int(samples[0].index) if (n > 0 and samples[0].index is not None) else 0
+    sample_indices = list(range(base_idx, base_idx + n))
+    shared_mask = [1] * RQ_CODE_NUM
+    return {
+        "tokens": tokens,
+        "total_lengths": total_lengths,
+        "response_lengths": [RQ_CODE_NUM] * n,
+        "rewards": norm_rewards,
+        "raw_reward": raw_rewards,
+        "truncated": [0] * n,
+        "sample_indices": sample_indices,
+        "rollout_ids": sample_indices,
+        "loss_masks": [shared_mask] * n,
+        "rollout_mask_sums": [RQ_CODE_NUM] * n,
+        "rollout_log_probs": [s.rollout_log_probs for s in samples],
+    }
+
+
 def log_rollout(
     rollout_id: int,
     args: Any,
@@ -208,15 +360,28 @@ def log_rollout(
     rollout_extra_metrics: dict[str, Any] | None,
     rollout_time: float,
 ) -> bool:
-    del rollout_time
     stage_coupled_doc2k_updates(args, rollout_id)
     if rollout_extra_metrics is None:
         return False
-    add_group_reward_metrics(args, samples, rollout_extra_metrics)
-    apply_hierarchical_tree_credit(args, samples)
+    g_size = getattr(args, "n_samples_per_prompt", 0)
+    is_regular = _is_regular_group_layout(samples, g_size)
+    first_meta = (
+        samples[0].metadata.get("generative_retriever", {})
+        if (samples and isinstance(samples[0].metadata, dict))
+        else {}
+    )
+    in_process_groups = is_regular and "group_u32" in first_meta
+    if in_process_groups:
+        apply_hierarchical_tree_credit(args, samples)
+        add_group_reward_metrics(args, samples, rollout_extra_metrics)
+    else:
+        add_group_reward_metrics(args, samples, rollout_extra_metrics)
+        apply_hierarchical_tree_credit(args, samples)
+
     values: dict[str, list[float]] = defaultdict(list)
-    for sample in samples:
-        metadata = sample.metadata.get("generative_retriever", {})
+    metric_Linear_samples = samples[::g_size] if in_process_groups else samples
+    for sample in metric_Linear_samples:
+        metadata = sample.metadata.get("generative_retriever", {}) if isinstance(sample.metadata, dict) else {}
         if "prepare_metrics" not in metadata and "reward_metrics" not in metadata:
             continue
         for source in ("prepare_metrics", "reward_metrics"):
@@ -233,6 +398,58 @@ def log_rollout(
         else:
             value = math.fsum(metrics) / len(metrics)
         rollout_extra_metrics[f"rollout/generative_retriever/{name}"] = value
+
+    if in_process_groups:
+        num_groups = len(samples) // g_size
+        u32_mat = np.stack(
+            [samples[g * g_size].metadata["generative_retriever"].pop("group_u32") for g in range(num_groups)],
+            axis=0,
+        )
+        s_u32 = np.sort(u32_mat, axis=1)
+        unique_per_group = 1.0 + np.sum(s_u32[:, 1:] != s_u32[:, :-1], axis=1).astype(np.float64)
+        rollout_extra_metrics["rollout/generative_retriever/distinct_docid_ratio"] = float(
+            np.mean(unique_per_group / float(g_size))
+        )
+        raw_1d = first_meta.get("batch_raw_rewards_1d")
+        if raw_1d is not None and rollout_time > 0:
+            n = len(samples)
+            raw_arr = np.asarray(raw_1d, dtype=np.float64)
+            raw_groups = raw_arr.reshape(num_groups, g_size)
+            zero_std_mask = np.all(raw_groups == raw_groups[:, :1], axis=1)
+            zero_count = int(np.sum(zero_std_mask & (np.round(raw_groups[:, 0], 1) == 0.0)))
+            one_count = int(np.sum(zero_std_mask & (np.round(raw_groups[:, 0], 1) == 1.0)))
+            total_resp_tokens = float(n * RQ_CODE_NUM)
+            rollout_gpus = max(1, int(getattr(args, "rollout_num_gpus", 1) or 1))
+            log_dict: dict[str, Any] = {
+                **rollout_extra_metrics,
+                "rollout/num_training_samples": n,
+                "rollout/episode_raw_reward": float(np.mean(raw_arr)),
+                "rollout/episode_response_length/mean": float(RQ_CODE_NUM),
+                "rollout/episode_response_length/min": float(RQ_CODE_NUM),
+                "rollout/episode_response_length/max": float(RQ_CODE_NUM),
+                "rollout/episode_response_length/std": 0.0,
+                "rollout/episode_total_response_length/mean": float(RQ_CODE_NUM),
+                "rollout/response_len/mean": float(RQ_CODE_NUM),
+                "rollout/response_len/min": float(RQ_CODE_NUM),
+                "rollout/response_len/max": float(RQ_CODE_NUM),
+                "rollout/response_len/std": 0.0,
+                "rollout/zero_std/all_zero_percentage": zero_count / float(num_groups),
+                "rollout/zero_std/all_one_percentage": one_count / float(num_groups),
+                "rollout/repetition_frac": 0.0,
+                "rollout/truncated_ratio": 0.0,
+                "perf/rollout_time": rollout_time,
+                "perf/tokens_per_gpu_per_sec": total_resp_tokens / rollout_time / rollout_gpus,
+                "perf/longest_sample_tokens_per_sec": float(RQ_CODE_NUM) / rollout_time,
+                "perf/effective_tokens_per_gpu_per_sec": total_resp_tokens / rollout_time / rollout_gpus,
+                "perf/longest_effective_sample_tokens_per_sec": float(RQ_CODE_NUM) / rollout_time,
+            }
+            logger.info(f"perf {rollout_id}: {log_dict}")
+            step = compute_rollout_step(args, rollout_id)
+            log_dict["rollout/step"] = step
+            tracking.log(args, log_dict, step_key="rollout/step")
+            return True
+        return False
+
     groups: dict[int, list[tuple[int, ...]]] = defaultdict(list)
     for sample in samples:
         metadata = sample.metadata.get("generative_retriever", {})

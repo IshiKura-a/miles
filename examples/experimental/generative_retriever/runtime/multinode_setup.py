@@ -24,11 +24,8 @@ class Manifest(TypedDict):
     qwen_model: str
     slm_root: str
     mapping: str
-    mapping_url: str
-    mapping_owned: bool
-    mapping_owner: str
-    mapping_checkpoint: str | None
     relevance_model: str
+    reward_mode: str
     prompt_source: str
     num_rollout: int
     train_argv: list[str]

@@ -317,16 +317,18 @@ def store_chunk_breakdown(
 
 
 async def reward(args: Any, samples: Sample | list[Sample], **kwargs: Any) -> float | list[float]:
-    """Score generated docids through the configured retrieval-reward service."""
+    """Return in-process GPU rewards if present, or score via configured HTTP endpoint."""
     del kwargs
+    batch = samples if isinstance(samples, list) else [samples]
+    if batch and all(isinstance(s.reward, (int, float)) and not isinstance(s.reward, bool) for s in batch):
+        precomputed = [float(s.reward) for s in batch]  # type: ignore[arg-type]
+        return precomputed if isinstance(samples, list) else precomputed[0]
+
     url = args.generative_retriever_reward_url
     if not url:
         raise ValueError(
-            "--generative-retriever-reward-url is required when using "
-            "examples.experimental.generative_retriever.reward.reward.reward"
+            "--generative-retriever-reward-url is required when samples are not scored in-process"
         )
-
-    batch = samples if isinstance(samples, list) else [samples]
     timeout_seconds = args.generative_retriever_reward_timeout
     if timeout_seconds <= 0:
         raise ValueError("generative_retriever_reward_timeout must be positive")
@@ -345,7 +347,7 @@ async def reward(args: Any, samples: Sample | list[Sample], **kwargs: Any) -> fl
             timeout_seconds,
             max_samples=max_samples,
             concurrency=concurrency,
-            shard=xxhash.xxh64_intdigest(chunk[0].prompt) % _NUM_REWARD_SHARDS,
+            shard=xxhash.xxh64_intdigest(str(chunk[0].prompt)) % _NUM_REWARD_SHARDS,
         ).submit([sample_payload(sample) for sample in chunk])
         for chunk in chunks
     ))

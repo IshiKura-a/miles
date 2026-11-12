@@ -64,6 +64,8 @@ def prepare_bundle(
     output: str | Path,
     slm_root: str | Path,
     id_mapping: str | Path,
+    relevance_model: str | Path | None = None,
+    reward_mode: str = "discrete_relevance_unique",
     num_beams: int = DEFAULT_TRAIN_GROUP_SIZE,
     num_return_sequences: int = DEFAULT_TRAIN_GROUP_SIZE,
     temperature: float = 1.0,
@@ -75,6 +77,11 @@ def prepare_bundle(
     mapping_path = absolute_path(id_mapping)
     if not is_columnar_index_dir(mapping_path):
         raise FileNotFoundError(f"Incomplete official mapping index: {mapping_path}")
+    resolved_relevance = (
+        str(require_directory(relevance_model, "relevance model"))
+        if relevance_model is not None
+        else os.environ.get("GR_RELEVANCE_MODEL", "")
+    )
     output_path = absolute_path(output)
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -97,7 +104,10 @@ def prepare_bundle(
         "docid_dim": RQ_CODE_DIM,
         "temperature": temperature,
         "slm_root": str(slm_path),
+        "qwen_model": str(qwen_path),
         "id_mapping": str(mapping_path),
+        "relevance_model": resolved_relevance,
+        "reward_mode": reward_mode,
         "num_beams": num_beams,
         "num_return_sequences": num_return_sequences,
         "decoding_mode": decoding_mode,
@@ -142,6 +152,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True)
     parser.add_argument("--slm-root", required=True)
     parser.add_argument("--id-mapping", required=True)
+    parser.add_argument("--relevance-model", default=None)
+    parser.add_argument("--reward-mode", default="discrete_relevance_unique")
     parser.add_argument("--num-beams", type=int, default=DEFAULT_TRAIN_GROUP_SIZE)
     parser.add_argument("--num-return-sequences", type=int, default=DEFAULT_TRAIN_GROUP_SIZE)
     parser.add_argument("--temperature", type=float, default=1.0)
@@ -161,6 +173,8 @@ def main() -> None:
         output=args.output,
         slm_root=args.slm_root,
         id_mapping=args.id_mapping,
+        relevance_model=args.relevance_model,
+        reward_mode=args.reward_mode,
         num_beams=args.num_beams,
         num_return_sequences=args.num_return_sequences,
         temperature=args.temperature,

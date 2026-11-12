@@ -22,15 +22,11 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import select
 import shlex
-import signal
 import socket
-import subprocess
 import sys
 import tempfile
 import time
-import uuid
 from typing import cast
 
 import ray
@@ -39,41 +35,19 @@ from ray._private.node import Node
 from ray._private.parameter import RayParams
 
 from examples.experimental.generative_retriever.index.id_text_mapping import COLUMNAR_INDEX_FILES, is_columnar_index_dir
-from examples.experimental.generative_retriever.runtime.training_common import (
-    ScriptArgs, count_records, expanded_path, prepare_prompt_data, required_directory,
-)
 from examples.experimental.generative_retriever.model.model_loading import (
     stage_local_model_dir,
 )
+from examples.experimental.generative_retriever.reward.relevance_model import (
+    _stage_local_relevance_model,
+    _stage_local_relevance_source,
+    relevance_source_path,
+)
 from examples.experimental.generative_retriever.reward.relevance_reward import (
-    DEFAULT_REWARD_BATCH_SIZE,
     PROMPT_DATASET_ROWS,
-    REWARD_PAIR_BATCH_SIZE,
-    REWARD_TOWER_BATCH_SIZE,
-)
-from examples.experimental.generative_retriever.runtime.service_processes import (
-    ProcessSupervisor,
-    claim_mapping,
-    health_matches,
-    select_mapping_service,
-    release_mapping,
-    start_service,
-    stop_process,
-    wait_health,
-)
-from examples.experimental.generative_retriever.runtime.prepare_rocm_env import (
-    derive_reward_cache_sizes,
-)
-from examples.experimental.generative_retriever.runtime.prepare_sglang_bundle import (
-    prepare_bundle,
-    require_sglang_abort_patch,
 )
 from examples.experimental.generative_retriever.runtime.multinode_recipe import (
     MAX_STEPS_PER_PAIR,
-    QUERIES_PER_STEP_PER_PAIR,
-    REWARD_GPUS_PER_NODE,
-    REWARD_NODES_PER_PAIR,
-    ROLLOUT_GPUS_PER_PAIR,
     SAMPLES_PER_PROMPT,
     build_multinode_recipe,
     build_multinode_runtime_env,
@@ -88,22 +62,24 @@ from examples.experimental.generative_retriever.runtime.multinode_setup import (
     validate_cluster,
     write_record,
 )
-from examples.experimental.generative_retriever.services.baseline_service import (
-    BASELINE_CACHE_SIZE,
-    BASELINE_SERVICE_API_VERSION,
+from examples.experimental.generative_retriever.runtime.prepare_sglang_bundle import (
+    prepare_bundle,
+    require_sglang_abort_patch,
+)
+from examples.experimental.generative_retriever.runtime.service_processes import (
+    ProcessSupervisor,
+)
+from examples.experimental.generative_retriever.runtime.training_common import (
+    ScriptArgs, count_records, expanded_path, prepare_prompt_data, required_directory,
+)
+from examples.experimental.generative_retriever.sglang_models.gr_policy import (
+    _stage_local_mapping_dir,
 )
 from miles.utils.external_utils.command_utils import create_run_id
 
 _REPO = Path(__file__).absolute().parents[3]
 _MODULE = "examples.experimental.generative_retriever.run_grpo_multinode_async"
-_RESIDENT_MAPPING_PORT = 31480
-_BASELINE_PORT = 31581
-_REWARD_PORTS = (31583,)
-_REWARD_DEVICES = tuple(f"cuda:{i}" for i in range(REWARD_GPUS_PER_NODE))
-_ROUTER_PORT = 31593
 _RAY_PORT = 16380
-
-
 
 
 def disable_uv_runtime_env() -> None:
@@ -112,18 +88,12 @@ def disable_uv_runtime_env() -> None:
     ray_constants.RAY_ENABLE_UV_RUN_RUNTIME_ENV = False
 
 
-@ray.remote
-class ReserveServiceGpus:
-    def gpu_ids(self) -> list[int]:
-        return [int(value) for value in ray.get_gpu_ids()]
-
-
 def resolve_hosts(text: str) -> tuple[list[str], list[str]]:
     hosts = text.split(",")
     if len(hosts) < 2 or len(hosts) % 2 or len(set(hosts)) != len(hosts) or any(
         not host.strip() or host != host.strip() for host in hosts
     ):
-        raise ValueError("Pass distinct hostnames in service,learner pairs (2n nodes)")
+        raise ValueError("Pass distinct hostnames in node pairs (2n nodes)")
     addresses = [socket.gethostbyname(host) for host in hosts]
     if len(set(addresses)) != len(addresses):
         raise ValueError("Each host must resolve to a different node IP")
@@ -146,7 +116,6 @@ def build_manifest(
         raise FileNotFoundError(f"Incomplete official mapping index: {mapping}")
     if not prompt.is_file():
         raise FileNotFoundError(f"Prompt dataset is missing: {prompt}")
-    mapping_url, mapping_owned = select_mapping_service(mapping, addresses[0], resident_port=_RESIDENT_MAPPING_PORT)
     output = expanded_path(args.output_dir, "output_dir", directory=False)
     run_dir = output / args.run_id
     checkpoint_dir = run_dir / "checkpoints"
@@ -155,7 +124,6 @@ def build_manifest(
     count = count_records(prompt)
     if count != PROMPT_DATASET_ROWS or args.rollout_batch_size * args.num_rollout > count:
         raise ValueError(f"Expected {PROMPT_DATASET_ROWS} source rows without wrapping, got {count}")
-    mapping_checkpoint = None
     if validate_checkpoints:
         if resume:
             tracker = checkpoint_dir / "latest_checkpointed_iteration.txt"
@@ -168,9 +136,6 @@ def build_manifest(
                 checkpoint_dir / "rollout" / f"global_dataset_state_dict_{iteration - 1}.pt"
             ).is_file():
                 raise FileNotFoundError("Resume requires the matching rollout dataset state")
-            mapping_checkpoint = str(checkpoint_dir / f"iter_{iteration:07d}" / "mapping")
-            if not is_columnar_index_dir(mapping_checkpoint) or not (Path(mapping_checkpoint) / "overlay.parquet").is_file():
-                raise FileNotFoundError("Resume requires the matching mapping overlay checkpoint")
         elif (checkpoint_dir / "latest_checkpointed_iteration.txt").is_file():
             raise FileExistsError(f"Run directory already contains checkpoints; pass --resume: {run_dir}")
     return {
@@ -185,177 +150,20 @@ def build_manifest(
         "qwen_model": qwen,
         "slm_root": slm_root,
         "mapping": str(mapping),
-        "mapping_url": mapping_url,
-        "mapping_owned": mapping_owned,
-        "mapping_owner": uuid.uuid4().hex,
-        "mapping_checkpoint": mapping_checkpoint,
         "relevance_model": relevance,
+        "reward_mode": args.reward_mode,
         "prompt_source": str(prompt),
         "num_rollout": args.num_rollout,
         "train_argv": build_multinode_train_args(
             args, addresses=addresses, bundle=local_bundle, prompt=alias,
-            reward_url=f"http://{addresses[0]}:{_ROUTER_PORT}",
             checkpoint_dir=checkpoint_dir, resume=resume,
         ),
         "runtime_env": build_multinode_runtime_env(
             checkpoint=checkpoint, qwen=qwen, slm_root=slm_root,
-            mapping=str(mapping), addresses=addresses,
+            mapping=str(mapping), relevance_model=relevance,
+            reward_mode=args.reward_mode, addresses=addresses,
         ),
     }
-
-
-def start_baseline(
-    processes: ProcessSupervisor, manifest: Manifest, host: str,
-) -> tuple[subprocess.Popen[str], dict[str, object]] | None:
-    mapping = manifest["mapping"]
-    expected: dict[str, object] = {
-        "status": "ready",
-        "worker_count": ROLLOUT_GPUS_PER_PAIR,
-        "docids_per_query": SAMPLES_PER_PROMPT,
-        "service_config": {
-            "api_version": BASELINE_SERVICE_API_VERSION,
-            "checkpoint": manifest["checkpoint"],
-            "qwen_model": manifest["qwen_model"],
-            "slm_root": manifest["slm_root"],
-            "id_mapping": mapping,
-            "devices": [f"cuda:{gpu}" for gpu in range(ROLLOUT_GPUS_PER_PAIR)],
-            "cache_size": BASELINE_CACHE_SIZE,
-            "docids_per_query": SAMPLES_PER_PROMPT,
-        },
-    }
-    url = f"http://{host}:{_BASELINE_PORT}/health"
-    if health_matches(url, expected):
-        print(f"Reusing verified frozen baseline: {url}", flush=True)
-        return None
-    check_available_ports(host, (_BASELINE_PORT,))
-    process = start_service(
-        processes, "baseline", "baseline_service", host, _BASELINE_PORT,
-        [
-            "--checkpoint", manifest["checkpoint"],
-            "--qwen-model", manifest["qwen_model"],
-            "--slm-root", manifest["slm_root"],
-            "--id-mapping", mapping, "--docids-per-query", str(SAMPLES_PER_PROMPT),
-            "--devices", "cuda:0,cuda:1,cuda:2,cuda:3",
-        ],
-        gpus="0,1,2,3", persistent=True,
-    )
-    return process, expected
-
-
-def exit_on_sigterm(signum: int, _frame: object) -> None:
-    raise SystemExit(128 + signum)
-
-
-def run_service_node(manifest: Manifest, index: int) -> None:
-    os.environ.update(manifest["runtime_env"])
-    host = manifest["addresses"][index]
-    baseline_host = manifest["addresses"][(index // 2) * 2]
-    baseline_url = f"http://{baseline_host}:{_BASELINE_PORT}/generate"
-    mapping = manifest["mapping"]
-    processes = ProcessSupervisor(Path(f"/tmp/gr_logs_{manifest['run_id']}") / f"services-{index}")
-    previous_handler = signal.signal(signal.SIGTERM, exit_on_sigterm)
-    baseline: tuple[subprocess.Popen[str], dict[str, object]] | None = None
-    mapping_process: subprocess.Popen[str] | None = None
-    mapping_claimed = False
-    mapping_base_url = ""
-    try:
-        mapping_base_url, local_mapping_owned = select_mapping_service(
-            Path(mapping), host, resident_port=_RESIDENT_MAPPING_PORT,
-        )
-        local_mapping_url = f"{mapping_base_url}/runs/{manifest['mapping_owner']}"
-        if local_mapping_owned:
-            check_available_ports(host, (_RESIDENT_MAPPING_PORT,))
-            mapping_process = start_service(
-                processes, "mapping", "mapping_service", host, _RESIDENT_MAPPING_PORT,
-                ["--mapping", mapping], persistent=True,
-            )
-        baseline = None
-        reward_health = []
-        pairs = len(manifest["hosts"]) // 2
-        query_cache, kw_cache, score_cache = derive_reward_cache_sizes(
-            QUERIES_PER_STEP_PER_PAIR * pairs,
-            SAMPLES_PER_PROMPT,
-            REWARD_NODES_PER_PAIR * pairs,
-        )
-        check_available_ports(host, _REWARD_PORTS)
-        port = _REWARD_PORTS[0]
-        name = "reward-0"
-        start_service(
-            processes, name, "reward_service", host, port,
-            [
-                "--baseline-url", baseline_url,
-                "--mapping-url", local_mapping_url,
-                "--mapping-version", Path(mapping).name,
-                "--relevance-model", manifest["relevance_model"],
-                "--devices", ",".join(_REWARD_DEVICES),
-                "--batch-size", str(REWARD_TOWER_BATCH_SIZE),
-                "--pair-batch-size", str(REWARD_PAIR_BATCH_SIZE),
-                "--docids-per-query", str(SAMPLES_PER_PROMPT),
-                "--max-samples-per-request", str(DEFAULT_REWARD_BATCH_SIZE),
-                "--query-cache-size", str(query_cache),
-                "--keyword-cache-size", str(kw_cache),
-                "--score-cache-size", str(score_cache),
-            ],
-            gpus=",".join(str(g) for g in range(REWARD_GPUS_PER_NODE)),
-        )
-        reward_health.append((name, port, {
-            "worker_count": REWARD_GPUS_PER_NODE,
-            "mapping_version": Path(mapping).name,
-            "service_config": {
-                "baseline_url": baseline_url,
-                "mapping_url": local_mapping_url,
-                "relevance_model": manifest["relevance_model"],
-                "devices": list(_REWARD_DEVICES),
-                "docids_per_query": SAMPLES_PER_PROMPT,
-                "max_samples_per_request": DEFAULT_REWARD_BATCH_SIZE,
-            },
-        }))
-        if local_mapping_owned:
-            wait_health(
-                processes, host, "mapping", _RESIDENT_MAPPING_PORT,
-                {
-                    "mapping_version": Path(mapping).name,
-                    "service_config": {"mapping": mapping},
-                },
-            )
-        claim_mapping(mapping_base_url, manifest["mapping_owner"], manifest["mapping_checkpoint"])
-        mapping_claimed = True
-        if baseline is not None:
-            wait_health(processes, host, "baseline", _BASELINE_PORT, baseline[1])
-            print(
-                f"Frozen baseline will remain on GPU 0-3 after this run: "
-                f"http://{host}:{_BASELINE_PORT}/health",
-                flush=True,
-            )
-            baseline = None
-        for name, port, expected in reward_health:
-            wait_health(processes, host, name, port, expected)
-        print(f"service node {index} ready", flush=True)
-        while True:
-            processes.check()
-            ready, _, _ = select.select([sys.stdin], [], [], 2)
-            if ready:
-                if sys.stdin.readline().strip() == "STOP":
-                    break
-                raise RuntimeError("Service manager input closed without STOP")
-    except BaseException:
-        if mapping_process is not None and not mapping_claimed:
-            stop_process(mapping_process, timeout=30, kill_timeout=30)
-        if baseline is not None and baseline[0].poll() is None:
-            baseline[0].terminate()
-            try:
-                baseline[0].wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                baseline[0].kill()
-                baseline[0].wait(timeout=30)
-        raise
-    finally:
-        signal.signal(signal.SIGTERM, previous_handler)
-        try:
-            processes.close()
-        finally:
-            if mapping_claimed:
-                release_mapping(mapping_base_url, manifest["mapping_owner"])
 
 
 def check_available_ports(host: str, ports: tuple[int, ...]) -> None:
@@ -403,11 +211,16 @@ def prepare_node_assets(manifest: Manifest) -> None:
 
     local_ckpt = stage_local_model_dir(manifest["checkpoint"], "checkpoint")
     local_qwen = stage_local_model_dir(manifest["qwen_model"], "Qwen model")
+    local_mapping = _stage_local_mapping_dir(manifest["mapping"])
+    _stage_local_relevance_source(relevance_source_path(manifest["relevance_model"]))
+    local_relevance = _stage_local_relevance_model(manifest["relevance_model"])
     bundle = prepare_bundle(
         checkpoint=local_ckpt,
         qwen_model=local_qwen,
         slm_root=manifest["slm_root"],
-        id_mapping=manifest["mapping"],
+        id_mapping=local_mapping,
+        relevance_model=local_relevance,
+        reward_mode=manifest["reward_mode"],
         output=local_bundle_path(manifest["run_id"]),
         num_beams=SAMPLES_PER_PROMPT,
         num_return_sequences=SAMPLES_PER_PROMPT,
@@ -517,24 +330,7 @@ def run_cluster(manifest: Manifest) -> None:
             ),
         )
         print(f"Async GRPO run manifest: {record}", flush=True)
-        check_available_ports(manifest["head_ip"], (_RAY_PORT, _ROUTER_PORT))
-        for node, host in enumerate(manifest["hosts"]):
-            argv = (
-                [sys.executable, "-u", "-m", _MODULE, "_service_node", str(path), str(node)]
-                if node == 0 else remote_command(host, "_service_node", path, node)
-            )
-            processes.start(f"services-{node}", argv, stdin=True)
-        worker_urls = [
-            f"http://{host}:{port}/score"
-            for host in manifest["addresses"] for port in _REWARD_PORTS
-        ]
-        start_service(
-            processes, "reward-router", "reward_router_service",
-            manifest["head_ip"], _ROUTER_PORT,
-            ["--worker-urls", ",".join(worker_urls),
-             "--max-samples-per-request", str(DEFAULT_REWARD_BATCH_SIZE),
-             "--forward-concurrency", "2"],
-        )
+        check_available_ports(manifest["head_ip"], (_RAY_PORT,))
         os.environ.update(manifest["runtime_env"])
         head = Node(
             RayParams(
@@ -563,24 +359,7 @@ def run_cluster(manifest: Manifest) -> None:
             if time.monotonic() > deadline:
                 raise TimeoutError(f"Expected {required} Ray GPUs across all nodes")
             time.sleep(2)
-        # All 64 GPUs are colocated for rollout, baseline, reward, and training.
-        for node, host in enumerate(manifest["addresses"]):
-            wait_health(
-                processes, host, f"mapping-{node}", _RESIDENT_MAPPING_PORT,
-                {"mapping_version": Path(manifest["mapping"]).name},
-                health_path=f"/runs/{manifest['mapping_owner']}/health",
-            )
-            for port in _REWARD_PORTS:
-                wait_health(
-                    processes, host, f"reward-{node}-{port}", port,
-                    {"worker_count": REWARD_GPUS_PER_NODE, "mapping_version": Path(manifest["mapping"]).name},
-                )
-        wait_health(
-            processes, manifest["head_ip"], "reward-router", _ROUTER_PORT,
-            {"worker_count": len(manifest["hosts"]),
-             "mapping_version": Path(manifest["mapping"]).name,
-             "service_config": {"worker_urls": worker_urls}},
-        )
+        # All GPUs are colocated for in-process rollout, baseline, reward, and training.
         training = processes.start(
             "training",
             [sys.executable, "-u", "-m", _MODULE, "_train", str(path)],
@@ -590,7 +369,7 @@ def run_cluster(manifest: Manifest) -> None:
             processes.check(except_name="training")
             time.sleep(5)
         if training.returncode:
-            raise RuntimeError(f"train_async.py exited {training.returncode}: {run_dir / 'training.log'}")
+            raise RuntimeError(f"train.py exited {training.returncode}: {run_dir / 'training.log'}")
         tracker = run_dir / "checkpoints/latest_checkpointed_iteration.txt"
         completed = int(tracker.read_text().strip())
         if completed != manifest["num_rollout"]:
@@ -617,7 +396,7 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
         "_role", nargs="?",
-        choices=("_worker", "_service_node", "_prepare_assets", "_train"),
+        choices=("_worker", "_prepare_assets", "_train"),
     )
     parser.add_argument("_manifest", nargs="?")
     parser.add_argument("_index", nargs="?", type=int)
@@ -633,8 +412,6 @@ def main() -> None:
                 parser.error("Internal node role requires a valid node index")
             if cli._role == "_worker":
                 run_worker(manifest, cli._index)
-            elif cli._role == "_service_node":
-                run_service_node(manifest, cli._index)
             else:
                 prepare_node_assets(manifest)
         return
@@ -656,8 +433,6 @@ def main() -> None:
             "num_rollout": manifest["num_rollout"],
             "prompt_source": manifest["prompt_source"],
             "mapping": manifest["mapping"],
-            "mapping_url": manifest["mapping_url"],
-            "mapping_owned": manifest["mapping_owned"],
             "checkpoint": manifest["checkpoint"],
             "qwen_model": manifest["qwen_model"],
             "relevance_model": manifest["relevance_model"],

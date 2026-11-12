@@ -445,55 +445,84 @@ class RelevanceScorer:
             pair_k_slots,
         )
         cross_seconds = time.perf_counter() - phase
-        results = [(float(row[0]), float(row[1])) for row in pm_sm]
+        results = [
+            (float(r0), float(r1))
+            for r0, r1 in pm_sm.tolist()
+        ]
         logger.info(
             "graphene_score_stage pairs=%d keywords=%d keyword_s=%.3f cross_s=%.3f total_s=%.3f",
             len(q_indices), len(keywords), keyword_seconds, cross_seconds, time.perf_counter() - started,
         )
         return results, k_delta
 
-    def score(self, pairs: list[tuple[str, str]]) -> dict[tuple[str, str], tuple[float, float]]:
+    def score_with_deltas(
+        self, pairs: list[tuple[str, str]],
+    ) -> tuple[dict[tuple[str, str], tuple[float, float]], dict[str, dict[str, int]]]:
         started = time.perf_counter()
-        resolved = {}
-        missing = []
-        for pair in dict.fromkeys(pairs):
+        zero_counter = {"hits": 0, "misses": 0, "evictions": 0}
+        unique_pairs = list(dict.fromkeys(pairs))
+        if not unique_pairs:
+            return {}, {
+                "reward": dict(zero_counter),
+                "query_features": dict(zero_counter),
+                "keyword_features": dict(zero_counter),
+            }
+        resolved: dict[tuple[str, str], tuple[float, float]] = {}
+        missing: list[tuple[str, str]] = []
+        r_hits = r_misses = 0
+        for pair in unique_pairs:
             score = self.scores.get(pair)
             if score is None:
                 missing.append(pair)
+                r_misses += 1
             else:
                 resolved[pair] = score
+                r_hits += 1
+        if not missing:
+            return resolved, {
+                "reward": {"hits": r_hits, "misses": 0, "evictions": 0},
+                "query_features": dict(zero_counter),
+                "keyword_features": dict(zero_counter),
+            }
         lookup_seconds = time.perf_counter() - started
-        query_seconds = keyword_seconds = cross_seconds = store_seconds = 0.0
-        for start in range(0, len(missing), self.pair_batch_size):
-            chunk = missing[start:start + self.pair_batch_size]
-            unique_queries = list(dict.fromkeys(query for query, _ in chunk))
-            unique_keywords = list(dict.fromkeys(keyword for _, keyword in chunk))
-            phase = time.perf_counter()
-            q_storage, q_map, _ = self._encode_gpu_table(unique_queries, query=True)
-            query_seconds += time.perf_counter() - phase
-            phase = time.perf_counter()
-            k_storage, k_map, _ = self._encode_gpu_table(unique_keywords, query=False)
-            keyword_seconds += time.perf_counter() - phase
-            phase = time.perf_counter()
-            pm_sm = self._cross_score_gpu(
-                q_storage,
-                k_storage,
-                [q_map[query] for query, _ in chunk],
-                [k_map[keyword] for _, keyword in chunk],
-            )
-            cross_seconds += time.perf_counter() - phase
-            phase = time.perf_counter()
-            for pair, row in zip(chunk, pm_sm, strict=True):
-                score = (float(row[0]), float(row[1]))
-                self.scores.put(pair, score)
-                resolved[pair] = score
-            store_seconds = time.perf_counter() - phase
+        unique_queries = list(dict.fromkeys(query for query, _ in missing))
+        unique_keywords = list(dict.fromkeys(keyword for _, keyword in missing))
+        phase = time.perf_counter()
+        q_storage, q_map, q_delta = self._encode_gpu_table(unique_queries, query=True)
+        query_seconds = time.perf_counter() - phase
+        phase = time.perf_counter()
+        k_storage, k_map, k_delta = self._encode_gpu_table(unique_keywords, query=False)
+        keyword_seconds = time.perf_counter() - phase
+        phase = time.perf_counter()
+        pm_sm = self._cross_score_gpu(
+            q_storage,
+            k_storage,
+            [q_map[query] for query, _ in missing],
+            [k_map[keyword] for _, keyword in missing],
+        )
+        cross_seconds = time.perf_counter() - phase
+        phase = time.perf_counter()
+        evictions_before = self.scores.stats().evictions
+        for pair, (r0, r1) in zip(missing, pm_sm.tolist(), strict=True):
+            score = (float(r0), float(r1))
+            self.scores.put(pair, score)
+            resolved[pair] = score
+        r_evictions = self.scores.stats().evictions - evictions_before
+        store_seconds = time.perf_counter() - phase
         logger.info(
             "graphene_score_stage pairs=%d misses=%d lookup_s=%.3f query_s=%.3f "
             "keyword_s=%.3f cross_s=%.3f store_s=%.3f total_s=%.3f",
             len(pairs), len(missing), lookup_seconds, query_seconds, keyword_seconds,
             cross_seconds, store_seconds, time.perf_counter() - started,
         )
+        return resolved, {
+            "reward": {"hits": r_hits, "misses": r_misses, "evictions": r_evictions},
+            "query_features": q_delta,
+            "keyword_features": k_delta,
+        }
+
+    def score(self, pairs: list[tuple[str, str]]) -> dict[tuple[str, str], tuple[float, float]]:
+        resolved, _ = self.score_with_deltas(pairs)
         return resolved
 
 

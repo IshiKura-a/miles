@@ -17,6 +17,9 @@ from examples.experimental.generative_retriever.model.constrained_decode import 
     SortedU32Constraint,
     load_constraint,
 )
+from examples.experimental.generative_retriever.reward.relevance_reward import (
+    DEFAULT_TRAIN_GROUP_SIZE,
+)
 
 from examples.experimental.generative_retriever.model.model_loading import (
     build_run_arguments,
@@ -36,7 +39,7 @@ def _required_path(variable: str) -> Path:
 
 
 class GRStage5Policy(nn.Module):
-    """Frozen Qwen encoder plus trainable projection and autoregressive docid decoder."""
+    """Trainable Qwen encoder, projection, and autoregressive docid decoder."""
 
     _miles_requires_response_lengths = True
     _miles_fsdp_ignore_frozen_parameters = True
@@ -61,21 +64,32 @@ class GRStage5Policy(nn.Module):
         self.decoder: Any = source.decoder
         self.lm_head: Any = source.lm_head
 
-        self.encoder_list.requires_grad_(False)
+        causal_lm = self.encoder_list[0].model.encoder
+        if hasattr(causal_lm, "lm_head"):
+            causal_lm.lm_head = nn.Identity()
         for module in self.modules():
             if isinstance(module, nn.Dropout):
                 module.p = 0.0
             if isinstance(module, T5Attention):
                 module.dropout = 0.0
         for module in (
+            self.encoder_list,
             self.docEnc2decoder,
             self.decoder,
             self.lm_head,
         ):
             module.requires_grad_(True)
 
+    def _encoder_backbone(self) -> Any:
+        causal_lm = self.encoder_list[0].model.encoder
+        backbone = getattr(causal_lm, "model", None)
+        if backbone is None:
+            raise TypeError("GR Qwen encoder must expose its backbone as .model")
+        return backbone
+
     def gradient_checkpointing_enable(self, **kwargs: Any) -> None:
         del kwargs
+        self._encoder_backbone().gradient_checkpointing_enable()
         self.decoder.gradient_checkpointing = True
 
     def _encode_prompts(
@@ -87,33 +101,57 @@ class GRStage5Policy(nn.Module):
             tokens.shape[0] - response_length
             for tokens, response_length in zip(sample_tokens, response_lengths, strict=True)
         ]
-        prompts = [
-            sample_tokens[index][:prompt_length]
-            for index, prompt_length in enumerate(prompt_lengths)
-        ]
-        padded_prompts = pad_sequence(
-            [prompt.flip(0) for prompt in prompts],
-            batch_first=True,
-            padding_value=self.pad_token_id,
-        ).flip(1)
-        unique_prompts, inverse_indices = torch.unique(
-            padded_prompts,
-            dim=0,
-            return_inverse=True,
-        )
-        unique_mask = unique_prompts.ne(self.pad_token_id).long()
-        with torch.no_grad():
-            causal_lm = self.encoder_list[0].model.encoder
-            backbone = getattr(causal_lm, "model", None)
-            if backbone is None:
-                raise TypeError("GR Qwen encoder must expose its backbone as .model")
-            outputs = backbone(
-                input_ids=unique_prompts,
-                attention_mask=unique_mask,
-                return_dict=True,
-                use_cache=False,
+        n = len(sample_tokens)
+        g_size = DEFAULT_TRAIN_GROUP_SIZE
+        is_grouped = (
+            n >= g_size
+            and n % g_size == 0
+            and all(
+                prompt_lengths[start] == prompt_lengths[i]
+                for start in range(0, n, g_size)
+                for i in range(start + 1, start + g_size)
             )
-            unique_hidden_states = outputs.last_hidden_state
+        )
+        if is_grouped:
+            group_prompts = [
+                sample_tokens[start][: prompt_lengths[start]].flip(0)
+                for start in range(0, n, g_size)
+            ]
+            padded_groups = pad_sequence(
+                group_prompts,
+                batch_first=True,
+                padding_value=self.pad_token_id,
+            ).flip(1)
+            unique_prompts, group_inverse = torch.unique(
+                padded_groups,
+                dim=0,
+                return_inverse=True,
+            )
+            inverse_indices = group_inverse.repeat_interleave(g_size)
+        else:
+            prompts = [
+                sample_tokens[index][:prompt_length]
+                for index, prompt_length in enumerate(prompt_lengths)
+            ]
+            padded_prompts = pad_sequence(
+                [prompt.flip(0) for prompt in prompts],
+                batch_first=True,
+                padding_value=self.pad_token_id,
+            ).flip(1)
+            unique_prompts, inverse_indices = torch.unique(
+                padded_prompts,
+                dim=0,
+                return_inverse=True,
+            )
+        unique_mask = unique_prompts.ne(self.pad_token_id).long()
+        backbone = self._encoder_backbone()
+        outputs = backbone(
+            input_ids=unique_prompts,
+            attention_mask=unique_mask,
+            return_dict=True,
+            use_cache=False,
+        )
+        unique_hidden_states = outputs.last_hidden_state
         return unique_hidden_states, unique_mask, inverse_indices, prompt_lengths
 
     def _allowed_for_prefix(self, prefix_tuple: tuple[int, ...]) -> tuple[torch.Tensor, set[int]]:
@@ -209,10 +247,32 @@ class GRStage5Policy(nn.Module):
             (input_batch_size, sequence_length, vocab_size)
         )
 
-        responses = torch.stack([
-            tokens[prompt_length : prompt_length + self.code_num]
-            for tokens, prompt_length in zip(sample_tokens, prompt_lengths, strict=True)
-        ])
+        g_size = DEFAULT_TRAIN_GROUP_SIZE
+        if (
+            input_batch_size == 1
+            and sample_count >= g_size
+            and sample_count % g_size == 0
+            and all(
+                total_lengths[start] == total_lengths[i]
+                for start in range(0, sample_count, g_size)
+                for i in range(start + 1, start + g_size)
+            )
+        ):
+            responses = torch.cat(
+                [
+                    input_ids[
+                        0,
+                        output_offsets[start] : output_offsets[start] + g_size * total_lengths[start],
+                    ].view(g_size, total_lengths[start])[:, prompt_lengths[start] : prompt_lengths[start] + self.code_num]
+                    for start in range(0, sample_count, g_size)
+                ],
+                dim=0,
+            )
+        else:
+            responses = torch.stack([
+                tokens[prompt_length : prompt_length + self.code_num]
+                for tokens, prompt_length in zip(sample_tokens, prompt_lengths, strict=True)
+            ])
         decoder_input_ids = torch.cat(
             (
                 torch.zeros(

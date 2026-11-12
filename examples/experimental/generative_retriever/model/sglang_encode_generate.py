@@ -4,17 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import numpy as np
 import logging
 import math
 from typing import Any
-from weakref import WeakKeyDictionary
 
 import httpx
+import numpy as np
 
-from miles.rollout.base_types import BaseGroupGenerateFn, GenerateFnInput, GenerateFnOutput
-from miles.utils.http_utils import GeneralHttpClientProvider
-from miles.utils.types import Sample
 from examples.experimental.generative_retriever.reward.relevance_reward import (
     DEFAULT_REWARD_BATCH_SIZE,
     DOCID_TOKEN_OFFSET,
@@ -23,91 +19,20 @@ from examples.experimental.generative_retriever.reward.relevance_reward import (
     RQ_CODE_DIM,
     RQ_CODE_NUM,
 )
-from examples.experimental.generative_retriever.reward.reward_http import (
-    AsyncRequestBatcher,
-    PendingBatchRequest,
-    post_json_async,
+from examples.experimental.generative_retriever.sglang_models.gr_policy import (
+    IN_PROCESS_BEAM_COLS,
+    IN_PROCESS_METRIC_KEYS,
 )
+from miles.rollout.base_types import BaseGroupGenerateFn, GenerateFnInput, GenerateFnOutput
+from miles.utils.http_utils import GeneralHttpClientProvider
+from miles.utils.types import Sample
 
-_PREPARE_BATCHERS: WeakKeyDictionary[
-    asyncio.AbstractEventLoop, dict[tuple[str, float, int], BaselinePrepareBatcher]
-] = WeakKeyDictionary()
 _DOCID_SIZE = RQ_CODE_NUM
 _DOCID_DIM = RQ_CODE_DIM
-_MAX_PREPARE_QUERIES = 64
-_PREPARE_BATCH_WAIT_SECONDS = 0.01
 _TRANSPORT_ATTEMPTS = 3
 _RETRY_DELAY_SECONDS = 0.5
 
 logger = logging.getLogger(__name__)
-
-
-class BaselinePrepareBatcher(AsyncRequestBatcher[str, dict[str, float]]):
-    def __init__(self, url: str, timeout_seconds: float, concurrency: int) -> None:
-        super().__init__(
-            max_batch_size=_MAX_PREPARE_QUERIES,
-            concurrency=concurrency,
-            batch_wait_seconds=_PREPARE_BATCH_WAIT_SECONDS,
-        )
-        self._url = url
-        self._timeout_seconds = timeout_seconds
-
-    async def submit(self, query: str) -> dict[str, float]:
-        return await self.submit_weighted(query, weight=1)
-
-    async def execute_batch(
-        self,
-        requests: list[PendingBatchRequest[str, dict[str, float]]],
-    ) -> None:
-        queries = list(dict.fromkeys(request.payload for request in requests))
-        payload = await post_json_async(
-            self._url,
-            {"queries": queries},
-            timeout=self._timeout_seconds,
-        )
-        if payload.get("prepared_queries") != len(queries):
-            raise ValueError("Reward prepare endpoint returned an unexpected query count")
-        metrics = parse_prepare_metrics(payload)
-        for index, request in enumerate(requests):
-            if not request.future.done():
-                request.future.set_result(metrics if index == 0 else {})
-
-
-def get_prepare_batcher(
-    url: str, timeout_seconds: float, concurrency: int,
-) -> BaselinePrepareBatcher:
-    loop = asyncio.get_running_loop()
-    batchers = _PREPARE_BATCHERS.setdefault(loop, {})
-    key = (url, timeout_seconds, concurrency)
-    batcher = batchers.get(key)
-    if batcher is None:
-        batcher = BaselinePrepareBatcher(url, timeout_seconds, concurrency)
-        batchers[key] = batcher
-    return batcher
-
-
-def parse_prepare_metrics(payload: dict[str, Any]) -> dict[str, float]:
-    metrics: dict[str, float] = {}
-
-    def collect(prefix: str, values: Any) -> None:
-        if not isinstance(values, dict):
-            raise ValueError(f"Reward prepare {prefix} metrics must be a JSON object")
-        for name, value in values.items():
-            path = f"{prefix}/{name}"
-            if isinstance(value, dict):
-                collect(path, value)
-            elif isinstance(value, (int, float)) and not isinstance(value, bool):
-                metrics[path] = float(value)
-
-    collect("prepare/cache_gauge", payload.get("cache", {}))
-    collect("prepare/cache_delta", payload.get("cache_delta", {}))
-    collect("prepare/routing_delta", payload.get("routed_queries", {}))
-    latency = payload.get("latency_seconds")
-    if not isinstance(latency, (int, float)) or isinstance(latency, bool):
-        raise ValueError("Reward prepare endpoint returned invalid latency")
-    metrics["prepare/latency_seconds"] = float(latency)
-    metrics["prepare/request_count"] = 1.0
-    return metrics
 
 
 def add_arguments(parser: Any) -> None:
@@ -120,13 +45,13 @@ def add_arguments(parser: Any) -> None:
         "--generative-retriever-reward-url",
         type=str,
         default=None,
-        help="HTTP endpoint returning retrieval rewards for generated docids.",
+        help="Optional legacy HTTP endpoint returning retrieval rewards for generated docids.",
     )
     parser.add_argument(
         "--generative-retriever-reward-prepare-url",
         type=str,
         default=None,
-        help="HTTP endpoint preparing frozen baselines concurrently with rollout.",
+        help="Optional legacy HTTP endpoint preparing frozen baselines.",
     )
     parser.add_argument(
         "--generative-retriever-reward-timeout",
@@ -247,30 +172,6 @@ async def request_embedding(args: Any, router_url: str, prompt_ids: list[int]) -
     return {"embedding": embedding}
 
 
-async def request_embedding_and_prepare(
-    args: Any,
-    router_url: str,
-    prompt_ids: list[int],
-    query: str,
-) -> tuple[dict[str, Any], dict[str, float]]:
-    embedding = await request_embedding(args, router_url, prompt_ids)
-    raw_np = embedding.get("embedding_np")
-    if raw_np is not None and raw_np.size == args.n_samples_per_prompt * _DOCID_SIZE * 3:
-        return embedding, {}
-    raw = embedding.get("embedding")
-    if isinstance(raw, list) and len(raw) == args.n_samples_per_prompt * _DOCID_SIZE * 3:
-        return embedding, {}
-    prepare_url = args.generative_retriever_reward_prepare_url
-    if not prepare_url:
-        raise ValueError("--generative-retriever-reward-prepare-url is required")
-    prepare_metrics = await get_prepare_batcher(
-        prepare_url,
-        args.generative_retriever_reward_timeout,
-        args.generative_retriever_prepare_concurrency,
-    ).submit(query)
-    return embedding, prepare_metrics
-
-
 def encode_training_prompt(state: Any, query: str) -> list[int]:
     if not isinstance(query, str) or not query.strip():
         raise ValueError("GR rollout requires a non-empty query string prompt")
@@ -292,7 +193,6 @@ def populate_beam_sample(
     output: dict[str, Any],
     group_size: int,
     beam_rank: int,
-    prepare_metrics: dict[str, float],
 ) -> None:
     token_ids, logprobs = parse_embedding(
         output, _DOCID_SIZE, _DOCID_DIM, group_size, beam_rank,
@@ -315,8 +215,6 @@ def populate_beam_sample(
         baseline_docids = parse_baseline_docids(output, _DOCID_SIZE, _DOCID_DIM, group_size)
         if baseline_docids is not None:
             metadata["baseline_docids"] = baseline_docids
-        if prepare_metrics:
-            metadata["prepare_metrics"] = prepare_metrics
 
 
 def validate_pending_sample(sample: Sample, *, evaluation: bool) -> str:
@@ -354,13 +252,38 @@ async def generate_group_samples(
             raise ValueError(f"Expected beam rank {beam_rank}, got sample.index={sample.index}")
 
     prompt_ids = encode_training_prompt(state, query)
-    output, prepare_metrics = await request_embedding_and_prepare(
-        args,
-        resolve_engine_url(args),
-        prompt_ids,
-        query,
-    )
+    output = await request_embedding(args, resolve_engine_url(args), prompt_ids)
     raw_np = output.get("embedding_np")
+    expected_in_process = group_size * IN_PROCESS_BEAM_COLS + len(IN_PROCESS_METRIC_KEYS)
+    if not evaluation and raw_np is not None and raw_np.size == expected_in_process:
+        core = raw_np[: group_size * IN_PROCESS_BEAM_COLS].reshape(group_size, IN_PROCESS_BEAM_COLS)
+        tok_mat = core[:, :4].astype(np.int64)
+        tok_list = tok_mat.tolist()
+        lp_list = core[:, 4:8].astype(np.float64).tolist()
+        rewards_list = core[:, 8].astype(np.float64).tolist()
+        raw_rewards_list = core[:, 9].astype(np.float64).tolist()
+        pos_mat = tok_mat - DOCID_TOKEN_OFFSET
+        u32_arr = (
+            (pos_mat[:, 0].astype(np.uint32) << np.uint32(24))
+            | ((pos_mat[:, 1] - 256).astype(np.uint32) << np.uint32(16))
+            | ((pos_mat[:, 2] - 512).astype(np.uint32) << np.uint32(8))
+            | (pos_mat[:, 3] - 768).astype(np.uint32)
+        )
+        for beam_rank, sample in enumerate(group):
+            sample.tokens = prompt_ids + tok_list[beam_rank]
+            sample.response_length = _DOCID_SIZE
+            sample.rollout_log_probs = lp_list[beam_rank]
+            sample.reward = rewards_list[beam_rank]
+            sample.status = Sample.Status.COMPLETED
+        p0, p1, p2, p3 = (int(v) for v in pos_mat[0].tolist())
+        first.response = f"{p0},{p1},{p2},{p3}"
+        meta0 = first.metadata.setdefault("generative_retriever", {})
+        meta0["group_u32"] = u32_arr
+        meta0["group_raw_rewards"] = raw_rewards_list
+        metrics_vals = raw_np[group_size * IN_PROCESS_BEAM_COLS :].astype(np.float64).tolist()
+        meta0["reward_metrics"] = dict(zip(IN_PROCESS_METRIC_KEYS, metrics_vals, strict=True))
+        return group
+
     expected_2 = group_size * _DOCID_SIZE * 2
     expected_3 = group_size * _DOCID_SIZE * 3
     if not evaluation and raw_np is not None and raw_np.size in (expected_2, expected_3):
@@ -387,8 +310,6 @@ async def generate_group_samples(
             metadata["positional_docid"] = positional_docid
         if baseline_docids_np is not None:
             group[0].metadata["generative_retriever"]["baseline_docids"] = baseline_docids_np
-        if prepare_metrics:
-            group[0].metadata["generative_retriever"]["prepare_metrics"] = prepare_metrics
         return group
 
     raw = output.get("embedding")
@@ -430,8 +351,6 @@ async def generate_group_samples(
                 baseline_docids.append((b0, b1, b2, b3))
         if baseline_docids is not None:
             group[0].metadata["generative_retriever"]["baseline_docids"] = baseline_docids
-        if prepare_metrics:
-            group[0].metadata["generative_retriever"]["prepare_metrics"] = prepare_metrics
         return group
 
     for beam_rank, sample in enumerate(group):
@@ -441,7 +360,6 @@ async def generate_group_samples(
             output=output,
             group_size=group_size,
             beam_rank=0 if evaluation else beam_rank,
-            prepare_metrics=prepare_metrics,
         )
     return group
 
@@ -458,12 +376,7 @@ async def generate_single_sample(
     assert sample.index is not None
     beam_rank = 0 if evaluation else sample.index % group_size
     prompt_ids = encode_training_prompt(state, query)
-    output, prepare_metrics = await request_embedding_and_prepare(
-        args,
-        resolve_engine_url(args),
-        prompt_ids,
-        query,
-    )
+    output = await request_embedding(args, resolve_engine_url(args), prompt_ids)
     if "embedding_np" in output and "embedding" not in output:
         output["embedding"] = output["embedding_np"].tolist()
     populate_beam_sample(
@@ -472,7 +385,6 @@ async def generate_single_sample(
         output=output,
         group_size=group_size,
         beam_rank=beam_rank,
-        prepare_metrics=prepare_metrics,
     )
     return sample
 

@@ -1,5 +1,5 @@
 import logging
-from typing import Any
+from typing import Any, cast
 
 import torch
 
@@ -62,6 +62,7 @@ def convert_samples_to_train_data(
     """
     if (f := custom_convert_samples_to_train_data_func) is not None:
         return f(args, samples)
+    samples = cast(list[Sample], samples)
 
     raw_rewards, rewards = _post_process_rewards(
         args,
@@ -73,35 +74,60 @@ def convert_samples_to_train_data(
     assert len(raw_rewards) == len(samples)
     assert len(rewards) == len(samples)
 
+    n = len(samples)
+    has_compacted_rollouts = any(sample.rollout_id is not None for sample in samples)
+    first_resp_len = samples[0].response_length if n > 0 else 0
+    uniform_default_mask = (
+        n > 0
+        and not has_compacted_rollouts
+        and all(
+            s.loss_mask is None and not s.remove_sample and s.response_length == first_resp_len
+            for s in samples
+        )
+    )
+
     train_data = {
         "tokens": [sample.tokens for sample in samples],
-        "response_lengths": [sample.response_length for sample in samples],
+        "response_lengths": [first_resp_len] * n if uniform_default_mask else [sample.response_length for sample in samples],
         # some reward model, e.g. remote rm, may return multiple rewards,
         # we could use key to select the reward.
         "rewards": rewards,
         "raw_reward": raw_rewards,
         "truncated": [1 if sample.status == Sample.Status.TRUNCATED else 0 for sample in samples],
         "sample_indices": [sample.index for sample in samples],
-        "rollout_ids": [s.rollout_id if s.rollout_id is not None else s.index for s in samples],
+        "rollout_ids": (
+            [s.rollout_id if s.rollout_id is not None else s.index for s in samples]
+            if has_compacted_rollouts
+            else [sample.index for sample in samples]
+        ),
     }
 
     # loss mask
-    # TODO: compress the loss mask
-    loss_masks = []
-    for sample in samples:
-        # always instantiate loss_mask if not provided
-        if sample.loss_mask is None:
-            sample.loss_mask = [1] * sample.response_length
+    if uniform_default_mask:
+        shared_mask = [1] * first_resp_len
+        for sample in samples:
+            sample.loss_mask = shared_mask
+        loss_masks = [shared_mask] * n
+        train_data["loss_masks"] = loss_masks
+        train_data["rollout_mask_sums"] = [first_resp_len] * n
+    else:
+        loss_masks = []
+        for sample in samples:
+            # always instantiate loss_mask if not provided
+            if sample.loss_mask is None:
+                sample.loss_mask = [1] * sample.response_length
 
-        assert (
-            len(sample.loss_mask) == sample.response_length
-        ), f"loss mask length {len(sample.loss_mask)} != response length {sample.response_length}"
-        if sample.remove_sample:
-            sample.loss_mask = [0] * sample.response_length
-        loss_masks.append(sample.loss_mask)
-    train_data["loss_masks"] = loss_masks
-
-    train_data["rollout_mask_sums"] = _compute_rollout_mask_sums(train_data["rollout_ids"], loss_masks)
+            assert (
+                len(sample.loss_mask) == sample.response_length
+            ), f"loss mask length {len(sample.loss_mask)} != response length {sample.response_length}"
+            if sample.remove_sample:
+                sample.loss_mask = [0] * sample.response_length
+            loss_masks.append(sample.loss_mask)
+        train_data["loss_masks"] = loss_masks
+        if has_compacted_rollouts:
+            train_data["rollout_mask_sums"] = _compute_rollout_mask_sums(train_data["rollout_ids"], loss_masks)
+        else:
+            train_data["rollout_mask_sums"] = [sum(mask) for mask in loss_masks]
 
     # overwriting the raw reward
     if samples[0].metadata and "raw_reward" in samples[0].metadata:
@@ -197,6 +223,7 @@ def _reward_group_segments(args: Any, samples: list[Sample], prompt_group_sizes:
     if all(group_index is not None for group_index in group_indices):
         segments_by_group_index: dict[int, list[int]] = {}
         for segment_index, group_index in enumerate(group_indices):
+            assert group_index is not None
             segments_by_group_index.setdefault(int(group_index), []).append(segment_index)
         return list(segments_by_group_index.values())
 
@@ -302,10 +329,11 @@ def _post_process_rewards(
 ):
     if (f := custom_reward_post_process_func) is not None:
         return f(args, samples)
+    flat_samples = cast(list[Sample], samples)
 
-    raw_rewards = [sample.get_reward_value(args) for sample in samples]
+    raw_rewards = [sample.get_reward_value(args) for sample in flat_samples]
     if args.advantage_estimator in ["grpo", "gspo", "reinforce_plus_plus_baseline"] and args.rewards_normalization:
-        normalized_rewards = _normalize_rewards_by_rollout(args, samples, raw_rewards, prompt_group_sizes)
+        normalized_rewards = _normalize_rewards_by_rollout(args, flat_samples, raw_rewards, prompt_group_sizes)
         return raw_rewards, normalized_rewards
 
     return raw_rewards, raw_rewards
@@ -317,7 +345,15 @@ def split_train_data_by_dp(args, data: dict[str, Any], train_parallel_config: di
     When the training backend can consume a rollout-side schedule, the shards
     also carry the precomputed micro-batch layout; otherwise this falls back to
     the legacy split (the training side schedules locally)."""
-    if can_schedule_on_rollout_side(args, data, train_parallel_config):
+    assert train_parallel_config is not None
+    if "dp_partitions" in data:
+        partitions = data.pop("dp_partitions")
+        if len(partitions) != train_parallel_config["dp_size"]:
+            raise ValueError("Custom DP partitions must match the data-parallel size")
+        if "total_lengths" not in data:
+            data["total_lengths"] = [len(tokens) for tokens in data["tokens"]]
+        shards = _package_shards(args, data, partitions)
+    elif can_schedule_on_rollout_side(args, data, train_parallel_config):
         shards = split_train_data_by_dp_scheduled_raw(args, data, train_parallel_config=train_parallel_config)
     else:
         shards = split_train_data_by_dp_raw(args, data, dp_size=train_parallel_config["dp_size"])
@@ -343,8 +379,10 @@ def split_train_data_by_dp_scheduled_raw(
     args, data: dict[str, Any], *, train_parallel_config: dict
 ) -> list[dict[str, Any]]:
     """DP split with the micro-batch schedule precomputed on the rollout side."""
-    total_lengths = [len(t) for t in data["tokens"]]
-    data["total_lengths"] = total_lengths
+    total_lengths = data.get("total_lengths")
+    if total_lengths is None:
+        total_lengths = [len(t) for t in data["tokens"]]
+        data["total_lengths"] = total_lengths
 
     global_batch_size = data.get("dynamic_global_batch_size", args.global_batch_size)
     partitions, micro_batch_indices, num_microbatches, num_rollouts = build_dp_schedule(
@@ -369,30 +407,38 @@ def split_train_data_by_dp_scheduled_raw(
 
 def split_train_data_by_dp_raw(args, data: dict[str, Any], *, dp_size: int) -> list[dict[str, Any]]:
     """Split the train data by data parallel size."""
-    total_lengths = [len(t) for t in data["tokens"]]
-    data["total_lengths"] = total_lengths
+    total_lengths = data.get("total_lengths")
+    if total_lengths is None:
+        total_lengths = [len(t) for t in data["tokens"]]
+        data["total_lengths"] = total_lengths
 
+    n = len(total_lengths)
+    g_size = getattr(args, "n_samples_per_prompt", 1)
+    if not isinstance(g_size, int) or g_size < 1:
+        g_size = 1
     if args.balance_data:
-        partitions = get_seqlen_balanced_partitions(total_lengths, dp_size, equal_size=True)
+        partitions: list[Any] = get_seqlen_balanced_partitions(total_lengths, dp_size, equal_size=True)
+    elif g_size > 1 and n >= dp_size * g_size and n % g_size == 0:
+        num_groups = n // g_size
+        partitions = [
+            range(((i * num_groups) // dp_size) * g_size, (((i + 1) * num_groups) // dp_size) * g_size)
+            for i in range(dp_size)
+        ]
     else:
-        partitions = [range(i, len(total_lengths), dp_size) for i in range(dp_size)]
+        partitions = [range((i * n) // dp_size, ((i + 1) * n) // dp_size) for i in range(dp_size)]
 
     # Multi-LoRA: sort partitions by adapter slot so each microbatch is
     # contiguous-by-slot (required by the per-adapter token-count math).
     adapter_slots = data.get("adapter_slots")
     if adapter_slots is not None:
-        partitions = [sorted(p, key=lambda i: adapter_slots[i]) for p in partitions]
+        slots = adapter_slots
+        partitions = [sorted(p, key=lambda i: slots[i]) for p in partitions]
 
     return _package_shards(args, data, partitions)
 
 
 def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, Any]]:
     """Package one rollout_data shard per DP rank from precomputed partitions."""
-    dp_size = len(partitions)
-    is_strided = all(
-        isinstance(p, range) and p.start == i and p.step == dp_size
-        for i, p in enumerate(partitions)
-    )
     shards = []
     slice_keys = [
         "tokens",
@@ -427,11 +473,11 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
         k for k in ("dynamic_global_batch_size", "prompt_group_sizes", "loss_fn", "loss_fn_config")
         if k in data
     ]
-    for i, partition in enumerate(partitions):
-        rollout_data = {"partition": None}
-        if is_strided:
+    for partition in partitions:
+        rollout_data: dict[str, Any] = {"partition": None}
+        if isinstance(partition, range):
             for key in present_keys:
-                rollout_data[key] = data[key][i::dp_size]
+                rollout_data[key] = data[key][partition.start : partition.stop : partition.step]
         else:
             for key in present_keys:
                 col = data[key]
@@ -451,7 +497,7 @@ def process_rollout_data_shard(args, rollout_data):
     total_lengths = rollout_data["total_lengths"]
 
     # save the seqlen of the whole rollout batch
-    Timer().seq_lens = total_lengths
+    cast(Any, Timer()).seq_lens = total_lengths
     if partition is not None:
         rollout_data["total_lengths"] = [total_lengths[i] for i in partition]
 

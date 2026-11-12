@@ -66,6 +66,7 @@ def build_multinode_recipe(run_id: str, pairs: int, num_rollout: int) -> ScriptA
         rollout_num_gpus=ROLLOUT_GPUS_PER_PAIR * pairs,
         rollout_num_gpus_per_engine=1,
         sglang_dp_size=1,
+        micro_batch_size=10 * SAMPLES_PER_PROMPT,
         max_tokens_per_gpu=262144,
         sglang_mem_fraction_static=mem_fraction,
         sglang_server_concurrency=_SGLANG_CONCURRENCY_PER_PAIR * pairs,
@@ -80,7 +81,7 @@ def build_multinode_recipe(run_id: str, pairs: int, num_rollout: int) -> ScriptA
 
 def build_multinode_train_args(
     args: ScriptArgs, *, addresses: list[str], bundle: Path, prompt: Path,
-    reward_url: str, checkpoint_dir: Path, resume: bool,
+    checkpoint_dir: Path, resume: bool,
 ) -> list[str]:
     blocks = [
         [
@@ -92,10 +93,10 @@ def build_multinode_train_args(
             "examples.experimental.generative_retriever.index.data_source.GRRolloutDataSource",
             "--custom-weight-sync-function-path",
             "examples.experimental.generative_retriever.index.data_source.sync_mapping_on_weight_update",
-            "--weight-sync-include-prefixes", "docEnc2decoder.", "decoder.", "lm_head.",
+            "--weight-sync-include-prefixes",
+            "encoder_list.0.model.encoder.model.", "docEnc2decoder.", "decoder.", "lm_head.",
             "--update-weight-buffer-size", "536870912",
-            "--use-dynamic-batch-size",
-            "--max-tokens-per-gpu", str(args.max_tokens_per_gpu),
+            "--micro-batch-size", str(args.micro_batch_size),
         ],
         [
             "--prompt-data", str(prompt),
@@ -106,13 +107,9 @@ def build_multinode_train_args(
             "--custom-rm-path", "examples.experimental.generative_retriever.reward.reward.reward",
             "--custom-rollout-log-function-path",
             "examples.experimental.generative_retriever.reward.rollout_metrics.log_rollout",
-            "--generative-retriever-reward-url", reward_url + "/score",
-            "--generative-retriever-reward-prepare-url", reward_url + "/prepare",
+            "--custom-convert-samples-to-train-data-path",
+            "examples.experimental.generative_retriever.reward.rollout_metrics.convert_gr_samples_to_train_data",
             "--generative-retriever-reward-mode", args.reward_mode,
-            "--generative-retriever-reward-timeout", str(args.reward_timeout),
-            "--generative-retriever-reward-batch-size", str(args.reward_batch_size),
-            "--generative-retriever-reward-concurrency", str(args.reward_request_concurrency),
-            "--generative-retriever-prepare-concurrency", str(args.prepare_concurrency),
             "--num-rollout", str(args.num_rollout),
             "--rollout-batch-size", str(args.rollout_batch_size),
             "--rollout-max-in-flight-groups", str(args.rollout_max_in_flight_groups),
@@ -146,7 +143,7 @@ def build_multinode_train_args(
 
 def build_multinode_runtime_env(
     *, checkpoint: str, qwen: str, slm_root: str, mapping: str,
-    addresses: list[str],
+    relevance_model: str, reward_mode: str, addresses: list[str],
 ) -> dict[str, str]:
     inherited = (
         "ROCM_HOME", "ROCM_PATH", "PATH", "LD_LIBRARY_PATH", "LIBRARY_PATH",
@@ -165,6 +162,8 @@ def build_multinode_runtime_env(
         "GR_QWEN_MODEL": qwen,
         "GR_SLM_ROOT": slm_root,
         "GR_ID_MAPPING": mapping,
+        "GR_RELEVANCE_MODEL": relevance_model,
+        "GR_REWARD_MODE": reward_mode,
         "SGLANG_EXTERNAL_MODEL_PACKAGE":
             "examples.experimental.generative_retriever.sglang_models",
         "SGLANG_USE_AITER": "0",

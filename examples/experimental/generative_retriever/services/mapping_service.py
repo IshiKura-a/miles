@@ -116,10 +116,11 @@ class SaveMappingRequest(BaseModel):
 
 
 class ResidentMapping:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, read_only: bool = False) -> None:
         if not is_columnar_index_dir(path):
             raise ValueError(f"Mapping path must be a columnar index directory: {path}")
         self.path = path
+        self.read_only = read_only
         self.version = (
             symlink_target(path / "keywords.parquet").parent.name
             if path.name == "mapping" and (path / "keywords.parquet").is_symlink()
@@ -129,8 +130,9 @@ class ResidentMapping:
         self._owner: str | None = None
         self._active_requests = 0
         self._overlay_kw_ids: dict[int, tuple[int, ...]] = {}
+        self._docid_kw_cache: dict[int, list[str]] = {}
         self._text_to_kid: dict[str, int] = {}
-        self._decoded_kws: list[str | None] = []
+        self._decoded_kws: dict[int, str] = {}
         self._kw_array: Any = None
         self._in_na_array: np.ndarray = np.empty(0, dtype=np.bool_)
         self._markets_array: Any = None
@@ -144,31 +146,43 @@ class ResidentMapping:
         logger.info("Loading columnar index into memory: %s", directory)
         kw_path = directory / "keywords.parquet"
         pairs_path = directory / "docid_keywords.parquet"
-        kw_table = pq.read_table(kw_path, columns=["keyword_id", "keyword", "in_na", "markets"])
-        self._kw_array = kw_table.column("keyword").combine_chunks()
-        n_kw = len(self._kw_array)
-        self._decoded_kws = [None] * n_kw
-        if n_kw > 0:
-            kid_col = kw_table.column("keyword_id")
-            if int(kid_col[0].as_py()) != 0 or int(kid_col[n_kw - 1].as_py()) != n_kw - 1:
-                raise ValueError("keywords.parquet keyword_id column must be contiguous 0..N-1")
-        self._in_na_array = kw_table.column("in_na").to_numpy(zero_copy_only=False)
-        self._markets_array = kw_table.column("markets").combine_chunks()
+        if self.read_only:
+            ipc_path = directory / "keywords_only.arrow"
+            if ipc_path.is_file():
+                mmap = pa.memory_map(str(ipc_path), "r")
+                kw_table = pa.ipc.open_file(mmap).read_all()
+            else:
+                kw_table = pq.read_table(kw_path, columns=["keyword"], memory_map=True)
+            self._kw_array = kw_table.column("keyword")
+            n_kw = len(self._kw_array)
+        else:
+            kw_table = pq.read_table(
+                kw_path, columns=["keyword_id", "keyword", "in_na", "markets"], memory_map=True,
+            )
+            self._kw_array = kw_table.column("keyword").combine_chunks()
+            n_kw = len(self._kw_array)
+            if n_kw > 0:
+                kid_col = kw_table.column("keyword_id")
+                if int(kid_col[0].as_py()) != 0 or int(kid_col[n_kw - 1].as_py()) != n_kw - 1:
+                    raise ValueError("keywords.parquet keyword_id column must be contiguous 0..N-1")
+            self._in_na_array = kw_table.column("in_na").to_numpy(zero_copy_only=False)
+            self._markets_array = kw_table.column("markets").combine_chunks()
 
         u_path = directory / "docid_unique.u32.npy"
         off_path = directory / "docid_offsets.i64.npy"
         kid_path = directory / "docid_kw_ids.u32.npy"
-        self._unique_docids_u32 = np.load(u_path)
-        self._csr_offsets = np.load(off_path)
-        self._csr_kw_ids = np.load(kid_path)
+        self._unique_docids_u32 = np.load(u_path, mmap_mode="r")
+        self._csr_offsets = np.load(off_path, mmap_mode="r")
+        self._csr_kw_ids = np.load(kid_path, mmap_mode="r")
 
         self.rows = int(len(self._csr_kw_ids))
-        self._kw_degree = np.bincount(self._csr_kw_ids, minlength=n_kw).astype(np.int32)
+        if not self.read_only:
+            self._kw_degree = np.bincount(self._csr_kw_ids, minlength=n_kw).astype(np.int32)
         self.byte_count = int(kw_path.stat().st_size + pairs_path.stat().st_size)
         logger.info(
             "Columnar mapping ready: %d IDs, %d keywords, %d pairs",
             len(self._unique_docids_u32),
-            len(self._kw_array),
+            n_kw,
             self.rows,
         )
 
@@ -206,13 +220,14 @@ class ResidentMapping:
         return tuple(int(k) for k in self._csr_kw_ids[start:end])
 
     def _decode_kid(self, kid: int) -> str:
-        cached = self._decoded_kws[kid]
+        cached = self._decoded_kws.get(kid)
         if cached is not None:
             return cached
         raw_bytes: bytes = self._kw_array[kid].as_py()
         text = raw_bytes.decode("utf-8")
         self._decoded_kws[kid] = text
-        self._text_to_kid[text] = kid
+        if not self.read_only:
+            self._text_to_kid[text] = kid
         return text
 
     @contextmanager
@@ -237,6 +252,43 @@ class ResidentMapping:
             for kid in current - previous:
                 self._kw_degree[kid] += 1
         self._overlay_kw_ids = overlay
+        self._docid_kw_cache.clear()
+
+    def lookup_u32(
+        self,
+        packed_u32: np.ndarray,
+        *,
+        use_initial: bool = False,
+    ) -> dict[int, list[str]]:
+        """Fast vectorized lookup from packed uint32 docids to deduplicated keyword lists."""
+        u32_list: list[int] = packed_u32.tolist()
+        out: dict[int, list[str]] = {}
+        overlay_map = None if use_initial else self._overlay_kw_ids
+        cache = self._docid_kw_cache
+        missing_u32: list[int] = []
+        for u32_int in u32_list:
+            if overlay_map and u32_int in overlay_map:
+                out[u32_int] = list(dict.fromkeys(self._decode_kid(int(k)) for k in overlay_map[u32_int]))
+            else:
+                cached = cache.get(u32_int)
+                if cached is not None:
+                    out[u32_int] = cached
+                else:
+                    missing_u32.append(u32_int)
+        if missing_u32:
+            missing_arr = np.asarray(missing_u32, dtype=np.uint32)
+            positions = np.searchsorted(self._unique_docids_u32, missing_arr)
+            n_unique = len(self._unique_docids_u32)
+            for u32_int, pos in zip(missing_u32, positions.tolist(), strict=True):
+                idx = int(pos)
+                if idx >= n_unique or int(self._unique_docids_u32[idx]) != u32_int:
+                    raise LookupError(f"Official mapping packed u32 ID not found: {u32_int}")
+                start = int(self._csr_offsets[idx])
+                end = int(self._csr_offsets[idx + 1])
+                kws = list(dict.fromkeys(self._decode_kid(int(k)) for k in self._csr_kw_ids[start:end]))
+                cache[u32_int] = kws
+                out[u32_int] = kws
+        return out
 
     def claim(self, owner: str, checkpoint: str | None) -> None:
         overlay: dict[int, tuple[int, ...]] = {}
@@ -373,6 +425,8 @@ class ResidentMapping:
                 if changed:
                     self._overlay_kw_ids[u32] = tuple(kid_list)
                     updated_u32.add(u32)
+            for u32 in updated_u32:
+                self._docid_kw_cache.pop(u32, None)
             return {
                 "updated_docids": len(updated_u32),
                 "added_edges": added_edges,

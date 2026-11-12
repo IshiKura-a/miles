@@ -62,16 +62,17 @@ class ScriptArgs(U.ExecuteTrainConfig):
     )
     reward_mode: RewardMode = "discrete_relevance_unique"
     num_gpus_per_node: int = 8
-    actor_num_gpus_per_node: int = 2
-    rollout_num_gpus: int = 2
-    rollout_num_gpus_per_engine: int = 2
-    sglang_dp_size: int = 2
+    actor_num_gpus_per_node: int = 8
+    rollout_num_gpus: int = 8
+    rollout_num_gpus_per_engine: int = 1
+    sglang_dp_size: int = 1
     sglang_mem_fraction_static: float = 0.0
     sglang_server_concurrency: int = 8192
     rollout_batch_size: int = _QUERIES_PER_STEP
     rollout_max_in_flight_groups: int = _IN_FLIGHT_GROUPS
     n_samples_per_prompt: int = DEFAULT_TRAIN_GROUP_SIZE
     global_batch_size: int = _GLOBAL_BATCH_SIZE
+    micro_batch_size: int = 10 * DEFAULT_TRAIN_GROUP_SIZE
     max_tokens_per_gpu: int = 131072
     reward_timeout: float = 1800.0
     reward_batch_size: int = DEFAULT_REWARD_BATCH_SIZE

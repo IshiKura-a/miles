@@ -6,9 +6,13 @@ from examples.experimental.generative_retriever.utils.paths import absolute_path
 
 from collections.abc import Callable
 from functools import lru_cache
+from pathlib import Path
+import shutil
+import tempfile
 from threading import Lock
 from typing import Any, cast
 
+from filelock import FileLock
 import numpy as np
 import torch
 from torch import nn
@@ -205,9 +209,6 @@ class SortedU32Constraint:
 
 @lru_cache(maxsize=1)
 def load_constraint(mapping_path: str, code_num: int, code_dim: int) -> PrefixConstraint:
-    import shutil, tempfile
-    from pathlib import Path
-    from filelock import FileLock
     mapping = absolute_path(mapping_path)
     if code_num != 4 or code_dim != 256:
         raise ValueError("Columnar u32 docid index requires code_num=4 and code_dim=256")
