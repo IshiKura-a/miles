@@ -31,7 +31,7 @@ from examples.experimental.generative_retriever.index.id_text_mapping import (
     pack_docid_u32,
     validate_docid,
 )
-from examples.experimental.generative_retriever.reward.relevance_reward import DOCID_MAX_KEYWORDS
+from examples.experimental.generative_retriever.reward.relevance_reward import DOC2K_PRUNE_FLOOR, DOCID_MAX_KEYWORDS
 
 logger = logging.getLogger(__name__)
 MAPPING_SERVICE_API_VERSION = 3
@@ -356,6 +356,123 @@ class ResidentMapping:
             results.append(KeywordResult(docid=docid, keywords=texts, status="ok"))
         return LookupResponse(mapping_version=self.version, results=results)
 
+    def lookup_u32_with_kids(
+        self,
+        packed_u32: np.ndarray,
+    ) -> tuple[dict[int, list[str]], dict[int, tuple[int, ...]]]:
+        u32_list: list[int] = packed_u32.tolist()
+        out_kws: dict[int, list[str]] = {}
+        out_kids: dict[int, tuple[int, ...]] = {}
+        overlay_map = self._overlay_kw_ids
+        cache = self._docid_kw_cache
+        missing_u32: list[int] = []
+        for u32_int in u32_list:
+            ov = overlay_map.get(u32_int)
+            if ov is not None:
+                out_kids[u32_int] = ov
+                cached = cache.get(u32_int)
+                if cached is not None:
+                    out_kws[u32_int] = cached
+                else:
+                    kws = list(dict.fromkeys(self._decode_kid(int(k)) for k in ov))
+                    cache[u32_int] = kws
+                    out_kws[u32_int] = kws
+            else:
+                missing_u32.append(u32_int)
+        if missing_u32:
+            missing_arr = np.asarray(missing_u32, dtype=np.uint32)
+            positions = np.searchsorted(self._unique_docids_u32, missing_arr)
+            n_unique = len(self._unique_docids_u32)
+            for u32_int, pos in zip(missing_u32, positions.tolist(), strict=True):
+                idx = int(pos)
+                if idx >= n_unique or int(self._unique_docids_u32[idx]) != u32_int:
+                    raise LookupError(f"Official mapping packed u32 ID not found: {u32_int}")
+                start = int(self._csr_offsets[idx])
+                end = int(self._csr_offsets[idx + 1])
+                raw_kids = tuple(int(k) for k in self._csr_kw_ids[start:end])
+                out_kids[u32_int] = raw_kids
+                cached = cache.get(u32_int)
+                if cached is not None:
+                    out_kws[u32_int] = cached
+                else:
+                    kws = list(dict.fromkeys(self._decode_kid(k) for k in raw_kids))
+                    cache[u32_int] = kws
+                    out_kws[u32_int] = kws
+        return out_kws, out_kids
+
+    def resolve_kid_in_docid(self, u32: int, keyword: str) -> int | None:
+        kids = self._overlay_kw_ids.get(u32)
+        if kids is None:
+            kids = self._base_kw_ids_one(u32)
+            if not kids:
+                return None
+        for raw_kid in kids:
+            kid = int(raw_kid)
+            if self._decode_kid(kid) == keyword:
+                return kid
+        return None
+
+    def apply_u32_kid_delta(
+        self,
+        additions: dict[int, list[int]],
+        removals: dict[int, set[int]],
+        *,
+        k_max: int = DOCID_MAX_KEYWORDS,
+    ) -> dict[str, int]:
+        updated_u32: set[int] = set()
+        added_edges = 0
+        removed_edges = 0
+        for u32, rem_kids in removals.items():
+            if not rem_kids:
+                continue
+            current_kids = self._overlay_kw_ids.get(u32)
+            if current_kids is None:
+                current_kids = self._base_kw_ids_one(u32)
+                if not current_kids:
+                    continue
+            if len(current_kids) <= DOC2K_PRUNE_FLOOR:
+                continue
+            filtered_list: list[int] = []
+            for idx_k, kid in enumerate(current_kids):
+                remaining_slots = len(current_kids) - idx_k
+                if (len(filtered_list) + remaining_slots) > DOC2K_PRUNE_FLOOR and kid in rem_kids:
+                    removed_edges += 1
+                else:
+                    filtered_list.append(kid)
+            if len(filtered_list) < len(current_kids):
+                self._overlay_kw_ids[u32] = tuple(filtered_list)
+                updated_u32.add(u32)
+        for u32, add_kids in additions.items():
+            if not add_kids:
+                continue
+            current_kids = self._overlay_kw_ids.get(u32)
+            if current_kids is None:
+                current_kids = self._base_kw_ids_one(u32)
+                if not current_kids:
+                    continue
+            kid_list = list(current_kids)
+            existing_kids = set(kid_list)
+            changed = False
+            for kid in add_kids:
+                if len(kid_list) >= k_max:
+                    break
+                if kid not in existing_kids:
+                    kid_list.append(kid)
+                    existing_kids.add(kid)
+                    added_edges += 1
+                    changed = True
+            if changed:
+                self._overlay_kw_ids[u32] = tuple(kid_list)
+                updated_u32.add(u32)
+        for u32 in updated_u32:
+            self._docid_kw_cache.pop(u32, None)
+        return {
+            "updated_docids": len(updated_u32),
+            "added_edges": added_edges,
+            "removed_edges": removed_edges,
+            "overlay_docids": len(self._overlay_kw_ids),
+        }
+
     def apply_delta(self, request: DeltaMappingRequest) -> dict[str, int]:
         def ids(entries: list[DocidKeywordTextPair]) -> list[DocidKeywordPair]:
             with self._lock:
@@ -385,18 +502,20 @@ class ResidentMapping:
                     if not current_kids:
                         continue
                 remove_kids = set(item.keyword_ids)
-                if not remove_kids or len(current_kids) <= 1:
+                if not remove_kids or len(current_kids) <= DOC2K_PRUNE_FLOOR:
                     continue
                 filtered_list: list[int] = []
+                has_deg = len(self._kw_degree) > 0
                 for idx_k, kid in enumerate(current_kids):
                     remaining_slots = len(current_kids) - idx_k
-                    can_remove = (len(filtered_list) + remaining_slots) > 1
+                    can_remove = (len(filtered_list) + remaining_slots) > DOC2K_PRUNE_FLOOR
                     if (
                         can_remove
                         and kid in remove_kids
-                        and int(self._kw_degree[kid]) > 1
+                        and (not has_deg or int(self._kw_degree[kid]) > 1)
                     ):
-                        self._kw_degree[kid] -= 1
+                        if has_deg:
+                            self._kw_degree[kid] -= 1
                         removed_edges += 1
                     else:
                         filtered_list.append(kid)
@@ -419,7 +538,8 @@ class ResidentMapping:
                     if kid not in existing_kids:
                         kid_list.append(kid)
                         existing_kids.add(kid)
-                        self._kw_degree[kid] += 1
+                        if len(self._kw_degree) > 0:
+                            self._kw_degree[kid] += 1
                         added_edges += 1
                         changed = True
                 if changed:

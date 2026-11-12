@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import pickle
+import tempfile
 from typing import Any
 
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 from transformers import T5Config, T5ForConditionalGeneration
@@ -19,6 +22,9 @@ from examples.experimental.generative_retriever.model.constrained_decode import 
 )
 from examples.experimental.generative_retriever.reward.relevance_reward import (
     DEFAULT_TRAIN_GROUP_SIZE,
+    DOC2K_ADD_MIN_QUERIES,
+    DOC2K_PRUNE_FLOOR,
+    DOC2K_PRUNE_MIN_QUERIES,
 )
 
 from examples.experimental.generative_retriever.model.model_loading import (
@@ -58,6 +64,10 @@ class GRStage5Policy(nn.Module):
         self.code_num: int = source.docid_size
         self.constraint = constraint
         self._prefix_allowed_cache: dict[tuple[int, ...], tuple[torch.Tensor, set[int]]] = {}
+        self._global_cand_votes: dict[tuple[int, int], int] = {}
+        self._global_docid_q_count: dict[int, int] = {}
+        self._global_docid_kids: dict[int, tuple[int, ...]] = {}
+        self._global_edge_passes: dict[tuple[int, int], int] = {}
 
         self.encoder_list: Any = source.encoder_list
         self.docEnc2decoder: Any = source.docEnc2decoder
@@ -86,6 +96,96 @@ class GRStage5Policy(nn.Module):
         if backbone is None:
             raise TypeError("GR Qwen encoder must expose its backbone as .model")
         return backbone
+
+    def _sync_global_doc2k_votes(self) -> None:
+        if not dist.is_initialized():
+            return
+        local_gpu = int(torch.cuda.current_device()) if torch.cuda.is_available() else (dist.get_rank() % 8)
+        local_path = Path(tempfile.gettempdir()) / f"gr_doc2k_local_gpu{local_gpu}.pkl"
+        local_payload: dict[str, Any] | None = None
+        if local_path.is_file():
+            try:
+                local_payload = pickle.loads(local_path.read_bytes())
+            finally:
+                local_path.unlink(missing_ok=True)
+        world_size = dist.get_world_size()
+        gathered: list[dict[str, Any] | None] = [None] * world_size
+        dist.all_gather_object(gathered, local_payload)
+        if not any(item is not None for item in gathered):
+            return
+
+        cand_votes = self._global_cand_votes
+        docid_q_count = self._global_docid_q_count
+        docid_kids = self._global_docid_kids
+        edge_passes = self._global_edge_passes
+
+        for item in gathered:
+            if item is None:
+                continue
+            for ckey, cnt in item["cand_votes"].items():
+                cand_votes[ckey] = cand_votes.get(ckey, 0) + int(cnt)
+            for u32, qcnt in item["docid_q_count"].items():
+                docid_q_count[u32] = docid_q_count.get(u32, 0) + int(qcnt)
+            for u32, kids_tup in item["docid_kids"].items():
+                docid_kids[u32] = kids_tup
+            for ekey, pcnt in item["edge_passes"].items():
+                edge_passes[ekey] = edge_passes.get(ekey, 0) + int(pcnt)
+
+        additions: dict[int, list[int]] = {}
+        promoted_ckeys: list[tuple[int, int]] = []
+        for ckey, total_votes in sorted(cand_votes.items()):
+            if total_votes >= DOC2K_ADD_MIN_QUERIES:
+                target_u32, kid = ckey
+                bucket_list = additions.setdefault(target_u32, [])
+                if kid not in bucket_list:
+                    bucket_list.append(kid)
+                promoted_ckeys.append(ckey)
+        for ckey in promoted_ckeys:
+            cand_votes.pop(ckey, None)
+
+        removals: dict[int, set[int]] = {}
+        harvested_u32: list[int] = []
+        for u32, total_q in sorted(docid_q_count.items()):
+            if total_q < DOC2K_PRUNE_MIN_QUERIES:
+                continue
+            harvested_u32.append(u32)
+            kids_tup = docid_kids.get(u32, ())
+            if len(kids_tup) <= DOC2K_PRUNE_FLOOR:
+                continue
+            max_rem = max(0, len(kids_tup) - DOC2K_PRUNE_FLOOR)
+            dead_kids: set[int] = set()
+            for kid in kids_tup:
+                if edge_passes.get((u32, kid), 0) == 0:
+                    dead_kids.add(kid)
+                    if len(dead_kids) >= max_rem:
+                        break
+            if dead_kids:
+                removals[u32] = dead_kids
+        for u32 in harvested_u32:
+            docid_q_count.pop(u32, None)
+            kids_tup = docid_kids.pop(u32, ())
+            for kid in kids_tup:
+                edge_passes.pop((u32, kid), None)
+
+        global_path = Path(tempfile.gettempdir()) / f"gr_doc2k_global_gpu{local_gpu}.pkl"
+        if global_path.is_file():
+            prev = pickle.loads(global_path.read_bytes())
+            for u32, kids in prev.get("additions", {}).items():
+                bl = additions.setdefault(u32, [])
+                for k in kids:
+                    if k not in bl:
+                        bl.append(k)
+            for u32, kids in prev.get("removals", {}).items():
+                removals.setdefault(u32, set()).update(kids)
+        tmp_path = global_path.with_suffix(".tmp")
+        tmp_path.write_bytes(
+            pickle.dumps({"additions": additions, "removals": removals}, protocol=pickle.HIGHEST_PROTOCOL)
+        )
+        tmp_path.replace(global_path)
+
+    def state_dict(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        self._sync_global_doc2k_votes()
+        return super().state_dict(*args, **kwargs)
 
     def gradient_checkpointing_enable(self, **kwargs: Any) -> None:
         del kwargs

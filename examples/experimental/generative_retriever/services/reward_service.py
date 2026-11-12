@@ -48,6 +48,7 @@ from examples.experimental.generative_retriever.reward.relevance_reward import (
     DOC2K_MAX_ADDS_PER_QUERY,
     DOC2K_MIN_GROUP_SAMPLES,
     DOC2K_MIN_HEAD_RANKS,
+    DOC2K_PRUNE_FLOOR,
     DOC2K_PRUNE_MIN_QUERIES,
     DOCID_REWARD_FLOOR,
     DOCID_TOKEN_OFFSET,
@@ -558,7 +559,7 @@ class KeywordRewardEngine:
                 passed_kws = [
                     kw
                     for kw, res in breakdown.items()
-                    if res.pm_pass >= 1.0 and res.sm_pass >= 1.0
+                    if res.pm_pass >= 1.0 or res.sm_pass >= 1.0
                 ]
                 uniq_good_kws = [
                     kw
@@ -581,7 +582,7 @@ class KeywordRewardEngine:
                 )
                 inline_kws = None
             sample_unique_good.append(uniq_good_kws)
-            if len(keywords) > 1:
+            if len(keywords) > DOC2K_PRUNE_FLOOR:
                 local_docid_queries.setdefault(docid, set()).add(sample.prompt)
                 local_docid_keywords[docid] = keywords
                 for kw in passed_kws:
@@ -620,31 +621,33 @@ class KeywordRewardEngine:
             head_keywords = {
                 kw for i in head_indices for kw in sample_keywords[i]
             }
-            default_target = docids[head_indices[0]]
-            for i in head_indices:
-                if len(sample_keywords[i]) < DOCID_REWARD_FLOOR:
-                    default_target = docids[i]
-                    break
+            head_by_size = sorted(head_indices, key=lambda hi: len(sample_keywords[hi]))
             added_for_query = 0
             seen_tail: set[str] = set()
             for i in tail_indices:
                 if added_for_query >= DOC2K_MAX_ADDS_PER_QUERY:
                     break
+                if not sample_unique_good[i]:
+                    continue
                 tail_docid = docids[i]
                 target_docid: tuple[int, int, int, int] | None = None
-                for hi in head_indices:
-                    hd = docids[hi]
-                    if hd[:2] == tail_docid[:2] and len(sample_keywords[hi]) < DOCID_REWARD_FLOOR:
-                        target_docid = hd
-                        break
-                if target_docid is None:
-                    for hi in head_indices:
+                for cap in (DOCID_REWARD_FLOOR, DOC2K_PRUNE_FLOOR):
+                    for hi in head_by_size:
                         hd = docids[hi]
-                        if hd[0] == tail_docid[0] and len(sample_keywords[hi]) < DOCID_REWARD_FLOOR:
+                        if hd[:2] == tail_docid[:2] and len(sample_keywords[hi]) < cap:
                             target_docid = hd
                             break
+                    if target_docid is not None:
+                        break
+                    for hi in head_by_size:
+                        hd = docids[hi]
+                        if hd[0] == tail_docid[0] and len(sample_keywords[hi]) < cap:
+                            target_docid = hd
+                            break
+                    if target_docid is not None:
+                        break
                 if target_docid is None:
-                    target_docid = default_target
+                    continue
                 for kw in sample_unique_good[i]:
                     if kw not in head_keywords and kw not in seen_tail:
                         seen_tail.add(kw)
@@ -727,13 +730,13 @@ class KeywordRewardEngine:
                     continue
                 harvested_docids.append(docid)
                 keywords = self._step_docid_keywords.get(docid, [])
-                if len(keywords) <= 1:
+                if len(keywords) <= DOC2K_PRUNE_FLOOR:
                     continue
                 dead_keywords = [
                     kw for kw in keywords
                     if self._step_edge_passes.get((docid, kw), 0) == 0
                 ]
-                max_removable = max(0, len(keywords) - 1)
+                max_removable = max(0, len(keywords) - DOC2K_PRUNE_FLOOR)
                 if dead_keywords and max_removable > 0:
                     removals.append({
                         "docid": list(docid),

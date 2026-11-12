@@ -26,14 +26,15 @@ DEFAULT_REWARD_BATCH_SIZE = 4096
 REWARD_TOWER_BATCH_SIZE = 8192
 REWARD_PAIR_BATCH_SIZE = 32768
 UNIQUE_WEIGHT = 2.0
-DOCID_REWARD_FLOOR = 25
+DOCID_REWARD_FLOOR = 10
+DOC2K_PRUNE_FLOOR = 32
 DOCID_MAX_KEYWORDS = 150
 DOC2K_MIN_GROUP_SAMPLES = 4
 DOC2K_HEAD_RANK_CUTOFF = 64
 DOC2K_MIN_HEAD_RANKS = 16
 DOC2K_MAX_ADDS_PER_QUERY = 8
-DOC2K_ADD_MIN_QUERIES = 2
-DOC2K_PRUNE_MIN_QUERIES = 5
+DOC2K_ADD_MIN_QUERIES = 10
+DOC2K_PRUNE_MIN_QUERIES = 32
 TREE_CREDIT_TOP_K = (8, 4, 2)
 TREE_CREDIT_LEVEL_WEIGHT = 0.25
 
@@ -279,10 +280,9 @@ def score_and_summarize_docid(
             cnt_any_uniq += 1
         if rel_el:
             cnt_rel_elig += 1
-        if p_ok and s_ok:
             passed_keywords.append(kw)
-            if u_pm and u_sm:
-                unique_good_keywords.append(kw)
+        if p_ok and s_ok and u_pm and u_sm:
+            unique_good_keywords.append(kw)
         if pm_u_el:
             cnt_pm_u_elig += 1
         if sm_u_el:
