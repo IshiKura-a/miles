@@ -313,12 +313,9 @@ def generate_beams_tree(
                         mask_cpu[row_idx, allowed] = True
                 mask_gpu = mask_cpu.to(device=device, non_blocking=True)
             masked_logits = logits.masked_fill(~mask_gpu, float("-inf"))
+            mask_3d = mask_gpu.reshape(batch_size, cur_beams, vocab_size)
             step_log_probs = F.log_softmax(masked_logits, dim=-1).reshape(batch_size, cur_beams, vocab_size)
-            step_log_probs = torch.where(
-                mask_gpu.reshape(batch_size, cur_beams, vocab_size),
-                step_log_probs,
-                torch.full_like(step_log_probs, float("-inf")),
-            )
+            step_log_probs = step_log_probs.masked_fill(~mask_3d, float("-inf"))
             cand_cum_3d = cum_scores.unsqueeze(-1) + step_log_probs
             cand_cum = cand_cum_3d.reshape(batch_size, cur_beams * vocab_size)
             valid_counts = (cand_cum > float("-inf")).sum(dim=-1)
@@ -328,14 +325,14 @@ def generate_beams_tree(
                 raise RuntimeError(f"Constrained beam tree has no valid continuations at step {step}")
             if do_sample:
                 scaled_3d = cand_cum_3d / temperature if temperature != 1.0 else cand_cum_3d
-                gumbel_3d = -torch.empty_like(scaled_3d).exponential_().log()
-                raw_g = torch.where(torch.isfinite(scaled_3d), scaled_3d + gumbel_3d, scaled_3d)
+                gumbel_3d = -torch.empty_like(scaled_3d).exponential_().clamp_min_(1e-38).log()
+                raw_g = torch.where(mask_3d, scaled_3d + gumbel_3d, float("-inf"))
                 if step > 0:
                     max_g = raw_g.max(dim=-1, keepdim=True).values
-                    delta = raw_g - max_g
-                    shifted = -raw_g + torch.log(-torch.expm1(delta).clamp_min(1e-38))
+                    delta = torch.where(mask_3d, raw_g - max_g, float("-inf"))
+                    shifted = torch.where(mask_3d, -raw_g + torch.log(-torch.expm1(delta)), float("inf"))
                     cond_g = -torch.logaddexp(-beam_gumbels.unsqueeze(-1).expand_as(raw_g), shifted)
-                    cond_g = torch.where(torch.isfinite(raw_g) & torch.isfinite(max_g), cond_g, raw_g)
+                    cond_g = torch.where(mask_3d & torch.isfinite(max_g), cond_g, float("-inf"))
                 else:
                     cond_g = raw_g
                 flat_g = cond_g.reshape(batch_size, cur_beams * vocab_size)
