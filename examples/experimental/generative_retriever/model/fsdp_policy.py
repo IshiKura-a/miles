@@ -10,6 +10,7 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from miles.utils.distributed_utils import get_gloo_group
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 from transformers import T5Config, T5ForConditionalGeneration
@@ -103,7 +104,11 @@ class GRStage5Policy(nn.Module):
     def _sync_global_doc2k_votes(self) -> None:
         if not dist.is_initialized():
             return
-        local_gpu = dist.get_rank() % 8
+        gloo_group = get_gloo_group()
+        rank = dist.get_rank()
+        local_gpu = rank % 8
+        if rank == 0:
+            self._ensure_doc2k_sync_mapping()
         local_path = Path(tempfile.gettempdir()) / f"gr_doc2k_local_gpu{local_gpu}.pkl"
         local_payload: dict[str, Any] | None = None
         if local_path.is_file():
@@ -112,64 +117,80 @@ class GRStage5Policy(nn.Module):
             finally:
                 local_path.unlink(missing_ok=True)
         world_size = dist.get_world_size()
-        gathered: list[dict[str, Any] | None] = [None] * world_size
-        dist.all_gather_object(gathered, local_payload)
-        if not any(item is not None for item in gathered):
+        gathered: list[dict[str, Any] | None] | None = [None] * world_size if rank == 0 else None
+        dist.gather_object(local_payload, gathered, dst=0, group=gloo_group)
+
+        delta_box: list[dict[str, Any] | None] = [None]
+        if rank == 0 and gathered is not None and any(item is not None for item in gathered):
+            cand_votes = self._global_cand_votes
+            docid_q_count = self._global_docid_q_count
+            edge_passes = self._global_edge_passes
+            sync_map = self._ensure_doc2k_sync_mapping()
+
+            for item in gathered:
+                if item is None:
+                    continue
+                for ckey, cnt in item["cand_votes"].items():
+                    cand_votes[ckey] = cand_votes.get(ckey, 0) + int(cnt)
+                for u32, qcnt in item["docid_q_count"].items():
+                    docid_q_count[u32] = docid_q_count.get(u32, 0) + int(qcnt)
+                for ekey, pcnt in item["edge_passes"].items():
+                    edge_passes[ekey] = edge_passes.get(ekey, 0) + int(pcnt)
+
+            additions: dict[int, list[int]] = {}
+            promoted_ckeys: list[tuple[int, int]] = []
+            for ckey, total_votes in sorted(cand_votes.items()):
+                if total_votes >= DOC2K_ADD_MIN_QUERIES:
+                    target_u32, kid = ckey
+                    bucket_list = additions.setdefault(target_u32, [])
+                    if kid not in bucket_list:
+                        bucket_list.append(kid)
+                    promoted_ckeys.append(ckey)
+            for ckey in promoted_ckeys:
+                cand_votes.pop(ckey, None)
+
+            removals: dict[int, set[int]] = {}
+            harvested_u32: list[tuple[int, tuple[int, ...]]] = []
+            for u32, total_q in sorted(docid_q_count.items()):
+                if total_q < DOC2K_PRUNE_MIN_QUERIES:
+                    continue
+                kids_tup: tuple[int, ...] = ()
+                if sync_map is not None:
+                    ov_kids = sync_map._overlay_kw_ids.get(u32)
+                    if ov_kids is not None:
+                        kids_tup = ov_kids
+                    else:
+                        base_kids = sync_map._base_kw_ids_one(u32)
+                        if base_kids is not None:
+                            kids_tup = tuple(dict.fromkeys(base_kids))
+                harvested_u32.append((u32, kids_tup))
+                if len(kids_tup) <= DOC2K_PRUNE_FLOOR:
+                    continue
+                max_rem = max(0, len(kids_tup) - DOC2K_PRUNE_FLOOR)
+                dead_kids: set[int] = set()
+                for kid in kids_tup:
+                    if edge_passes.get((u32, kid), 0) == 0:
+                        dead_kids.add(kid)
+                        if len(dead_kids) >= max_rem:
+                            break
+                if dead_kids:
+                    removals[u32] = dead_kids
+            for u32, kids_tup in harvested_u32:
+                docid_q_count.pop(u32, None)
+                for kid in kids_tup:
+                    edge_passes.pop((u32, kid), None)
+
+            if sync_map is not None:
+                sync_map.apply_u32_kid_delta(additions, removals)
+            delta_box[0] = {"additions": additions, "removals": removals}
+
+        dist.broadcast_object_list(delta_box, src=0, group=gloo_group)
+        delta = delta_box[0]
+        if delta is None:
             return
 
-        cand_votes = self._global_cand_votes
-        docid_q_count = self._global_docid_q_count
-        docid_kids = self._global_docid_kids
-        edge_passes = self._global_edge_passes
-
-        for item in gathered:
-            if item is None:
-                continue
-            for ckey, cnt in item["cand_votes"].items():
-                cand_votes[ckey] = cand_votes.get(ckey, 0) + int(cnt)
-            for u32, qcnt in item["docid_q_count"].items():
-                docid_q_count[u32] = docid_q_count.get(u32, 0) + int(qcnt)
-            for u32, kids_tup in item["docid_kids"].items():
-                docid_kids[u32] = kids_tup
-            for ekey, pcnt in item["edge_passes"].items():
-                edge_passes[ekey] = edge_passes.get(ekey, 0) + int(pcnt)
-
-        additions: dict[int, list[int]] = {}
-        promoted_ckeys: list[tuple[int, int]] = []
-        for ckey, total_votes in sorted(cand_votes.items()):
-            if total_votes >= DOC2K_ADD_MIN_QUERIES:
-                target_u32, kid = ckey
-                bucket_list = additions.setdefault(target_u32, [])
-                if kid not in bucket_list:
-                    bucket_list.append(kid)
-                promoted_ckeys.append(ckey)
-        for ckey in promoted_ckeys:
-            cand_votes.pop(ckey, None)
-
-        removals: dict[int, set[int]] = {}
-        harvested_u32: list[int] = []
-        for u32, total_q in sorted(docid_q_count.items()):
-            if total_q < DOC2K_PRUNE_MIN_QUERIES:
-                continue
-            harvested_u32.append(u32)
-            kids_tup = docid_kids.get(u32, ())
-            if len(kids_tup) <= DOC2K_PRUNE_FLOOR:
-                continue
-            max_rem = max(0, len(kids_tup) - DOC2K_PRUNE_FLOOR)
-            dead_kids: set[int] = set()
-            for kid in kids_tup:
-                if edge_passes.get((u32, kid), 0) == 0:
-                    dead_kids.add(kid)
-                    if len(dead_kids) >= max_rem:
-                        break
-            if dead_kids:
-                removals[u32] = dead_kids
-        for u32 in harvested_u32:
-            docid_q_count.pop(u32, None)
-            kids_tup = docid_kids.pop(u32, ())
-            for kid in kids_tup:
-                edge_passes.pop((u32, kid), None)
-
+        additions = delta["additions"]
+        removals = delta["removals"]
         global_path = Path(tempfile.gettempdir()) / f"gr_doc2k_global_gpu{local_gpu}.pkl"
         if global_path.is_file():
             prev = pickle.loads(global_path.read_bytes())
@@ -180,10 +201,6 @@ class GRStage5Policy(nn.Module):
                         bl.append(k)
             for u32, kids in prev.get("removals", {}).items():
                 removals.setdefault(u32, set()).update(kids)
-        if dist.get_rank() == 0:
-            sync_map = self._ensure_doc2k_sync_mapping()
-            if sync_map is not None:
-                sync_map.apply_u32_kid_delta(additions, removals)
 
         tmp_path = global_path.with_suffix(".tmp")
         tmp_path.write_bytes(
@@ -203,14 +220,24 @@ class GRStage5Policy(nn.Module):
         object.__setattr__(self, "_doc2k_sync_mapping", sync_map)
         return sync_map
 
-    def save_doc2k_mapping(self, output_dir: str | Path) -> None:
+    def save_doc2k_mapping(
+        self,
+        output_dir: str | Path,
+        *,
+        stage_dir: str | Path | None = None,
+        async_transfer: bool = True,
+    ) -> None:
         self._sync_global_doc2k_votes()
         if not dist.is_initialized() or dist.get_rank() == 0:
             sync_map = self._ensure_doc2k_sync_mapping()
             if sync_map is not None:
-                sync_map.save_docid_mappings(output_dir)
+                sync_map.save_docid_mappings(
+                    output_dir,
+                    stage_dir=stage_dir,
+                    async_transfer=async_transfer,
+                )
         if dist.is_initialized():
-            dist.barrier()
+            dist.barrier(group=get_gloo_group())
 
     def state_dict(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         self._sync_global_doc2k_votes()
@@ -218,7 +245,7 @@ class GRStage5Policy(nn.Module):
 
     def gradient_checkpointing_enable(self, **kwargs: Any) -> None:
         del kwargs
-        self.decoder.gradient_checkpointing = True
+        self.decoder.gradient_checkpointing = False
 
     def _encode_prompts(
         self,

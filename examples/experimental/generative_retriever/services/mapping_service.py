@@ -7,6 +7,9 @@ Run:
 
 from __future__ import annotations
 
+import atexit
+import threading
+
 from examples.experimental.generative_retriever.utils.paths import absolute_path, symlink_target
 
 import argparse
@@ -140,6 +143,9 @@ class ResidentMapping:
         self._csr_offsets: np.ndarray = np.empty(0, dtype=np.int64)
         self._csr_kw_ids: np.ndarray = np.empty(0, dtype=np.uint32)
         self._kw_degree: np.ndarray = np.empty(0, dtype=np.int32)
+        self._async_save_lock = threading.Lock()
+        self._async_save_thread: threading.Thread | None = None
+        atexit.register(self.flush_async_saves)
         self._load_columnar(path)
 
     def _load_columnar(self, directory: Path) -> None:
@@ -524,77 +530,135 @@ class ResidentMapping:
                 "overlay_docids": len(self._overlay_kw_ids),
             }
 
-    def save_docid_mappings(self, output_dir: str | Path) -> dict[str, Any]:
+    def flush_async_saves(self) -> None:
+        with self._async_save_lock:
+            thread = self._async_save_thread
+            self._async_save_thread = None
+        if thread is not None and thread.is_alive():
+            thread.join()
+
+    def save_docid_mappings(
+        self,
+        output_dir: str | Path,
+        *,
+        stage_dir: str | Path | None = None,
+        async_transfer: bool = True,
+    ) -> dict[str, Any]:
+        import os
+        import shutil
+        import tempfile
+        import time
+
+        self.flush_async_saves()
         with self._lock:
             overlay_snapshot = dict(self._overlay_kw_ids)
         target_dir = absolute_path(output_dir)
-        target_dir.mkdir(parents=True, exist_ok=True)
-        counts = np.diff(self._csr_offsets)
-        base_docids = np.repeat(self._unique_docids_u32, counts)
+        raw_base = os.environ.get("GR_ID_MAPPING")
+        base_dir = Path(raw_base).resolve() if raw_base and Path(raw_base).is_dir() else self.path
+        unique_docids = self._unique_docids_u32
+        n_unique = len(unique_docids)
+        counts = np.diff(self._csr_offsets).copy()
         if overlay_snapshot:
-            overlay_u32 = np.asarray(list(overlay_snapshot.keys()), dtype=np.uint32)
-            docid_in_overlay = np.isin(self._unique_docids_u32, overlay_u32, assume_unique=False)
-            keep_mask = np.repeat(~docid_in_overlay, counts)
-            ov_docids_list: list[int] = []
-            ov_kids_list: list[int] = []
-            for u32, kids in overlay_snapshot.items():
-                ov_docids_list.extend([u32] * len(kids))
-                ov_kids_list.extend(kids)
-            merged_docids = np.concatenate([
-                base_docids[keep_mask],
-                np.asarray(ov_docids_list, dtype=np.uint32),
-            ])
-            merged_kids = np.concatenate([
-                self._csr_kw_ids[keep_mask],
-                np.asarray(ov_kids_list, dtype=np.uint32),
-            ])
-            packed = (merged_docids.astype(np.uint64) << np.uint64(32)) | merged_kids.astype(np.uint64)
-            packed = np.unique(packed)
-            expanded_docids = (packed >> np.uint64(32)).astype(np.uint32)
-            csr_kw_ids = (packed & np.uint64(0xFFFFFFFF)).astype(np.uint32)
-            change_idx = np.flatnonzero(expanded_docids[1:] != expanded_docids[:-1]) + 1
-            unique_docids = np.empty(len(change_idx) + 1, dtype=np.uint32)
-            unique_docids[0] = expanded_docids[0]
-            unique_docids[1:] = expanded_docids[change_idx]
-            csr_offsets = np.empty(len(unique_docids) + 1, dtype=np.int64)
+            sorted_ov = sorted(overlay_snapshot.items())
+            ov_u32 = np.asarray([u for u, _ in sorted_ov], dtype=np.uint32)
+            ov_pos = np.searchsorted(unique_docids, ov_u32)
+            valid_items: list[tuple[int, np.ndarray]] = []
+            for (u32, kids), pos in zip(sorted_ov, ov_pos.tolist(), strict=True):
+                idx_pos = int(pos)
+                if idx_pos < n_unique and int(unique_docids[idx_pos]) == int(u32):
+                    dedup_k = np.asarray(list(dict.fromkeys(int(k) for k in kids)), dtype=np.uint32)
+                    counts[idx_pos] = len(dedup_k)
+                    valid_items.append((idx_pos, dedup_k))
+            csr_offsets = np.empty(n_unique + 1, dtype=np.int64)
             csr_offsets[0] = 0
-            csr_offsets[1:-1] = change_idx
-            csr_offsets[-1] = len(expanded_docids)
+            np.cumsum(counts, out=csr_offsets[1:])
+            total_rows = int(csr_offsets[-1])
+            csr_kw_ids = np.empty(total_rows, dtype=np.uint32)
+            prev_idx = 0
+            for idx_pos, dedup_k in valid_items:
+                if idx_pos > prev_idx:
+                    old_s = int(self._csr_offsets[prev_idx])
+                    old_e = int(self._csr_offsets[idx_pos])
+                    new_s = int(csr_offsets[prev_idx])
+                    csr_kw_ids[new_s : new_s + (old_e - old_s)] = self._csr_kw_ids[old_s:old_e]
+                new_s = int(csr_offsets[idx_pos])
+                csr_kw_ids[new_s : new_s + len(dedup_k)] = dedup_k
+                prev_idx = idx_pos + 1
+            if prev_idx < n_unique:
+                old_s = int(self._csr_offsets[prev_idx])
+                old_e = int(self._csr_offsets[n_unique])
+                new_s = int(csr_offsets[prev_idx])
+                csr_kw_ids[new_s : new_s + (old_e - old_s)] = self._csr_kw_ids[old_s:old_e]
         else:
-            expanded_docids = base_docids
-            unique_docids = self._unique_docids_u32
             csr_offsets = self._csr_offsets
             csr_kw_ids = self._csr_kw_ids
-        pairs_schema = pa.schema([
-            ("docid_u32", pa.uint32()),
-            ("keyword_id", pa.uint32()),
-        ])
-        pairs_path = target_dir / "docid_keywords.parquet"
-        pq.write_table(
-            pa.Table.from_arrays(
-                [pa.array(expanded_docids, type=pa.uint32()), pa.array(csr_kw_ids, type=pa.uint32())],
-                schema=pairs_schema,
-            ),
-            pairs_path,
-            compression="zstd",
-        )
-        np.save(target_dir / "docid_unique.u32.npy", unique_docids)
-        np.save(target_dir / "docid_offsets.i64.npy", csr_offsets)
-        np.save(target_dir / "docid_kw_ids.u32.npy", csr_kw_ids)
-        src_kw = self.path / "keywords.parquet"
-        dst_kw = target_dir / "keywords.parquet"
-        if not dst_kw.exists() and src_kw.is_file():
-            dst_kw.symlink_to(src_kw)
+
         overlay_table = pa.table({
             "docid_u32": pa.array(list(overlay_snapshot), type=pa.uint32()),
             "keyword_ids": pa.array(list(overlay_snapshot.values()), type=pa.list_(pa.uint32())),
-        }).replace_schema_metadata({b"base_mapping": str(self.path).encode()})
-        temporary = target_dir / "overlay.parquet.tmp"
-        pq.write_table(overlay_table, temporary, compression="zstd")
-        temporary.replace(target_dir / "overlay.parquet")
+        }).replace_schema_metadata({b"base_mapping": str(base_dir).encode()})
+
+        def _populate_local_dir(local_d: Path) -> None:
+            local_d.mkdir(parents=True, exist_ok=True)
+            np.save(local_d / "docid_offsets.i64.npy", csr_offsets)
+            np.save(local_d / "docid_kw_ids.u32.npy", csr_kw_ids)
+            pq.write_table(overlay_table, local_d / "overlay.parquet", compression="zstd")
+            for link_name in ("keywords.parquet", "docid_keywords.parquet", "docid_unique.u32.npy"):
+                src_f = base_dir / link_name
+                if not src_f.is_file():
+                    src_f = self.path / link_name
+                dst_f = local_d / link_name
+                if not dst_f.exists() and not dst_f.is_symlink() and src_f.is_file():
+                    dst_f.symlink_to(src_f)
+
+        if stage_dir is not None:
+            _populate_local_dir(Path(stage_dir))
+            return {
+                "output_dir": str(target_dir),
+                "staged_dir": str(stage_dir),
+                "id_count": int(n_unique),
+                "rows": int(len(csr_kw_ids)),
+            }
+
+        tmp_dir = Path(tempfile.mkdtemp(prefix="gr_save_map_"))
+        _populate_local_dir(tmp_dir)
+
+        def _sync_worker() -> None:
+            t0 = time.perf_counter()
+            try:
+                target_dir.mkdir(parents=True, exist_ok=True)
+                for fname in ("docid_offsets.i64.npy", "docid_kw_ids.u32.npy", "overlay.parquet"):
+                    dst_tmp = target_dir / f"{fname}.tmp"
+                    shutil.copyfile(tmp_dir / fname, dst_tmp)
+                    dst_tmp.replace(target_dir / fname)
+                for link_name in ("keywords.parquet", "docid_keywords.parquet", "docid_unique.u32.npy"):
+                    src_link = tmp_dir / link_name
+                    dst_link = target_dir / link_name
+                    if src_link.is_symlink() and not dst_link.exists() and not dst_link.is_symlink():
+                        dst_link.symlink_to(os.readlink(src_link))
+                logger.info(
+                    "[GR doc2k save] Synced staged mapping to %s in %.2fs",
+                    target_dir,
+                    time.perf_counter() - t0,
+                )
+            finally:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        if async_transfer:
+            with self._async_save_lock:
+                t = threading.Thread(
+                    target=_sync_worker,
+                    name=f"gr-map-sync-{target_dir.name}",
+                    daemon=False,
+                )
+                self._async_save_thread = t
+                t.start()
+        else:
+            _sync_worker()
+
         return {
             "output_dir": str(target_dir),
-            "id_count": int(len(unique_docids)),
+            "id_count": int(n_unique),
             "rows": int(len(csr_kw_ids)),
         }
 

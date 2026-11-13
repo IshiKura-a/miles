@@ -689,7 +689,6 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
         payload = {
             "cand_votes": self._step_cand_votes,
             "docid_q_count": self._step_docid_q_count,
-            "docid_kids": self._step_docid_kids,
             "edge_passes": self._step_edge_passes,
         }
         tmp_path.write_bytes(pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL))

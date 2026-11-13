@@ -1391,6 +1391,15 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             reset_arg(parser, "--save", type=str, default=None)
             reset_arg(parser, "--save-interval", type=int, default=None)
             reset_arg(parser, "--async-save", action="store_true")
+            parser.add_argument(
+                "--temp-stage-save",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help=(
+                    "Stage all checkpoint and mapping writes to local /tmp first and sync to the target "
+                    "save directory asynchronously in the background (default: True)."
+                ),
+            )
             reset_arg(
                 parser,
                 "--no-save-optim",

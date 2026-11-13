@@ -201,30 +201,74 @@ def finalize_load(actor: Any, checkpoint_payload: dict[str, Any] | None) -> None
     dist.barrier()
 
 
-def save(actor: Any, iteration: int) -> None:
+_ACTIVE_SYNC_THREADS: list[Any] = []
+
+
+def flush_staged_saves(actor: Any | None = None) -> None:
+    if actor is not None:
+        t = getattr(actor, "_temp_stage_sync_thread", None)
+        if t is not None and t.is_alive():
+            t.join()
+        if hasattr(actor, "_temp_stage_sync_thread"):
+            actor._temp_stage_sync_thread = None
+    while _ACTIVE_SYNC_THREADS:
+        t = _ACTIVE_SYNC_THREADS.pop(0)
+        if t is not None and t.is_alive():
+            t.join()
+
+
+import atexit as _atexit
+_atexit.register(flush_staged_saves)
+
+
+def save(actor: Any, iteration: int, force_sync: bool = False) -> None:
     """Save checkpoint to disk.
 
-    Saves model weights and optimizer state to separate directories.
-    This allows loading weights without optimizer or deleting optimizer before loading.
+    When actor.args.temp_stage_save is True (default), all checkpoint artifacts
+    (mapping, model, optimizer, lr_scheduler, rng.pt, meta.json) are written to fast
+    local /tmp storage first and then synchronized to the target save directory
+    in a background thread (or synchronously when force_sync=True).
     """
+    import os
+    import shutil
+    import tempfile
+    import threading
+    from miles.utils.distributed_utils import get_gloo_group
+
     torch.cuda.synchronize()
+    flush_staged_saves(actor)
+    gloo_group = get_gloo_group()
 
     base_dir = Path(actor.args.save).expanduser()
     step_id = iteration + 1
     checkpoint_dir = base_dir / f"iter_{step_id:07d}"
-    model_dir = checkpoint_dir / "model"
-    optimizer_dir = checkpoint_dir / "optimizer"
-    lr_scheduler_dir = checkpoint_dir / "lr_scheduler"
+    rank = dist.get_rank()
+    temp_stage_save = bool(getattr(actor.args, "temp_stage_save", True))
 
-    if dist.get_rank() == 0:
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    if temp_stage_save:
+        stage_root = Path(tempfile.mkdtemp(prefix=f"miles_ckpt_s{step_id}_r{rank}_"))
+        write_ckpt_dir = stage_root / f"iter_{step_id:07d}"
+    else:
+        stage_root = None
+        write_ckpt_dir = checkpoint_dir
+
+    model_dir = write_ckpt_dir / "model"
+    optimizer_dir = write_ckpt_dir / "optimizer"
+    lr_scheduler_dir = write_ckpt_dir / "lr_scheduler"
+
+    if temp_stage_save or rank == 0:
+        write_ckpt_dir.mkdir(parents=True, exist_ok=True)
         model_dir.mkdir(parents=True, exist_ok=True)
         optimizer_dir.mkdir(parents=True, exist_ok=True)
         lr_scheduler_dir.mkdir(parents=True, exist_ok=True)
-    dist.barrier()
+    dist.barrier(group=gloo_group)
 
     if hasattr(actor.model, "save_doc2k_mapping"):
-        actor.model.save_doc2k_mapping(checkpoint_dir / "mapping")
+        actor.model.save_doc2k_mapping(
+            checkpoint_dir / "mapping",
+            stage_dir=(write_ckpt_dir / "mapping") if temp_stage_save else None,
+            async_transfer=not force_sync,
+        )
 
     # Save model weights
     model_state = ModelState(actor.model)
@@ -244,10 +288,10 @@ def save(actor: Any, iteration: int) -> None:
         lr_scheduler_state_dict = {"lr_scheduler_state": lr_scheduler_state}
         dcp.save(lr_scheduler_state_dict, checkpoint_id=str(lr_scheduler_dir))
 
-    if dist.get_rank() == 0:
+    if rank == 0:
         rng_state = {"torch": torch.get_rng_state()}
         rng_state["cuda"] = torch.cuda.get_rng_state_all()
-        torch.save(rng_state, checkpoint_dir / "rng.pt")
+        torch.save(rng_state, write_ckpt_dir / "rng.pt")
 
         metadata = {
             "iteration": step_id,
@@ -258,10 +302,59 @@ def save(actor: Any, iteration: int) -> None:
             "world_size": dist.get_world_size(),
             "timestamp": time.time(),
         }
-        _write_checkpoint_metadata(checkpoint_dir / "meta.json", metadata)
+        _write_checkpoint_metadata(write_ckpt_dir / "meta.json", metadata)
 
-        tracker_file = base_dir / "latest_checkpointed_iteration.txt"
-        tracker_file.write_text(str(step_id))
-        logger.info(f"[FSDP] Saved checkpoint to {checkpoint_dir}")
+        if not temp_stage_save:
+            tracker_file = base_dir / "latest_checkpointed_iteration.txt"
+            tracker_file.write_text(str(step_id))
+            logger.info(f"[FSDP] Saved checkpoint to {checkpoint_dir}")
 
-    dist.barrier()
+    dist.barrier(group=gloo_group)
+
+    if temp_stage_save and stage_root is not None:
+        if rank == 0:
+            for sub in ("model", "optimizer", "lr_scheduler", "mapping"):
+                (checkpoint_dir / sub).mkdir(parents=True, exist_ok=True)
+            logger.info(f"[FSDP] Staged checkpoint to local {write_ckpt_dir}; starting sync to {checkpoint_dir}")
+        dist.barrier(group=gloo_group)
+
+        def _sync_staged_to_target() -> None:
+            t0 = time.perf_counter()
+            try:
+                for src_item in sorted(write_ckpt_dir.rglob("*")):
+                    rel = src_item.relative_to(write_ckpt_dir)
+                    dst_item = checkpoint_dir / rel
+                    if src_item.is_symlink():
+                        dst_item.parent.mkdir(parents=True, exist_ok=True)
+                        if not dst_item.exists() and not dst_item.is_symlink():
+                            dst_item.symlink_to(os.readlink(src_item))
+                    elif src_item.is_dir():
+                        dst_item.mkdir(parents=True, exist_ok=True)
+                    elif src_item.is_file():
+                        dst_item.parent.mkdir(parents=True, exist_ok=True)
+                        dst_tmp = dst_item.with_name(f"{dst_item.name}.tmp.r{rank}")
+                        shutil.copyfile(src_item, dst_tmp)
+                        dst_tmp.replace(dst_item)
+                if rank == 0:
+                    tracker_tmp = base_dir / f"latest_checkpointed_iteration.txt.tmp.s{step_id}"
+                    tracker_tmp.write_text(str(step_id))
+                    tracker_tmp.replace(base_dir / "latest_checkpointed_iteration.txt")
+                    logger.info(
+                        "[FSDP] Synced staged checkpoint to %s in %.2fs",
+                        checkpoint_dir,
+                        time.perf_counter() - t0,
+                    )
+            finally:
+                shutil.rmtree(stage_root, ignore_errors=True)
+
+        sync_thread = threading.Thread(
+            target=_sync_staged_to_target,
+            name=f"miles-ckpt-sync-s{step_id}-r{rank}",
+            daemon=False,
+        )
+        actor._temp_stage_sync_thread = sync_thread
+        _ACTIVE_SYNC_THREADS.append(sync_thread)
+        sync_thread.start()
+        if force_sync:
+            flush_staged_saves(actor)
+            dist.barrier(group=gloo_group)

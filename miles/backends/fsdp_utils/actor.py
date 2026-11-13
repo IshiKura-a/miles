@@ -365,7 +365,7 @@ class FSDPTrainRayActor(TrainRayActor):
             return
 
         assert not self.args.async_save, "FSDPTrainRayActor does not support async_save yet."
-        checkpoint.save(self, rollout_id)
+        checkpoint.save(self, rollout_id, force_sync=force_sync)
 
     def _compute_log_prob(
         self,
