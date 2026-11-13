@@ -104,21 +104,40 @@ class GRStage5Policy(nn.Module):
     def _sync_global_doc2k_votes(self) -> None:
         if not dist.is_initialized():
             return
-        gloo_group = get_gloo_group()
         rank = dist.get_rank()
+        world_size = dist.get_world_size()
         local_gpu = rank % 8
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
         if rank == 0:
             self._ensure_doc2k_sync_mapping()
         local_path = Path(tempfile.gettempdir()) / f"gr_doc2k_local_gpu{local_gpu}.pkl"
-        local_payload: dict[str, Any] | None = None
+        local_bytes = b""
         if local_path.is_file():
             try:
-                local_payload = pickle.loads(local_path.read_bytes())
+                local_bytes = local_path.read_bytes()
             finally:
                 local_path.unlink(missing_ok=True)
-        world_size = dist.get_world_size()
-        gathered: list[dict[str, Any] | None] | None = [None] * world_size if rank == 0 else None
-        dist.gather_object(local_payload, gathered, dst=0, group=gloo_group)
+        local_len_t = torch.tensor([len(local_bytes)], dtype=torch.int64, device=device)
+        all_lens_t = torch.zeros(world_size, dtype=torch.int64, device=device)
+        dist.all_gather_into_tensor(all_lens_t, local_len_t)
+        max_local_len = int(all_lens_t.max().item())
+        gathered: list[dict[str, Any] | None] | None = None
+        if max_local_len > 0:
+            send_buf = torch.zeros(max_local_len, dtype=torch.uint8, device=device)
+            if local_bytes:
+                send_buf[: len(local_bytes)] = torch.frombuffer(bytearray(local_bytes), dtype=torch.uint8).to(device)
+            recv_buf = torch.empty(world_size * max_local_len, dtype=torch.uint8, device=device)
+            dist.all_gather_into_tensor(recv_buf, send_buf)
+            if rank == 0:
+                recv_cpu = recv_buf.cpu().numpy()
+                lens_cpu = all_lens_t.cpu().tolist()
+                gathered = []
+                for r_idx, r_len in enumerate(lens_cpu):
+                    if r_len > 0:
+                        chunk = bytes(recv_cpu[r_idx * max_local_len : r_idx * max_local_len + r_len])
+                        gathered.append(pickle.loads(chunk))
+                    else:
+                        gathered.append(None)
 
         delta_box: list[dict[str, Any] | None] = [None]
         if rank == 0 and gathered is not None and any(item is not None for item in gathered):
@@ -184,10 +203,18 @@ class GRStage5Policy(nn.Module):
                 sync_map.apply_u32_kid_delta(additions, removals)
             delta_box[0] = {"additions": additions, "removals": removals}
 
-        dist.broadcast_object_list(delta_box, src=0, group=gloo_group)
-        delta = delta_box[0]
-        if delta is None:
+        delta_bytes = pickle.dumps(delta_box[0], protocol=pickle.HIGHEST_PROTOCOL) if (rank == 0 and delta_box[0] is not None) else b""
+        delta_len_t = torch.tensor([len(delta_bytes)], dtype=torch.int64, device=device)
+        dist.broadcast(delta_len_t, src=0)
+        delta_len = int(delta_len_t.item())
+        if delta_len == 0:
             return
+        if rank == 0:
+            delta_buf = torch.frombuffer(bytearray(delta_bytes), dtype=torch.uint8).to(device)
+        else:
+            delta_buf = torch.empty(delta_len, dtype=torch.uint8, device=device)
+        dist.broadcast(delta_buf, src=0)
+        delta = pickle.loads(bytes(delta_buf.cpu().numpy()))
 
         additions = delta["additions"]
         removals = delta["removals"]

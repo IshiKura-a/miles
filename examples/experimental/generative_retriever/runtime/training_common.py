@@ -86,7 +86,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     one_step_async: bool = True
     temperature: float = 0.4
     lr: float = 2e-6
-    save_interval: int = 20
+    save_interval: int = 5
     resume: bool = False
     extra_args: str = ""
 
