@@ -8,6 +8,7 @@ import logging
 import math
 from typing import Any
 
+import aiohttp
 import httpx
 import numpy as np
 
@@ -138,20 +139,70 @@ def resolve_engine_url(args: Any) -> str:
     return f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
 
 
+_AIOHTTP_SESSIONS: dict[asyncio.AbstractEventLoop, aiohttp.ClientSession] = {}
+_WORKER_URLS_BY_ROUTER: dict[str, list[str]] = {}
+_WORKER_URL_LOCKS: dict[asyncio.AbstractEventLoop, asyncio.Lock] = {}
+_RR_COUNTER: int = 0
+
+
+def _get_aiohttp_session() -> aiohttp.ClientSession:
+    loop = asyncio.get_running_loop()
+    sess = _AIOHTTP_SESSIONS.get(loop)
+    if sess is None or sess.closed:
+        connector = aiohttp.TCPConnector(limit=0, limit_per_host=0, ttl_dns_cache=300, keepalive_timeout=600)
+        timeout = aiohttp.ClientTimeout(total=None, connect=30.0, sock_connect=30.0, sock_read=None)
+        sess = aiohttp.ClientSession(connector=connector, timeout=timeout)
+        _AIOHTTP_SESSIONS[loop] = sess
+    return sess
+
+
+async def _resolve_target_url(router_url: str, session: aiohttp.ClientSession) -> str:
+    global _RR_COUNTER
+    urls = _WORKER_URLS_BY_ROUTER.get(router_url)
+    if not urls:
+        loop = asyncio.get_running_loop()
+        lock = _WORKER_URL_LOCKS.setdefault(loop, asyncio.Lock())
+        async with lock:
+            urls = _WORKER_URLS_BY_ROUTER.get(router_url)
+            if not urls:
+                try:
+                    async with session.get(f"{router_url}/workers") as resp:
+                        if resp.status == 200:
+                            info = await resp.json()
+                            workers = info.get("workers", [])
+                            extracted = [w["url"].rstrip("/") for w in workers if isinstance(w, dict) and w.get("url")]
+                            if extracted:
+                                urls = extracted
+                                _WORKER_URLS_BY_ROUTER[router_url] = urls
+                                logger.info("[GR Rollout] Discovered %d direct SGLang worker URLs from router %s", len(urls), router_url)
+                except Exception:
+                    pass
+    if urls:
+        target = urls[_RR_COUNTER % len(urls)]
+        _RR_COUNTER += 1
+        return target
+    return router_url
+
+
 async def request_embedding(args: Any, router_url: str, prompt_ids: list[int]) -> dict[str, Any]:
+    session = _get_aiohttp_session()
     attempt = 1
     while True:
+        target_base = await _resolve_target_url(router_url, session)
         try:
-            response = await GeneralHttpClientProvider.client().post(
-                f"{router_url}/v1/embeddings",
+            async with session.post(
+                f"{target_base}/v1/embeddings",
                 json={
                     "model": args.hf_checkpoint,
                     "input": prompt_ids,
                     "encoding_format": "base64",
                 },
-            )
+            ) as response:
+                response.raise_for_status()
+                payload = await response.json()
             break
-        except (httpx.TransportError, httpx.TimeoutException) as error:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+            _WORKER_URLS_BY_ROUTER.pop(router_url, None)
             if attempt == _TRANSPORT_ATTEMPTS:
                 raise
             logger.warning(
@@ -160,8 +211,6 @@ async def request_embedding(args: Any, router_url: str, prompt_ids: list[int]) -
             )
             await asyncio.sleep(_RETRY_DELAY_SECONDS * 2 ** (attempt - 1))
             attempt += 1
-    response.raise_for_status()
-    payload = response.json()
     data = payload.get("data")
     if not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], dict):
         raise ValueError("GR router returned an invalid embeddings response")
