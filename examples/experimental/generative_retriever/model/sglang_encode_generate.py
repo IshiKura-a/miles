@@ -33,6 +33,8 @@ _TRANSPORT_ATTEMPTS = 3
 _RETRY_DELAY_SECONDS = 0.5
 
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def add_arguments(parser: Any) -> None:
@@ -175,14 +177,19 @@ async def request_embedding(args: Any, router_url: str, prompt_ids: list[int]) -
 def encode_training_prompt(state: Any, query: str) -> list[int]:
     if not isinstance(query, str) or not query.strip():
         raise ValueError("GR rollout requires a non-empty query string prompt")
+    pair = getattr(state, "_gr_chat_template_pair", None)
+    if pair is None:
+        sentinel = "__GR_QUERY_PLACEHOLDER__"
+        tmpl = state.tokenizer.apply_chat_template(
+            [{"role": "user", "content": f'Given the user Query: "{sentinel}", summarize it in one token:'}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        pair = tuple(tmpl.split(sentinel))
+        setattr(state, "_gr_chat_template_pair", pair)
     query_ids = state.tokenizer.encode(query, add_special_tokens=False)[:QUERY_MAX_TOKENS]
     truncated_query = state.tokenizer.decode(query_ids)
-    instruction = f'Given the user Query: "{truncated_query}", summarize it in one token:'
-    prompt = state.tokenizer.apply_chat_template(
-        [{"role": "user", "content": instruction}],
-        tokenize=False,
-        add_generation_prompt=True,
-    )
+    prompt = f"{pair[0]}{truncated_query}{pair[1]}"
     return list(state.tokenizer.encode(prompt, add_special_tokens=False))
 
 
@@ -243,13 +250,6 @@ async def generate_group_samples(
         raise ValueError(f"Expected group of {group_size} samples, got {len(group)}")
     first = group[0]
     query = validate_pending_sample(first, evaluation=evaluation)
-    for beam_rank, sample in enumerate(group):
-        if validate_pending_sample(sample, evaluation=evaluation) != query:
-            raise ValueError("All samples in a GR query group must share the same prompt")
-        if not evaluation and sample.group_index != first.group_index:
-            raise ValueError("All samples in a GR query group must share group_index")
-        if not evaluation and sample.index % group_size != beam_rank:
-            raise ValueError(f"Expected beam rank {beam_rank}, got sample.index={sample.index}")
 
     prompt_ids = encode_training_prompt(state, query)
     output = await request_embedding(args, resolve_engine_url(args), prompt_ids)

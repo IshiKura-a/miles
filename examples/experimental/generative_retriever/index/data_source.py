@@ -69,22 +69,43 @@ class GRRolloutDataSource(RolloutDataSourceWithBuffer):
         return position
 
     def save(self, rollout_id: int) -> None:
+        import shutil
+        import tempfile
+        import threading
+
         position = self.completed_position(rollout_id)
         if self.epoch_id != 0 or self.sample_offset < position or self.buffer:
             raise ValueError("GR rollout cannot checkpoint a wrapped or buffered prompt dataset")
         save_root = absolute_path(self.args.save)
         path = save_root / "rollout" / f"global_dataset_state_dict_{rollout_id}.pt"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {
-                "sample_offset": position,
-                "epoch_id": 0,
-                "sample_group_index": position,
-                "sample_index": position * self.args.n_samples_per_prompt,
-                "metadata": self.metadata,
-            },
-            path,
-        )
+        payload = {
+            "sample_offset": position,
+            "epoch_id": 0,
+            "sample_group_index": position,
+            "sample_index": position * self.args.n_samples_per_prompt,
+            "metadata": self.metadata,
+        }
+        if bool(getattr(self.args, "temp_stage_save", True)):
+            fd, tmp_str = tempfile.mkstemp(prefix=f"gr_ds_s{rollout_id}_", suffix=".pt")
+            import os
+            os.close(fd)
+            tmp_path = Path(tmp_str)
+            torch.save(payload, tmp_path)
+
+            def _sync_ds() -> None:
+                try:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    dst_tmp = path.with_suffix(".pt.tmp")
+                    shutil.copyfile(tmp_path, dst_tmp)
+                    dst_tmp.replace(path)
+                finally:
+                    tmp_path.unlink(missing_ok=True)
+
+            t = threading.Thread(target=_sync_ds, name=f"gr-ds-sync-{rollout_id}", daemon=False)
+            t.start()
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(payload, path)
         self.pending_mapping_checkpoints.append(rollout_id)
 
     def sync_mapping(self, rollout_id: int) -> None:

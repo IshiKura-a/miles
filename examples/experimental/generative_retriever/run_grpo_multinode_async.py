@@ -224,7 +224,7 @@ def prepare_node_assets(manifest: Manifest) -> None:
         output=local_bundle_path(manifest["run_id"]),
         num_beams=SAMPLES_PER_PROMPT,
         num_return_sequences=SAMPLES_PER_PROMPT,
-        temperature=1.0,
+        temperature=0.4,
         decoding_mode="beam_sample",
     )
     for name in ("config.json", "tokenizer.json", "pytorch_model.bin.index.json"):

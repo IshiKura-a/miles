@@ -280,6 +280,7 @@ def generate_beams_tree(
         sequences = torch.zeros((batch_size, 1, 1), dtype=torch.long, device=device)
         token_scores = torch.empty((batch_size, 1, 0), dtype=torch.float32, device=device)
         cum_scores = torch.zeros((batch_size, 1), dtype=torch.float32, device=device)
+        beam_gumbels = torch.zeros((batch_size, 1), dtype=torch.float32, device=device)
 
         for step in range(code_num):
             cur_beams = sequences.shape[1]
@@ -294,8 +295,6 @@ def generate_beams_tree(
                 return_dict=True,
             )
             logits = model.lm_head(dec_out.last_hidden_state[:, -1, :]).float()
-            if temperature != 1.0:
-                logits = logits / temperature
 
             vocab_size = logits.shape[-1]
             if isinstance(constraint, SortedU32Constraint):
@@ -315,16 +314,33 @@ def generate_beams_tree(
                 mask_gpu = mask_cpu.to(device=device, non_blocking=True)
             masked_logits = logits.masked_fill(~mask_gpu, float("-inf"))
             step_log_probs = F.log_softmax(masked_logits, dim=-1).reshape(batch_size, cur_beams, vocab_size)
-            cand_cum = (cum_scores.unsqueeze(-1) + step_log_probs).reshape(batch_size, cur_beams * vocab_size)
+            step_log_probs = torch.where(
+                mask_gpu.reshape(batch_size, cur_beams, vocab_size),
+                step_log_probs,
+                torch.full_like(step_log_probs, float("-inf")),
+            )
+            cand_cum_3d = cum_scores.unsqueeze(-1) + step_log_probs
+            cand_cum = cand_cum_3d.reshape(batch_size, cur_beams * vocab_size)
             valid_counts = (cand_cum > float("-inf")).sum(dim=-1)
             target_k = num_beams if step > 0 else min(num_beams, 256)
             next_k = min(target_k, int(valid_counts.min().item()))
             if next_k <= 0:
                 raise RuntimeError(f"Constrained beam tree has no valid continuations at step {step}")
             if do_sample:
-                gumbel = -torch.empty_like(cand_cum).exponential_().log()
-                perturbed = cand_cum + gumbel
-                _, top_idx = torch.topk(perturbed, k=next_k, dim=-1)
+                scaled_3d = cand_cum_3d / temperature if temperature != 1.0 else cand_cum_3d
+                gumbel_3d = -torch.empty_like(scaled_3d).exponential_().log()
+                raw_g = torch.where(torch.isfinite(scaled_3d), scaled_3d + gumbel_3d, scaled_3d)
+                if step > 0:
+                    max_g = raw_g.max(dim=-1, keepdim=True).values
+                    delta = raw_g - max_g
+                    shifted = -raw_g + torch.log(-torch.expm1(delta).clamp_min(1e-38))
+                    cond_g = -torch.logaddexp(-beam_gumbels.unsqueeze(-1).expand_as(raw_g), shifted)
+                    cond_g = torch.where(torch.isfinite(raw_g) & torch.isfinite(max_g), cond_g, raw_g)
+                else:
+                    cond_g = raw_g
+                flat_g = cond_g.reshape(batch_size, cur_beams * vocab_size)
+                top_g, top_idx = torch.topk(flat_g, k=next_k, dim=-1)
+                beam_gumbels = top_g
             else:
                 _, top_idx = torch.topk(cand_cum, k=next_k, dim=-1)
             beam_idx = top_idx // vocab_size

@@ -359,7 +359,7 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
             feature_cache_size=32_768,
             score_cache_size=524_288,
             pair_batch_size=65_536,
-            keyword_cache_size=67_108_864,
+            keyword_cache_size=33_554_432,
         )
         object.__setattr__(self, "_relevance_scorer", scorer)
 

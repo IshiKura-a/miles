@@ -84,7 +84,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     reward_score_cache_size: int = 0
     num_rollout: int = _MAX_STEPS
     one_step_async: bool = True
-    temperature: float = 1.0
+    temperature: float = 0.4
     lr: float = 2e-6
     save_interval: int = 20
     resume: bool = False

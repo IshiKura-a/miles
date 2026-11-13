@@ -183,7 +183,7 @@ def execute(args: ScriptArgs) -> None:
         "examples.experimental.generative_retriever.model.fsdp_policy.build_gr_stage5_policy "
         "--weight-sync-include-prefixes "
         "encoder_list.0.model.encoder.model. docEnc2decoder. decoder. lm_head. "
-        "--update-weight-buffer-size 536870912 "
+        "--update-weight-buffer-size 2147483648 "
         f"--micro-batch-size {args.micro_batch_size} "
     )
     checkpoint_args = (
@@ -217,7 +217,7 @@ def execute(args: ScriptArgs) -> None:
         f"--rollout-max-in-flight-groups {args.rollout_max_in_flight_groups} "
         f"--n-samples-per-prompt {args.n_samples_per_prompt} "
         "--rollout-max-response-len 4 "
-        f"--rollout-temperature {args.temperature} "
+        "--rollout-temperature 1.0 "
         "--rollout-top-p 1 "
         f"--global-batch-size {args.global_batch_size} "
     )

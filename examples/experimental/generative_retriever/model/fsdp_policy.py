@@ -245,7 +245,7 @@ class GRStage5Policy(nn.Module):
 
     def gradient_checkpointing_enable(self, **kwargs: Any) -> None:
         del kwargs
-        self.decoder.gradient_checkpointing = False
+        self.decoder.gradient_checkpointing = True
 
     def _encode_prompts(
         self,

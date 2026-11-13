@@ -28,7 +28,7 @@ REWARD_NODES_PER_PAIR = 2
 
 # Batch size and step limit scale with the number of node pairs.
 QUERIES_PER_STEP_PER_PAIR = 16_000
-IN_FLIGHT_GROUPS_PER_PAIR = 512
+IN_FLIGHT_GROUPS_PER_PAIR = 2_048
 SAMPLES_PER_PROMPT = DEFAULT_TRAIN_GROUP_SIZE
 MAX_STEPS_PER_PAIR = PROMPT_DATASET_ROWS // QUERIES_PER_STEP_PER_PAIR
 
@@ -115,7 +115,7 @@ def build_multinode_train_args(
             "--rollout-max-in-flight-groups", str(args.rollout_max_in_flight_groups),
             "--n-samples-per-prompt", str(args.n_samples_per_prompt),
             "--rollout-max-response-len", "4",
-            "--rollout-temperature", str(args.temperature),
+            "--rollout-temperature", "1.0",
             "--rollout-top-p", "1",
             "--global-batch-size", str(args.global_batch_size),
         ],
@@ -127,6 +127,8 @@ def build_multinode_train_args(
             "--actor-num-nodes", str(len(addresses)),
             "--actor-num-gpus-per-node", str(args.actor_num_gpus_per_node),
             "--num-gpus-per-node", str(args.num_gpus_per_node),
+            "--dp-replicate-size", str(len(addresses)),
+            "--router-policy", "round_robin",
         ] + build_sglang_args(args, args.sglang_mem_fraction_static),
         [
             "--save", str(checkpoint_dir),

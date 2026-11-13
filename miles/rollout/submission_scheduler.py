@@ -25,7 +25,14 @@ class GroupLevelSubmission:
         pass
 
     async def wait_for_progress(self, pendings: set[asyncio.Task]) -> tuple[set[asyncio.Task], set[asyncio.Task]]:
-        return await asyncio.wait(pendings, return_when=asyncio.FIRST_COMPLETED)
+        done, pending = await asyncio.wait(pendings, return_when=asyncio.FIRST_COMPLETED)
+        if pending and len(pending) >= 32:
+            await asyncio.sleep(0.015)
+            newly_done = {t for t in pending if t.done()}
+            if newly_done:
+                done = done | newly_done
+                pending = pending - newly_done
+        return done, pending
 
 
 class SampleBackfillSubmission:
