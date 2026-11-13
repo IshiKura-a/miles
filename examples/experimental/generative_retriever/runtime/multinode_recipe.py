@@ -95,7 +95,7 @@ def build_multinode_train_args(
             "examples.experimental.generative_retriever.index.data_source.sync_mapping_on_weight_update",
             "--weight-sync-include-prefixes",
             "encoder_list.0.model.encoder.model.", "docEnc2decoder.", "decoder.", "lm_head.",
-            "--update-weight-buffer-size", "536870912",
+            "--update-weight-buffer-size", "2147483648",
             "--micro-batch-size", str(args.micro_batch_size),
         ],
         [

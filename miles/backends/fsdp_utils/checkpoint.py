@@ -223,6 +223,9 @@ def save(actor: Any, iteration: int) -> None:
         lr_scheduler_dir.mkdir(parents=True, exist_ok=True)
     dist.barrier()
 
+    if hasattr(actor.model, "save_doc2k_mapping"):
+        actor.model.save_doc2k_mapping(checkpoint_dir / "mapping")
+
     # Save model weights
     model_state = ModelState(actor.model)
     state_dict = {"model_state": model_state}

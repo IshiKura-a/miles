@@ -306,6 +306,123 @@ class GpuEmbeddingTable:
         )
 
 
+
+_SHM_NUM_BUCKETS = 1 << 24  # 16,777,216 buckets
+_SHM_BUCKET_MASK = _SHM_NUM_BUCKETS - 1
+_SHM_WAYS = 4
+
+
+class NodeSharedKeywordCache:
+    """Lock-free 4-way set-associative /dev/shm keyword feature cache shared by all 8 GPUs on a node."""
+
+    def __init__(
+        self,
+        shm_name: str = "gr_node_kw_cache_v1",
+        num_tokens: int = GRAPHENE_NUM_TOKENS,
+        feature_dim: int = GRAPHENE_FEATURE_DIM,
+    ) -> None:
+        self.num_tokens = num_tokens
+        self.feature_dim = feature_dim
+        shm_root = Path("/dev/shm") if Path("/dev/shm").is_dir() else Path(tempfile.gettempdir())
+        self.cache_dir = shm_root / shm_name
+        keys_path = self.cache_dir / "keys.u64.mmap"
+        vecs_path = self.cache_dir / "vecs.u16.mmap"
+        keys_bytes = _SHM_NUM_BUCKETS * _SHM_WAYS * 8
+        vecs_bytes = _SHM_NUM_BUCKETS * _SHM_WAYS * num_tokens * feature_dim * 2
+        with FileLock(str(shm_root / f"{shm_name}.lock")):
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            if not keys_path.is_file() or keys_path.stat().st_size != keys_bytes:
+                with open(keys_path, "wb") as f:
+                    f.truncate(keys_bytes)
+            if not vecs_path.is_file() or vecs_path.stat().st_size != vecs_bytes:
+                with open(vecs_path, "wb") as f:
+                    f.truncate(vecs_bytes)
+        self.keys = np.memmap(keys_path, dtype=np.uint64, mode="r+", shape=(_SHM_NUM_BUCKETS, _SHM_WAYS))
+        self.vecs = np.memmap(
+            vecs_path,
+            dtype=np.uint16,
+            mode="r+",
+            shape=(_SHM_NUM_BUCKETS, _SHM_WAYS, num_tokens, feature_dim),
+        )
+
+    def lookup(
+        self, texts: list[str],
+    ) -> tuple[np.ndarray, torch.Tensor, list[int], list[str], np.ndarray]:
+        n = len(texts)
+        hashes = np.fromiter(
+            (xxhash.xxh64_intdigest(t) | 1 for t in texts),
+            dtype=np.uint64,
+            count=n,
+        )
+        buckets = (hashes & np.uint64(_SHM_BUCKET_MASK)).astype(np.int64)
+        k_rows = self.keys[buckets]
+        match_mask = k_rows == hashes[:, None]
+        hit_any = match_mask.any(axis=1)
+        if not hit_any.any():
+            return (
+                np.empty(0, dtype=np.int64),
+                torch.empty((0, self.num_tokens, self.feature_dim), dtype=torch.bfloat16),
+                list(range(n)),
+                texts,
+                hashes,
+            )
+        hit_pos = np.flatnonzero(hit_any)
+        ways = match_mask[hit_pos].argmax(axis=1)
+        b_hit = buckets[hit_pos]
+        vecs_u16 = self.vecs[b_hit, ways].copy()
+        k_after = self.keys[b_hit, ways]
+        valid = k_after == hashes[hit_pos]
+        if not valid.all():
+            hit_pos = hit_pos[valid]
+            vecs_u16 = vecs_u16[valid]
+        hit_mask = np.zeros(n, dtype=bool)
+        hit_mask[hit_pos] = True
+        miss_pos = np.flatnonzero(~hit_mask).tolist()
+        miss_texts = [texts[i] for i in miss_pos]
+        miss_hashes = hashes[miss_pos]
+        hit_tensor = torch.from_numpy(vecs_u16).view(torch.bfloat16)
+        return hit_pos, hit_tensor, miss_pos, miss_texts, miss_hashes
+
+    def store(self, hashes: np.ndarray, encoded_bf16: torch.Tensor) -> None:
+        if len(hashes) == 0:
+            return
+        vecs_u16 = encoded_bf16.detach().contiguous().view(torch.uint16).cpu().numpy()
+        buckets = (hashes & np.uint64(_SHM_BUCKET_MASK)).astype(np.int64)
+        _, first_idx = np.unique(buckets, return_index=True)
+        if len(first_idx) == len(hashes):
+            k_rows = self.keys[buckets]
+            empty_mask = k_rows == 0
+            has_empty = empty_mask.any(axis=1)
+            default_way = ((hashes >> np.uint64(24)) & np.uint64(_SHM_WAYS - 1)).astype(np.int64)
+            ways = np.where(has_empty, empty_mask.argmax(axis=1), default_way)
+            self.keys[buckets, ways] = np.uint64(0)
+            self.vecs[buckets, ways] = vecs_u16
+            self.keys[buckets, ways] = hashes
+            return
+        b_first = buckets[first_idx]
+        h_first = hashes[first_idx]
+        k_rows = self.keys[b_first]
+        empty_mask = k_rows == 0
+        has_empty = empty_mask.any(axis=1)
+        default_way = ((h_first >> np.uint64(24)) & np.uint64(_SHM_WAYS - 1)).astype(np.int64)
+        ways = np.where(has_empty, empty_mask.argmax(axis=1), default_way)
+        self.keys[b_first, ways] = np.uint64(0)
+        self.vecs[b_first, ways] = vecs_u16[first_idx]
+        self.keys[b_first, ways] = h_first
+
+        first_mask = np.zeros(len(hashes), dtype=bool)
+        first_mask[first_idx] = True
+        for idx in np.flatnonzero(~first_mask).tolist():
+            b = int(buckets[idx])
+            h = np.uint64(hashes[idx])
+            row = self.keys[b]
+            emp = np.flatnonzero(row == 0)
+            w = int(emp[0]) if len(emp) > 0 else int((h >> np.uint64(24)) & np.uint64(_SHM_WAYS - 1))
+            self.keys[b, w] = np.uint64(0)
+            self.vecs[b, w] = vecs_u16[idx]
+            self.keys[b, w] = h
+
+
 class RelevanceScorer:
     """Two-level in-VRAM GPU relevance cache: L1 (q, k) score cache + L2 (q_emb, k_emb) GPU tables."""
 
@@ -336,6 +453,7 @@ class RelevanceScorer:
         self.scores: LRUCache[tuple[str, str], tuple[float, float]] = LRUCache(
             score_cache_size
         )
+        self.node_keyword_cache: NodeSharedKeywordCache | None = NodeSharedKeywordCache()
 
     @torch.no_grad()
     def _encode_gpu_table(
@@ -347,30 +465,51 @@ class RelevanceScorer:
         table = self.query_features if query else self.keyword_features
         slot_map, missing_texts, missing_slots, delta = table.lookup_and_reserve(texts)
         if missing_texts:
-            engine = self.pipeline.query_engine if query else self.pipeline.keyword_engine
-            prefix = _QUERY_PREFIX if query else _KEYWORD_PREFIX
-            pad_multiple = (
-                _KEYWORD_PAD_MULTIPLE
-                if (not query and len(missing_texts) >= _KEYWORD_PAD_THRESHOLD)
-                else (
-                    _QUERY_PAD_MULTIPLE
-                    if (query and len(missing_texts) >= _QUERY_PAD_THRESHOLD)
-                    else _MIN_PAD_MULTIPLE
+            storage = table.ensure_storage(table.num_tokens, table.feature_dim)
+            compute_texts = missing_texts
+            compute_slots = missing_slots
+            miss_hashes: np.ndarray | None = None
+            if not query and self.node_keyword_cache is not None:
+                hit_pos, hit_tensor, miss_pos, compute_texts, miss_hashes = (
+                    self.node_keyword_cache.lookup(missing_texts)
                 )
-            )
-            padded = missing_texts + [missing_texts[-1]] * (-len(missing_texts) % pad_multiple)
-            prompts = [prefix + text for text in padded]
-            batch_size = int(engine.batch_size)
-            chunks: list[torch.Tensor] = []
-            for start in range(0, len(prompts), batch_size):
-                token_ids, attention = engine._prepare_batch(prompts[start : start + batch_size])
-                chunks.append(engine.model(token_ids, attention).to(dtype=table.dtype))
-            encoded = torch.cat(chunks, dim=0)[: len(missing_texts)]
-            if encoded.ndim != 3:
-                raise RuntimeError("Official relevance model returned invalid GPU tower features")
-            storage = table.ensure_storage(encoded.shape[1], encoded.shape[2])
-            slot_tensor = torch.tensor(missing_slots, dtype=torch.long).to(device=storage.device)
-            storage[slot_tensor] = encoded
+                if len(hit_pos) > 0:
+                    shm_slots = [missing_slots[int(i)] for i in hit_pos.tolist()]
+                    shm_slot_t = torch.tensor(shm_slots, dtype=torch.long, device=storage.device)
+                    storage[shm_slot_t] = hit_tensor.to(device=storage.device, dtype=table.dtype)
+                    shm_hits = int(len(hit_pos))
+                    table._hits += shm_hits
+                    table._misses = max(0, table._misses - shm_hits)
+                    delta["hits"] += shm_hits
+                    delta["misses"] = max(0, delta["misses"] - shm_hits)
+                compute_slots = [missing_slots[i] for i in miss_pos]
+            if compute_texts:
+                engine = self.pipeline.query_engine if query else self.pipeline.keyword_engine
+                prefix = _QUERY_PREFIX if query else _KEYWORD_PREFIX
+                pad_multiple = (
+                    _KEYWORD_PAD_MULTIPLE
+                    if (not query and len(compute_texts) >= _KEYWORD_PAD_THRESHOLD)
+                    else (
+                        _QUERY_PAD_MULTIPLE
+                        if (query and len(compute_texts) >= _QUERY_PAD_THRESHOLD)
+                        else _MIN_PAD_MULTIPLE
+                    )
+                )
+                padded = compute_texts + [compute_texts[-1]] * (-len(compute_texts) % pad_multiple)
+                prompts = [prefix + text for text in padded]
+                batch_size = int(engine.batch_size)
+                chunks: list[torch.Tensor] = []
+                for start in range(0, len(prompts), batch_size):
+                    token_ids, attention = engine._prepare_batch(prompts[start : start + batch_size])
+                    chunks.append(engine.model(token_ids, attention).to(dtype=table.dtype))
+                encoded = torch.cat(chunks, dim=0)[: len(compute_texts)]
+                if encoded.ndim != 3:
+                    raise RuntimeError("Official relevance model returned invalid GPU tower features")
+                storage = table.ensure_storage(encoded.shape[1], encoded.shape[2])
+                slot_tensor = torch.tensor(compute_slots, dtype=torch.long).to(device=storage.device)
+                storage[slot_tensor] = encoded
+                if not query and self.node_keyword_cache is not None and miss_hashes is not None:
+                    self.node_keyword_cache.store(miss_hashes, encoded)
         storage = table.ensure_storage(table.num_tokens, table.feature_dim)
         return storage, slot_map, delta
 

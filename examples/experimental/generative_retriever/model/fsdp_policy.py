@@ -20,6 +20,8 @@ from examples.experimental.generative_retriever.model.constrained_decode import 
     SortedU32Constraint,
     load_constraint,
 )
+from examples.experimental.generative_retriever.services.mapping_service import ResidentMapping
+from examples.experimental.generative_retriever.sglang_models.gr_policy import _stage_local_mapping_dir
 from examples.experimental.generative_retriever.reward.relevance_reward import (
     DEFAULT_TRAIN_GROUP_SIZE,
     DOC2K_ADD_MIN_QUERIES,
@@ -68,6 +70,7 @@ class GRStage5Policy(nn.Module):
         self._global_docid_q_count: dict[int, int] = {}
         self._global_docid_kids: dict[int, tuple[int, ...]] = {}
         self._global_edge_passes: dict[tuple[int, int], int] = {}
+        object.__setattr__(self, "_doc2k_sync_mapping", None)
 
         self.encoder_list: Any = source.encoder_list
         self.docEnc2decoder: Any = source.docEnc2decoder
@@ -177,11 +180,37 @@ class GRStage5Policy(nn.Module):
                         bl.append(k)
             for u32, kids in prev.get("removals", {}).items():
                 removals.setdefault(u32, set()).update(kids)
+        if dist.get_rank() == 0:
+            sync_map = self._ensure_doc2k_sync_mapping()
+            if sync_map is not None:
+                sync_map.apply_u32_kid_delta(additions, removals)
+
         tmp_path = global_path.with_suffix(".tmp")
         tmp_path.write_bytes(
             pickle.dumps({"additions": additions, "removals": removals}, protocol=pickle.HIGHEST_PROTOCOL)
         )
         tmp_path.replace(global_path)
+
+    def _ensure_doc2k_sync_mapping(self) -> ResidentMapping | None:
+        sync_map: ResidentMapping | None = getattr(self, "_doc2k_sync_mapping", None)
+        if sync_map is not None:
+            return sync_map
+        raw_mapping = os.environ.get("GR_ID_MAPPING")
+        if not raw_mapping:
+            return None
+        staged_dir = _stage_local_mapping_dir(raw_mapping)
+        sync_map = ResidentMapping(staged_dir, read_only=True)
+        object.__setattr__(self, "_doc2k_sync_mapping", sync_map)
+        return sync_map
+
+    def save_doc2k_mapping(self, output_dir: str | Path) -> None:
+        self._sync_global_doc2k_votes()
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            sync_map = self._ensure_doc2k_sync_mapping()
+            if sync_map is not None:
+                sync_map.save_docid_mappings(output_dir)
+        if dist.is_initialized():
+            dist.barrier()
 
     def state_dict(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         self._sync_global_doc2k_votes()
@@ -189,7 +218,6 @@ class GRStage5Policy(nn.Module):
 
     def gradient_checkpointing_enable(self, **kwargs: Any) -> None:
         del kwargs
-        self._encoder_backbone().gradient_checkpointing_enable()
         self.decoder.gradient_checkpointing = True
 
     def _encode_prompts(
