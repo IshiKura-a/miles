@@ -59,7 +59,26 @@ def unpack_docid_u32(value: int) -> PositionalID:
 
 def is_columnar_index_dir(path: str | Path) -> bool:
     resolved = absolute_path(path)
-    return resolved.is_dir() and all((resolved / name).is_file() for name in COLUMNAR_INDEX_FILES)
+    if not resolved.is_dir():
+        return False
+    if all((resolved / name).is_file() for name in COLUMNAR_INDEX_FILES):
+        return True
+    ov_path = resolved / "overlay.parquet"
+    if ov_path.is_file():
+        try:
+            import pyarrow.parquet as pq
+            meta = pq.read_schema(ov_path).metadata or {}
+            base_raw = meta.get(b"base_mapping")
+            if base_raw:
+                base_dir = Path(base_raw.decode("utf-8"))
+                for name in COLUMNAR_INDEX_FILES:
+                    dst = resolved / name
+                    src = base_dir / name
+                    if not dst.is_file() and not dst.is_symlink() and src.is_file():
+                        dst.symlink_to(src)
+        except Exception:
+            pass
+    return all((resolved / name).is_file() for name in COLUMNAR_INDEX_FILES)
 
 
 def lookup_texts(mapping: str | Path, docids: Iterable[PositionalID]) -> MappingLookup:
