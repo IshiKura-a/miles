@@ -2,6 +2,7 @@ import abc
 import base64
 import gc
 import logging
+from pathlib import Path
 import pickle
 import socket
 from argparse import Namespace
@@ -12,6 +13,7 @@ import ray
 import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
+from torch.multiprocessing import reductions as _mp_reductions
 
 from miles.backends.training_utils.conn_status import ConnStatusManager
 
@@ -92,7 +94,6 @@ class UpdateWeight(abc.ABC):
         dist.barrier(group=get_gloo_group())
         gc.collect()
         torch.cuda.ipc_collect()
-        torch.cuda.empty_cache()
 
         bucket = []
         bucket_size = 0
@@ -133,7 +134,6 @@ class UpdateWeight(abc.ABC):
         dist.barrier(group=get_gloo_group())
         gc.collect()
         torch.cuda.ipc_collect()
-        torch.cuda.empty_cache()
 
     def wait_and_update_bucket_weights(self, bucket):
         resolved = []
@@ -183,6 +183,33 @@ class UpdateWeightFromTensor(UpdateWeight):
 
     def update_bucket_weights(self, named_tensors, weight_version=None) -> None:
         monkey_patch_torch_reductions()
+        use_rocm_cpu_shm = torch.version.hip is not None
+        if use_rocm_cpu_shm:
+            if (
+                getattr(_mp_reductions, "_reduce_tensor_original", None) is not None
+                and not getattr(_mp_reductions, "_miles_cpu_safe_patch", False)
+            ):
+                _sgl_reduce_tensor = _mp_reductions.reduce_tensor
+
+                def _cpu_safe_reduce_tensor(tensor):
+                    if tensor.is_cuda:
+                        return _sgl_reduce_tensor(tensor)
+                    return _mp_reductions._reduce_tensor_original(tensor)
+
+                _mp_reductions.reduce_tensor = _cpu_safe_reduce_tensor
+                _mp_reductions._miles_cpu_safe_patch = True
+                _mp_reductions.init_reductions()
+            if torch.multiprocessing.get_sharing_strategy() != "file_system":
+                torch.multiprocessing.set_sharing_strategy("file_system")
+            torch_lib = Path(torch.__file__).resolve().parent / "lib"
+            rocm_blas = torch_lib.parent.parent / "_rocm_sdk_core/lib/host-math/lib/librocm-openblas.so.0"
+            target_blas = torch_lib / "librocm-openblas.so.0"
+            if rocm_blas.is_file() and not target_blas.exists():
+                try:
+                    target_blas.symlink_to(rocm_blas)
+                except OSError:
+                    pass
+
         logger.info("Using flattened tensor bucket")
         torch.cuda.ipc_collect()
         if getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
@@ -200,18 +227,21 @@ class UpdateWeightFromTensor(UpdateWeight):
         for _dtype, group_tensors in named_tensors_by_dtypes.items():
             flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=group_tensors)
             metadata = flattened_tensor_bucket.get_metadata()
+            if use_rocm_cpu_shm:
+                flattened_tensor = flattened_tensor_bucket.get_flattened_tensor().cpu()
+                del flattened_tensor_bucket
+                flattened_tensor_bucket = None
+            else:
+                flattened_tensor = flattened_tensor_bucket.get_flattened_tensor()
             flattened_tensor_data = {
-                "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
+                "flattened_tensor": flattened_tensor,
                 "metadata": metadata,
             }
             long_live_tensors.append((flattened_tensor_bucket, flattened_tensor_data))
             try:
                 serialized = MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
             except (torch.AcceleratorError, RuntimeError) as exc:
-                logger.warning("CUDA IPC serialize failed (%s); falling back to pickle payload", exc)
-                gc.collect()
-                torch.cuda.ipc_collect()
-                torch.cuda.empty_cache()
+                logger.warning("IPC serialize failed (%s); falling back to pickle payload", exc)
                 raw_bytes = pickle.dumps(flattened_tensor_data, protocol=pickle.HIGHEST_PROTOCOL)
                 serialized = base64.b64encode(raw_bytes).decode("utf-8")
             serialized_tensors.append(serialized)

@@ -107,15 +107,15 @@ def load(actor: Any) -> dict[str, Any] | None:
     target_step = getattr(actor.args, "ckpt_step", None)
     if target_step is None:
         tracker_file = root_path / "latest_checkpointed_iteration.txt"
-        if not tracker_file.exists():
-            logger.info(f"[FSDP] No tracker file at {tracker_file}; skipping load.")
-            return None
-        tracker_text = tracker_file.read_text().strip()
-        target_step = int(tracker_text)
+        tracker_text = tracker_file.read_text().strip() if tracker_file.exists() else ""
+        target_step = int(tracker_text) if tracker_text.isdigit() else -1
         if dist.is_initialized():
             step_tensor = torch.tensor([target_step], dtype=torch.int64, device="cuda")
             dist.all_reduce(step_tensor, op=dist.ReduceOp.MAX)
             target_step = int(step_tensor.item())
+        if target_step < 0:
+            logger.info(f"[FSDP] No tracker file at {tracker_file}; skipping load.")
+            return None
 
     checkpoint_dir = root_path / f"iter_{target_step:07d}"
     model_dir = checkpoint_dir / "model"
