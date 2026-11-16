@@ -215,19 +215,16 @@ R_continuous = continuous_base + unique_bonus
 
 ### Doc ID reward、4 层前缀树 Credit Assignment 与耦合 `doc2k` 更新
 
-- **Doc ID Reward（带 `DOCID_REWARD_FLOOR = 25` 下界）**：
+- **Doc ID Reward（带 `DOCID_REWARD_FLOOR = 10` 下界）**：
   对同一个 doc ID $d$ 对应的去重 keyword 集合 $K(d)$ 取带分母下界的平均：
-  `R_docid(q, d) = sum_{k in K(d)} R_keyword(q, k) / max(|K(d)|, 25)`。
-- **4 层 RQ 前缀树 Credit Assignment**（[rollout_metrics.py](../../examples/experimental/generative_retriever/reward/rollout_metrics.py)）：
-  在同一 query 的 rollout group 内计算标准化 leaf advantage $A_{\text{leaf}}(d)$ 后，
-  按 4 层 RQ 前缀树自底向上聚合子树 `top-k` 均值（`TREE_CREDIT_TOP_K = (8, 4, 2)`，
-  分别对应 depth 3 / 2 / 1），并以每层权重 `TREE_CREDIT_LEVEL_WEIGHT = 0.25` 分配到 4 个
-  decoder token 位置。
-- **耦合 `doc2k` 在线动态映射更新**：
-  每个 rollout step 结束时，各 reward worker 通过 `/harvest_step_delta` 汇总本步增量；权重同步后、下一次 rollout 开始前，router 按已训练 step 顺序并发提交至各节点的 `mapping_service`。异步预取的下一步继续使用原权重和原映射，同一 rollout 内映射不变：
-  1. **Tail-to-Head 同前缀双头共投注入**：将尾部（rank > `DOC2K_HEAD_RANK_CUTOFF = 64`）同时满足 `PM >= 0.58 and SM >= 0.82` 且双头 Unique 的好词，优先路由至共享 RQ 前缀且词数 `< DOCID_REWARD_FLOOR` 的头部 doc ID，跨步累计被至少 `DOC2K_ADD_MIN_QUERIES = 2` 个不同 query 验证通过后注入（每 query 最多投票 `DOC2K_MAX_ADDS_PER_QUERY = 8` 个，单 doc ID 词数上限 `DOCID_MAX_KEYWORDS = 150`）；
-  2. **全桶冗余死词裁剪（零死词守恒）**：对所有词数 `> 1` 的 doc ID，每当跨步累计被至少 `DOC2K_PRUNE_MIN_QUERIES = 5` 个不同 query 召回时，裁剪该窗口内 0 次同时过 PM/SM 阈值且全库度数 `degree > 1` 的冗余词（每桶至少保留 1 个词，全库 `degree == 1` 的唯一归属词原位保留以保证零死词）。
-  同时，Baseline `/prepare` 始终查询初始静态映射（`use_initial=True`），保证 $B(q)$ 参照系固定不变。
+  `R_docid(q, d) = sum_{k in K(d)} R_keyword(q, k) / max(|K(d)|, 10)`。
+- **4 层 RQ 前缀树 Credit Assignment**（[gr_policy.py](../../examples/experimental/generative_retriever/sglang_models/gr_policy.py) / [rollout_metrics.py](../../examples/experimental/generative_retriever/reward/rollout_metrics.py)）：
+  在同一 query 的 rollout group 内对 512 个候选 doc ID 的原始 reward 按 4 层 RQ 前缀树自底向上聚合子树 `top-k` 均值（`TREE_CREDIT_TOP_K = (8, 4, 2)`，分别对应 depth 1 / 2 / 3），并以每层权重 `TREE_CREDIT_LEVEL_WEIGHT = 0.25` 融合生成 credited reward。
+- **耦合 `doc2k` 在线动态映射更新（全局 `(10, 32)` 投票同步）**：
+  每个 rollout step 期间，各 GPU 上的 SGLang 引擎在进程内打分后将本步候选投票写入本地 `/tmp/gr_doc2k_local_gpu{local_gpu}.pkl`；权重更新时，FSDP learner 通过 `GRStage5Policy._sync_global_doc2k_votes` 使用 NCCL `all_gather_into_tensor` / `broadcast` 汇总全集群投票并广播合并后的全局增量至 `/tmp/gr_doc2k_global_gpu{local_gpu}.pkl`，供同卡 SGLang 引擎在下一次 rollout 前就地更新内存中的 `ResidentMapping`（同一 rollout 内映射不变）：
+  1. **Tail-to-Head 同前缀双头共投注入**：将尾部（rank $\ge$ `DOC2K_HEAD_RANK_CUTOFF = 64`）同时满足 `PM >= 0.58 and SM >= 0.82` 且双头 Unique 的好词，优先路由至共享 RQ 前缀且词数 `< DOCID_REWARD_FLOOR = 10` 的头部 doc ID，全集群累计被至少 `DOC2K_ADD_MIN_QUERIES = 10` 个不同 query 验证通过后注入（每 query 最多投票 `DOC2K_MAX_ADDS_PER_QUERY = 8` 个，单 doc ID 词数上限 `DOCID_MAX_KEYWORDS = 150`）；
+  2. **大桶冗余死词裁剪（`DOC2K_PRUNE_FLOOR = 32` 下界保护）**：对词数 `> DOC2K_PRUNE_FLOOR = 32` 的肥桶 doc ID，每当全集群累计被至少 `DOC2K_PRUNE_MIN_QUERIES = 32` 个不同 query 召回时，裁剪该窗口内 0 次过 PM/SM 阈值的死词，且每桶至少保留 `32` 个词。
+  同时，Baseline 始终查询初始静态映射（`use_initial=True`），保证 $B(q)$ 参照系固定不变。保存 checkpoint 时（默认 `save_interval=5`），`save_doc2k_mapping` 先在本地 `/tmp` 暂存映射快照（`overlay.parquet` 与基础索引符号链接），再异步同步至 `$cosmos_data_path` 下的 `checkpoints/iter_XXXXXXX/mapping/`。
 
 GRPO launcher 以 `--reward-mode` 指定训练模式，HTTP reward 请求用 `reward_mode`；
 默认 `discrete_relevance_unique`。W&B 汇报 PM/SM 原始分数、pass、threshold
@@ -258,18 +255,15 @@ Relevance 使用原源码快照中的 `MultiCupGraphenePipeline`：
 - Query、keyword tower 各输出 `[B,2,128]`，cross scorer 输出 `[B,4]`。
 HTTP reward hook 对每个 sample 返回一个 doc ID 的平均 keyword reward。
 
-### Rollout 配置
+### Rollout 配置（全卡 Colocated 进程内推理 + Baseline + 映射 + 打分）
 
 - [constrained_decode.py](../../examples/experimental/generative_retriever/model/constrained_decode.py)
-  使用当前映射的 ID 前缀约束。训练阶段 Baseline 为确定性 top-512 beam，训练 rollout 为
-  constrained 512-beam 无放回采样（`decoding_mode="beam_sample"`，每 query 返回 512 个
-  互不重复的有效 doc ID 及 4 个 decoder token logprob）。
-- Rollout 经 SGLang router 的 `/v1/embeddings` 返回 token 和 logprob；
-  每个 query group 作为单个整组任务执行一次分词、一次 `/v1/embeddings` 生成、一次 `/prepare` 基准准备，并整组 512 个有序 beam 一起提交 `/score` 打分（通过 `--rollout-max-in-flight-groups` 控制同时在途的 query group 窗口：单机 `512`、多机 `1024n`，不改变 `rollout_batch_size` 与 `global_batch_size`）。Prepare 与 Score 请求在凑满整批（512 个 query / 2,048 个 sample）时零延迟立即并发派发，未满批时最多等待 10ms 合并；learner 使用同一前缀约束在 GPU 上向量化构造 response mask 并计算 logprob。
-- 单机 Rollout engine 使用两卡 DP=2，`sglang-server-concurrency=8192`，
-  `mem-fraction-static` 按并发与 group size 自适应推导（约 `0.15`）。
-  Launcher 检查 mapping、baseline 和 reward 服务的 `/health`，
-  复用配置一致的常驻服务。
+  使用当前映射的 ID 前缀约束（`SortedU32Constraint`）。训练阶段 Baseline 为确定性 top-512 beam，训练 rollout 为
+  constrained 512-beam Kool et al. Stochastic Beam Search 无放回采样（`decoding_mode="beam_sample"`，`temperature=0.4`，每 query 返回 512 个互不重复的有效 doc ID 及 4 个 decoder token logprob）。
+- 每张 GPU 运行 1 个 SGLang 引擎（`--rollout-num-gpus-per-engine 1 --sglang-dp-size 1`），托管 [gr_policy.py](../../examples/experimental/generative_retriever/sglang_models/gr_policy.py) 中的 `GRQwen3ForDocIDGeneration`：
+  - 进程内同时驻留可训练 Policy（Qwen3-4B + `docEnc2decoder` + `decoder` + `lm_head`）、冻结 Baseline（top-512 beam，带 32,768 条 LRU 缓存）、本地 `/tmp` 零拷贝 Arrow `mmap` `ResidentMapping`、以及同卡 `RelevanceScorer`（含节点级 `/dev/shm` 共享 keyword 向量表 `gr_kw_shm_v1_*` 与进程内 L1 score cache）和向量化 4 层前缀树 credit assignment。
+  - Rollout 客户端 [sglang_encode_generate.py](../../examples/experimental/generative_retriever/model/sglang_encode_generate.py) 自动从 SGLang router `/workers` 发现全部引擎直连地址，通过 `aiohttp` $O(1)$ round-robin 并发请求 `/v1/embeddings`（`encoding_format="base64"`），单次返回 `512 × 10 + 40 = 5160` 个 `float32`（每条 beam 的 4 个 token、4 个 logprob、credited reward、raw reward 及 40 项汇总/缓存指标），通过 `--rollout-max-in-flight-groups` 控制在途 query group 窗口（单机 `512`、多机 `512n`）。
+- 单机 8 卡全部 colocated（`sglang-server-concurrency=8192`，`mem-fraction-static=0.15`）。
 
 ### 训练规模（单机 8 卡）
 
@@ -284,13 +278,9 @@ HTTP reward hook 对每个 sample 返回一个 doc ID 的平均 keyword reward�
   在 batch 尚未完成时，现有 rollout 仍会记录失败 group 并另取 query
   补足；这不等同于对原始数据精确遍历，须单独处理，不能宣称已修复。
 - `global_batch_size=2048000`，每次 rollout 恰好形成一个 training step。
-- Learner 使用动态 token batching（`--use-dynamic-batch-size`，`max_tokens_per_gpu=131072`，
-  保持每个 query 的 512 个连续 sample 不被打散以最大化 prompt 去重效率）；
-  冻结 Qwen encoder 使用 backbone 的 last hidden state。
-- 每 20 个 training step 保存 checkpoint，最终 step 也保存；包括 model、
-  optimizer、LR scheduler、RNG 及 rollout 数据位置。
-- 默认执行 `train_async.py`，Train N 与 Rollout N+1 重叠，
-  每步同步权重，并使用 rollout logprob 作为 behavior-policy denominator。
+- Learner 与 SGLang 全卡共置（`--colocate --no-offload-train --no-offload-rollout`），按连续整组对齐切分 DP shard，固定 `micro_batch_size=5120`（即每个 microbatch 含 10 个完整 query × 512 个连续 sample），`GRStage5Policy` 在前向中对连续 512 个相同 prompt 自动去重，使 Qwen3-4B 每个 microbatch 仅编码 10 条唯一 query；**Qwen3-4B 编码器与解码头联合训练**并通过 `--weight-sync-include-prefixes encoder_list.0.model.encoder.model. docEnc2decoder. decoder. lm_head.` 同步权重。
+- 默认每 `save_interval=5` 个 training step 保存 checkpoint，最终 step 也保存（先写入本地 `/tmp` 再异步同步至 FUSE）；包括 model、optimizer、LR scheduler、RNG、rollout 数据位置及 `checkpoints/iter_XXXXXXX/mapping/` 动态映射快照。
+- 执行 `train.py`（配合 `--use-rollout-logprobs --skip-actor-forward-only`），使用 rollout logprob 作为 behavior-policy denominator。
   FSDP 跳过额外的 actor 无梯度 logprob 前向；反向训练的前向仍计算
   policy loss 和梯度。此模式不再输出该额外前向生成的 `rollout/log_probs`
   与 `rollout/entropy` 指标。
@@ -394,39 +384,30 @@ CUDA_VISIBLE_DEVICES=4,5 uv run python -m \
      - **`query_features`（`--query-cache-size`）**：按 `xxhash64(q) % 8` 分片常驻在对应 GPU 显存及主进程内存缓存中（每条仅 `512 Bytes`），Baseline `/prepare` 编码一次 $q$ 后，后续 Rollout `/score` 直接 $O(1)$ 复用 `q_emb`；
      - **`keyword_features`（`--keyword-cache-size`）**：按 `xxhash64(k) % 8`（`k-hash`）在节点内 8 张 GPU 显存间全局分片（每卡最高 `16,777,216` 条仅占 `8.0 GiB` HBM，单节点 8 卡合并不重复常驻 **`1.34 亿`条** 唯一 keyword 向量）。同一节点内任何 keyword 最多只编码一次，8 张 GPU 子进程并行执行查表/编码与 `cross_model(q_emb, k_emb)` 打分，多机之间节点级独立闭环、零跨机打分网络通信。
 
-### 两机 16 GPU 与多机 `2n × 8` GPU 异步 GRPO 配置
+### 两机 16 GPU 与多机 `2n × 8` GPU Colocated GRPO 配置
 
 [run_grpo_multinode_async.py](../../examples/experimental/generative_retriever/run_grpo_multinode_async.py)
-是 Git 仓库内的多机入口，底层执行 **`train_async.py`**（Train N 与 Rollout N+1 重叠）。
-`--hosts` 按「服务/rollout 节点、learner 节点」依次成对排列；每个节点 8 卡，总计 `2n` 台：
+是 Git 仓库内的多机入口，按节点对（每对 2 台 8 卡节点 = 16 卡，共 `n` 对 = `2n` 台、`16n` 卡）全卡 colocated 运行：
 
-- 每对节点（16 卡）分配 8 learner（节点 `2k+1` 的 GPU 0–7）、4 rollout（节点 `2k` 的 GPU 4–7）、4 frozen baseline（节点 `2k` 的 GPU 0–3）和 **16 reward GPU（节点 `2k` 与节点 `2k+1` 的全部 GPU 0–7）**。
-- 每台节点并行启动或复用本机 `31480` 的 API v3 常驻 `mapping_service`，并由当前 run 独占；`/lookup` 在节点本地完成。run 结束时释放所有权，基础索引继续驻留。新 run 清除旧增量；恢复 run 从匹配的 `mapping/overlay.parquet` 恢复，旧 checkpoint 如缺少该文件则不能恢复。旧版常驻服务不能安全复用，不会被自动停止。
-- 每步汇总增量并暂存，在 rollout 权重同步后按 step 顺序并发更新各节点；预取 rollout 的增量留待下次权重同步。保存 checkpoint 后在对应权重同步时保存匹配的映射快照至 `checkpoints/iter_XXXXXXX/mapping/`。默认每步同步权重；若同步间隔大于一，checkpoint 要等到后续权重同步才包含映射快照，最后一步必须落在同步边界，否则启动时报错。
-- 每步处理 **`8000n` query × `512` sample**（两机 16 卡即 `8,000` query/step，`global_batch_size = 4,096,000n`，同时在途 query group 上限 `rollout_max_in_flight_groups = 1024n`）。
-- 完整遍历 `15,000,000` 条数据的最大 optimizer step 数为 **`1875 // n`**（例如 `n=1` 为 `1,875` 步，`n=3` 为 `625` 步，`n=4` 六十四卡为 `468` 步）。
-支持 `--num-rollout` 指定不超过该上限的短验收步骤；正式训练省略此参数。
-此精确遍历前提是每轮无请求或 group 失败；否则现有 rollout 会
-跳过失败 group 并补取 query，不能将运行结果视为精确遍历。
-旧 run `261021-114423-121` 在早期 rollout 已跳过失败 group，即使其
-`iter_0000040` checkpoint 完整，也不能用它证明精确遍历 1500 万条。
+- **全卡 Colocated 架构**：集群内全部 `16n` 张 GPU 同时承载 SGLang Rollout 引擎（每卡 1 个实例，进程内含 Policy、Frozen Baseline、零拷贝 Arrow `ResidentMapping`、同卡 `RelevanceScorer` 及节点内 `/dev/shm` 共享 keyword 向量表）与 FSDP Learner（节点内 8 卡 FSDP 分片、跨 `2n` 台节点 HSDP 副本 `--dp-replicate-size 2n`）。
+- **单步吞吐与 Batch 规模**：每对节点（16 卡）每步处理 **`16,000` query × `512` sample**，因此 `n` 对节点每步处理 **`16,000n` query × `512` sample**（两机 16 卡为 `16,000` query/step，`global_batch_size = 8,192,000n`；八机 64 卡 `n=4` 为 `64,000` query/step，`global_batch_size = 32,768,000`；同时在途 query group 上限 `rollout_max_in_flight_groups = 512n`，`sglang_server_concurrency = 16,384n`，`micro_batch_size = 5,120`）。
+- **1500 万条数据完整 1 Epoch 步数**：完整遍历 `15,000,000` 条数据且不越界回绕的最大 optimizer step 数为 **`937 // n`**：
+  - `n=1`（两机 16 卡）：**`937` 步**（消费 `14,992,000` 条）；
+  - `n=3`（六机 48 卡）：**`312` 步**（消费 `14,976,000` 条）；
+  - `n=4`（八机 64 卡）：**`234` 步**（`234 × 64,000 = 14,976,000` 条，占全量 99.84%）。
+  支持 `--num-rollout` 指定不超过该上限的短验收步骤；正式训练省略此参数。
+  此精确遍历前提是每轮无请求或 group 失败；否则现有 rollout 会
+  跳过失败 group 并补取 query，不能将运行结果视为精确遍历。
+  旧 run `261021-114423-121` 在早期 rollout 已跳过失败 group，即使其
+  `iter_0000040` checkpoint 完整，也不能用它证明精确遍历 1500 万条。
+- **动态映射同步与 Checkpoint**：每步权重更新时通过 NCCL 汇总全集群 `doc2k` 投票并更新各卡映射；每 `save_interval=5` 步及最终步在本地 `/tmp` 暂存 checkpoint 与 `checkpoints/iter_XXXXXXX/mapping/overlay.parquet`（含基础索引自动修复符号链接），并在后台异步同步至 `$cosmos_data_path`。
 
-先在首个服务节点检查各节点共享的 Cosmos 路径、ROCm 环境及免密 SSH。
+先在首个节点检查各节点共享的 Cosmos 路径、ROCm 环境及免密 SSH。
 所有节点必须部署同一 Miles commit，且运行工作树干净；入口启动前检查
 commit 和工作树状态，另行验证外部 SGLang 补丁、SLMv3 模型源码与
 Stage5/Qwen 索引。不一致就拒绝启动，不会覆盖其他节点的工作树。
-每个节点优先检测本机的 `31480` 常驻 mapping；仅当 `/health` 的 `api_version == 2`、
-版本名称和映射路径与当前统一列式索引一致时才复用，
-并且不会在本次任务退出时停止该服务。没有常驻服务时才在本机 `31580` 启动任务专属
-mapping；有服务但映射不符则明确报错，不使用错误数据。
-冻结 baseline 同样在每个服务节点的 `31581` 验证健康状态和完整配置
-（Stage5、Qwen、SLMv3、当前映射、4 GPU、constrained top-512）；一致则复用，
-端口被不匹配服务占用时拒绝启动。首次启动的 baseline 在本次训练结束后仍常驻
-服务节点 GPU 0–3，供下一次相同配置的 run 复用，不由训练任务清理。确认没有
-训练任务依赖它之后，可根据 `31581` 的监听 PID 单独停止；不要按进程名批量清理。
-AzureML FUSE 挂载的符号链接不会自动出现在其他节点；入口会在各节点就地创建
-训练数据的 `.jsonl` 别名及 SGLang bundle 的模型/Tokenizer 链接，并验证可读，
-不会复制或替换原始数据、权重。
+入口在各节点本地 `/tmp` 预先准备模型、映射索引及 SGLang bundle（含 `keywords_only.arrow`），
+避免多机训练期间高频读取 AzureML FUSE 挂载。
 W&B 必须提供 `WANDB_API_KEY`；入口与单机 launcher
 使用相同的 `miles-run_grpo` project 和 run-id group，密钥不写入 run manifest。
 `.env` 只用于导入运行环境，不传给服务进程；建议仅允许文件所有者读取：
@@ -447,7 +428,7 @@ uv run --no-sync --env-file .env python -m \
   examples.experimental.generative_retriever.run_grpo_multinode_async \
   --hosts node-0,node-1 --run-id <run_id> --dry-run
 
-# 两机 16 卡：8000 query/step × 1875 step = 1500 万条。
+# 两机 16 卡（n=1）：16000 query/step × 937 step = 14,992,000 条。
 uv run --no-sync --env-file .env python -m \
   examples.experimental.generative_retriever.run_grpo_multinode_async \
   --hosts node-0,node-1 --run-id <run_id>
@@ -457,22 +438,19 @@ uv run --no-sync --env-file .env python -m \
   examples.experimental.generative_retriever.run_grpo_multinode_async \
   --hosts node-0,node-1 --run-id <run_id> --resume
 
-# 六机 48 卡（n=3）举例：24000 query/step × 625 step = 1500 万条。
+# 八机 64 卡（n=4）：64000 query/step × 234 step = 14,976,000 条。
 uv run --no-sync --env-file .env python -m \
   examples.experimental.generative_retriever.run_grpo_multinode_async \
-  --hosts node-0,node-1,node-2,node-3,node-4,node-5 --run-id <another_run_id>
+  --hosts node-0,node-1,node-2,node-3,node-4,node-5,node-6,node-7 --run-id <another_run_id>
 ```
 
-全局 reward score 请求并发为 `32n`、prepare 并发为 `4n`，每个 8 卡节点 worker
-的转发并发为 `8`。入口只在端口未占用时建立本次运行所需的 reward/router 服务
-及 Ray 集群，不终止别的任务；启动时先并行检查所有节点的源码、模型索引及依赖，
+入口只在 Ray 端口（`16380`）未占用时建立本次运行所需的 Ray 集群，不终止别的任务；
+启动时先并行检查所有节点的源码、模型索引及依赖，
 全部通过后才并行分发本机 manifest 和准备本地 SGLang bundle。run 目录保存不可变的
 `manifest-<配置摘要>.json`，供 `--resume` 核对配置；各节点会验证该记录的内容一致。
-旧 run 的 `manifest.json` 仍可用于恢复。服务/训练日志、checkpoint 和该记录
-位于 `$cosmos_data_path/local/User/zihao/online_rl/gr_offline_syn/<run_id>/`。
+旧 run 的 `manifest.json` 仍可用于恢复。运行日志保存在各节点 `/tmp/gr_logs_<run_id>/`，
+checkpoint 和 manifest 记录位于 `$cosmos_data_path/local/User/zihao/online_rl/gr_offline_syn/<run_id>/`。
 成功条件为 `latest_checkpointed_iteration.txt` 等于目标 step 数。
-新多机入口需先以 `--num-rollout 2` 单独 run-id 验收 W&B、GPU 归属和 checkpoint，
-再执行全量训练；短跑并不能证明全量运行已完成。
 
 ## 离线 good-count eval 与训练资源隔离
 
