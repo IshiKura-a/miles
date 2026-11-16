@@ -112,6 +112,10 @@ def load(actor: Any) -> dict[str, Any] | None:
             return None
         tracker_text = tracker_file.read_text().strip()
         target_step = int(tracker_text)
+        if dist.is_initialized():
+            step_tensor = torch.tensor([target_step], dtype=torch.int64, device="cuda")
+            dist.all_reduce(step_tensor, op=dist.ReduceOp.MAX)
+            target_step = int(step_tensor.item())
 
     checkpoint_dir = root_path / f"iter_{target_step:07d}"
     model_dir = checkpoint_dir / "model"

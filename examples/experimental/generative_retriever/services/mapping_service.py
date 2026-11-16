@@ -100,6 +100,15 @@ def stage_local_doc2k_state(
         resume_dst.unlink(missing_ok=True)
         return
     iteration = int(tracker.read_text(encoding="utf-8").strip())
+    for entry in ckpt_root.iterdir():
+        if entry.name.startswith("iter_") and entry.name[5:].isdigit():
+            cand = int(entry.name[5:])
+            if (
+                cand > iteration
+                and (entry / "meta.json").is_file()
+                and (entry / "mapping" / "overlay.parquet").is_file()
+            ):
+                iteration = cand
     overlay_src = ckpt_root / f"iter_{iteration:07d}" / "mapping" / "overlay.parquet"
     if not overlay_src.is_file():
         resume_dst.unlink(missing_ok=True)

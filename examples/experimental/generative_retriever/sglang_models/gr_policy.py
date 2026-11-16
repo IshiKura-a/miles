@@ -815,17 +815,17 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
                     b_loader = getattr(baseline_param, "weight_loader", default_weight_loader)
                     b_loader(baseline_param, loaded_weight)
                     loaded_head_keys.append(baseline_target)
-        if qwen_weights:
+        had_qwen_weights = bool(qwen_weights)
+        if had_qwen_weights:
             super().load_weights(qwen_weights)
-        if not self._baseline_initialized and loaded_head_keys and qwen_weights:
+            qwen_weights.clear()
+        if not self._baseline_initialized and loaded_head_keys and had_qwen_weights:
             for b_param, p_param in zip(self.baseline_model.parameters(), self.model.parameters(), strict=True):
                 b_param.data.copy_(p_param.data)
             self._baseline_initialized = True
-        if self._has_uncommitted_rollout and (loaded_head_keys or qwen_weights):
+        if self._has_uncommitted_rollout and (loaded_head_keys or had_qwen_weights):
             self._has_uncommitted_rollout = False
             self._commit_step_doc2k_updates()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
     def _commit_step_doc2k_updates(self) -> None:
         if self._mapping_engine is None:

@@ -1,5 +1,8 @@
 import abc
+import base64
+import gc
 import logging
+import pickle
 import socket
 from argparse import Namespace
 from collections.abc import Sequence
@@ -87,6 +90,9 @@ class UpdateWeight(abc.ABC):
                 [async_utils.submit(client.begin_weight_update()) for client in self.rollout_engines]
             )
         dist.barrier(group=get_gloo_group())
+        gc.collect()
+        torch.cuda.ipc_collect()
+        torch.cuda.empty_cache()
 
         bucket = []
         bucket_size = 0
@@ -125,6 +131,9 @@ class UpdateWeight(abc.ABC):
                 [async_utils.submit(client.continue_generation()) for client in self.rollout_engines]
             )
         dist.barrier(group=get_gloo_group())
+        gc.collect()
+        torch.cuda.ipc_collect()
+        torch.cuda.empty_cache()
 
     def wait_and_update_bucket_weights(self, bucket):
         resolved = []
@@ -134,7 +143,10 @@ class UpdateWeight(abc.ABC):
             if target_dtype is not None and param.dtype != target_dtype:
                 param = param.to(target_dtype)
             resolved.append((name, param))
+        bucket.clear()
         self.update_bucket_weights(resolved, weight_version=self.weight_version)
+        del resolved
+        torch.cuda.ipc_collect()
 
     @abc.abstractmethod
     def update_bucket_weights(self, named_tensors, weight_version=None) -> None:
@@ -172,22 +184,37 @@ class UpdateWeightFromTensor(UpdateWeight):
     def update_bucket_weights(self, named_tensors, weight_version=None) -> None:
         monkey_patch_torch_reductions()
         logger.info("Using flattened tensor bucket")
-        named_tensors_by_dtypes = {}
-        for name, tensor in named_tensors:
-            dtype = tensor.dtype
-            if dtype not in named_tensors_by_dtypes:
-                named_tensors_by_dtypes[dtype] = []
-            named_tensors_by_dtypes[dtype].append((name, tensor))
+        torch.cuda.ipc_collect()
+        if getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
+            named_tensors_by_dtypes = {"dtype": named_tensors}
+        else:
+            named_tensors_by_dtypes = {}
+            for name, tensor in named_tensors:
+                dtype = tensor.dtype
+                if dtype not in named_tensors_by_dtypes:
+                    named_tensors_by_dtypes[dtype] = []
+                named_tensors_by_dtypes[dtype].append((name, tensor))
 
         serialized_tensors = []
-        for _dtype, named_tensors in named_tensors_by_dtypes.items():
-            flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+        long_live_tensors = []
+        for _dtype, group_tensors in named_tensors_by_dtypes.items():
+            flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=group_tensors)
             metadata = flattened_tensor_bucket.get_metadata()
             flattened_tensor_data = {
                 "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
                 "metadata": metadata,
             }
-            serialized_tensors.append(MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True))
+            long_live_tensors.append((flattened_tensor_bucket, flattened_tensor_data))
+            try:
+                serialized = MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
+            except (torch.AcceleratorError, RuntimeError) as exc:
+                logger.warning("CUDA IPC serialize failed (%s); falling back to pickle payload", exc)
+                gc.collect()
+                torch.cuda.ipc_collect()
+                torch.cuda.empty_cache()
+                raw_bytes = pickle.dumps(flattened_tensor_data, protocol=pickle.HIGHEST_PROTOCOL)
+                serialized = base64.b64encode(raw_bytes).decode("utf-8")
+            serialized_tensors.append(serialized)
 
         if self._ipc_gather_src == dist.get_rank():
             # On rank 0, prepare a list to hold the gathered batches from all ranks.
@@ -228,6 +255,8 @@ class UpdateWeightFromTensor(UpdateWeight):
 
         if dist.get_rank() == self._ipc_gather_src:
             async_utils.run(self._ipc_engine.flush_cache())
+        del long_live_tensors
+        torch.cuda.ipc_collect()
 
 
 class UpdateWeightFromDistributed(UpdateWeight):

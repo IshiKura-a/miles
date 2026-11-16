@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 def clear_memory(clear_host_memory: bool = False):
     torch.cuda.synchronize()
     gc.collect()
+    torch.cuda.ipc_collect()
     torch.cuda.empty_cache()
     if clear_host_memory:
         torch._C._host_emptyCache()
