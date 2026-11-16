@@ -68,10 +68,12 @@ python3 .claude/skills/vscode-tunnel/scripts/vscode_tunnel_exec.py read \
 1. Queries `https://global.rel.tunnels.api.visualstudio.com/api/v1/tunnels?global=true`
    and resolves the tunnel whose `name` or `tags` matches `--tunnel` (preferring
    active tunnels with `hostConnectionCount > 0`).
-2. Acquires an exclusive file lock (`/tmp/vscode_tunnel_31545.lock`) and spawns
-   `~/.local/bin/devtunnel connect <tunnelId>.<clusterId> -t -` to forward the
-   remote VS Code CLI `control_server` port `31545` to local `127.0.0.1:31545`.
+2. Spawns an independent `~/.local/bin/devtunnel connect <tunnelId>.<clusterId> -t -`
+   forwarder per invocation and parses the dynamically assigned local forwarding
+   port (`Forwarding from 127.0.0.1:<local_port> to host port 31545.`), so
+   multiple processes can access the same or different tunnels concurrently
+   without lock contention or port collisions.
 3. Speaks VS Code CLI `protocolv6` MessagePack-RPC (`spawn` / `fs_read`) over
-   `127.0.0.1:31545`, demultiplexing `stdout` and `stderr` streams in real time
-   and propagating the remote exit code.
-4. Terminates the local `devtunnel` forwarder and releases the lock on exit.
+   `127.0.0.1:<local_port>`, demultiplexing `stdout` and `stderr` streams in
+   real time and propagating the remote exit code.
+4. Terminates its own local `devtunnel` forwarder on exit.

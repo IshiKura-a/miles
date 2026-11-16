@@ -5,15 +5,16 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-import fcntl
 import json
 import os
 from pathlib import Path
 import re
+import selectors
 import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 from typing import Any
 import urllib.error
@@ -29,7 +30,7 @@ CLUSTER_TUNNEL_URL_TEMPLATE = (
 )
 DEVTUNNEL_DOWNLOAD_URL = "https://aka.ms/TunnelsCliDownload/linux-x64"
 CONTROL_PORT = 31545
-LOCK_FILE_PATH = Path("/tmp/vscode_tunnel_31545.lock")
+_FORWARD_RE = re.compile(rf"Forwarding from 127\.0\.0\.1:(\d+) to host port {CONTROL_PORT}\.")
 SYSTEM_TAGS = frozenset({"protocolv6", "vscode-server-launcher", "_flag4"})
 
 
@@ -209,33 +210,70 @@ def _ensure_devtunnel_binary() -> Path:
     return local_bin
 
 
-def _wait_for_local_port(port: int, proc: subprocess.Popen[str], timeout_sec: float = 20.0) -> socket.socket:
+def _wait_for_forwarded_socket(proc: subprocess.Popen[str], timeout_sec: float = 30.0) -> socket.socket:
+    assert proc.stdout is not None
+    sel = selectors.DefaultSelector()
+    sel.register(proc.stdout, selectors.EVENT_READ)
+    output_lines: list[str] = []
+    local_port: int | None = None
     deadline = time.monotonic() + timeout_sec
+    try:
+        while local_port is None and time.monotonic() < deadline:
+            if proc.poll() is not None:
+                rem = proc.stdout.read() or ""
+                if rem:
+                    output_lines.append(rem)
+                raise RuntimeError(
+                    f"devtunnel exited prematurely (code {proc.returncode}):\n{''.join(output_lines)}"
+                )
+            for key, _ in sel.select(timeout=0.5):
+                line = key.fileobj.readline()  # type: ignore[union-attr]
+                if not line:
+                    continue
+                output_lines.append(line)
+                match = _FORWARD_RE.search(line)
+                if match:
+                    local_port = int(match.group(1))
+                    break
+    finally:
+        sel.close()
+
+    if local_port is None:
+        raise TimeoutError(
+            f"Timed out waiting for devtunnel port forwarding to host port {CONTROL_PORT}:\n"
+            f"{''.join(output_lines)}"
+        )
+
+    def _drain_stdout(stream: Any) -> None:
+        try:
+            for _ in stream:
+                pass
+        except Exception:
+            pass
+
+    threading.Thread(target=_drain_stdout, args=(proc.stdout,), daemon=True).start()
+
     while time.monotonic() < deadline:
         if proc.poll() is not None:
-            out = proc.stdout.read() if proc.stdout else ""
-            raise RuntimeError(f"devtunnel exited prematurely (code {proc.returncode}):\n{out}")
+            raise RuntimeError(f"devtunnel exited prematurely (code {proc.returncode})")
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            sock.connect(("127.0.0.1", port))
+            sock.connect(("127.0.0.1", local_port))
             return sock
         except OSError:
             sock.close()
-            time.sleep(0.25)
-    raise TimeoutError(f"Timed out waiting for devtunnel to forward 127.0.0.1:{port}")
+            time.sleep(0.1)
+    raise TimeoutError(f"Timed out connecting to forwarded port 127.0.0.1:{local_port}")
 
 
 def _with_control_socket(target: TunnelTarget, timeout_sec: float):
     class _Session:
         def __init__(self) -> None:
-            self._lock_fd: int | None = None
             self._proc: subprocess.Popen[str] | None = None
             self.sock: socket.socket | None = None
 
         def __enter__(self) -> socket.socket:
             devtunnel_bin = _ensure_devtunnel_binary()
-            self._lock_fd = os.open(str(LOCK_FILE_PATH), os.O_CREAT | os.O_RDWR, 0o600)
-            fcntl.flock(self._lock_fd, fcntl.LOCK_EX)
             self._proc = subprocess.Popen(
                 [
                     str(devtunnel_bin),
@@ -248,11 +286,12 @@ def _with_control_socket(target: TunnelTarget, timeout_sec: float):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                bufsize=1,
             )
             assert self._proc.stdin is not None
             self._proc.stdin.write(target.connect_token + "\n")
             self._proc.stdin.close()
-            self.sock = _wait_for_local_port(CONTROL_PORT, self._proc)
+            self.sock = _wait_for_forwarded_socket(self._proc)
             self.sock.settimeout(timeout_sec)
             return self.sock
 
@@ -268,11 +307,6 @@ def _with_control_socket(target: TunnelTarget, timeout_sec: float):
                     self._proc.wait(timeout=3)
                 except Exception:
                     self._proc.kill()
-            if self._lock_fd is not None:
-                try:
-                    fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
-                finally:
-                    os.close(self._lock_fd)
 
     return _Session()
 
