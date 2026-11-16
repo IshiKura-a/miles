@@ -8,21 +8,16 @@ import os
 import sys
 import pickle
 from pathlib import Path
-import shutil
 import tempfile
 import time
 from typing import Any, cast
 
-from filelock import FileLock
 import numpy as np
-import pyarrow as pa
-import pyarrow.parquet as pq
 import torch
 from torch import nn
 from transformers import AutoTokenizer, T5Config
 from transformers.models.t5.modeling_t5 import T5Stack
 
-from examples.experimental.generative_retriever.index.id_text_mapping import COLUMNAR_INDEX_FILES
 from examples.experimental.generative_retriever.model.constrained_decode import (
     build_generation_model,
     generate_beams,
@@ -31,10 +26,10 @@ from examples.experimental.generative_retriever.model.constrained_decode import 
 )
 from examples.experimental.generative_retriever.reward.relevance_model import (
     RelevanceScorer,
-    _stage_local_relevance_model,
-    _stage_local_relevance_source,
     load_relevance_pipeline_factory,
     relevance_source_path,
+    stage_local_relevance_model,
+    stage_local_relevance_source,
 )
 from examples.experimental.generative_retriever.reward.relevance_reward import (
     BaselineSets,
@@ -52,7 +47,10 @@ from examples.experimental.generative_retriever.reward.relevance_reward import (
     score_and_summarize_docid,
 )
 from examples.experimental.generative_retriever.services.lru_cache import LRUCache
-from examples.experimental.generative_retriever.services.mapping_service import ResidentMapping
+from examples.experimental.generative_retriever.services.mapping_service import (
+    ResidentMapping,
+    stage_local_mapping_dir,
+)
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -131,40 +129,6 @@ def _resolve_physical_gpu_id(device: torch.device | None = None) -> int:
 
 _PROMPT_PREFIX = 'Given the user Query: "'
 _PROMPT_SUFFIX = '", summarize it in one token:'
-
-
-def _stage_local_mapping_dir(mapping_path: str | Path) -> Path:
-    resolved = Path(mapping_path).resolve()
-    local_root = Path(tempfile.gettempdir())
-    target = resolved if resolved.is_relative_to(local_root) else local_root / f"gr_mapping_{resolved.name}"
-    sentinel = target / ".staged_arrow_ok"
-    if not sentinel.is_file():
-        with FileLock(f"{target}.lock"):
-            if not sentinel.is_file():
-                target.mkdir(parents=True, exist_ok=True)
-                for fname in COLUMNAR_INDEX_FILES:
-                    src = resolved / fname
-                    if not src.is_file():
-                        raise FileNotFoundError(f"Columnar mapping file missing: {src}")
-                    dst = target / fname
-                    if dst != src and (not dst.is_file() or dst.stat().st_size != src.stat().st_size):
-                        tmp_fd, tmp_name = tempfile.mkstemp(prefix=f".{fname}.", dir=target)
-                        os.close(tmp_fd)
-                        tmp_path = Path(tmp_name)
-                        shutil.copyfile(src, tmp_path)
-                        tmp_path.replace(dst)
-                ipc_dst = target / "keywords_only.arrow"
-                if not ipc_dst.is_file():
-                    tmp_fd, tmp_name = tempfile.mkstemp(prefix=".keywords_only.arrow.", dir=target)
-                    os.close(tmp_fd)
-                    tmp_ipc = Path(tmp_name)
-                    tbl = pq.read_table(target / "keywords.parquet", columns=["keyword"])
-                    with pa.OSFile(str(tmp_ipc), "wb") as sink:
-                        with pa.ipc.new_file(sink, tbl.schema) as writer:
-                            writer.write_table(tbl)
-                    tmp_ipc.replace(ipc_dst)
-                sentinel.write_text(str(resolved), encoding="utf-8")
-    return target
 
 
 def _level_top_k_means(sorted_keys: np.ndarray, sorted_rewards: np.ndarray, ord_desc: np.ndarray, k: int) -> np.ndarray:
@@ -312,7 +276,7 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
         object.__setattr__(self, "_baseline_generation_model", baseline_generation_model)
         if self.relevance_model_path:
             tokenizer = AutoTokenizer.from_pretrained(self.qwen_model_path, trust_remote_code=True)
-            staged_map_dir = _stage_local_mapping_dir(self.id_mapping_path)
+            staged_map_dir = stage_local_mapping_dir(self.id_mapping_path)
             mapping_engine = ResidentMapping(staged_map_dir, read_only=True)
             object.__setattr__(self, "_qwen_tokenizer", tokenizer)
             object.__setattr__(self, "_mapping_engine", mapping_engine)
@@ -337,12 +301,12 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
             return
         if self._qwen_tokenizer is None or self._mapping_engine is None:
             tokenizer = AutoTokenizer.from_pretrained(self.qwen_model_path, trust_remote_code=True)
-            staged_map_dir = _stage_local_mapping_dir(self.id_mapping_path)
+            staged_map_dir = stage_local_mapping_dir(self.id_mapping_path)
             mapping_engine = ResidentMapping(staged_map_dir, read_only=True)
             object.__setattr__(self, "_qwen_tokenizer", tokenizer)
             object.__setattr__(self, "_mapping_engine", mapping_engine)
-        rel_src = _stage_local_relevance_source(relevance_source_path(self.relevance_model_path))
-        rel_model = _stage_local_relevance_model(self.relevance_model_path)
+        rel_src = stage_local_relevance_source(relevance_source_path(self.relevance_model_path))
+        rel_model = stage_local_relevance_model(self.relevance_model_path)
         factory = load_relevance_pipeline_factory(rel_src)
         dev_str = f"cuda:{device.index or 0}" if device.type == "cuda" else str(device)
         pipeline = factory(
@@ -829,6 +793,10 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
                     loaded_head_keys.append(baseline_target)
         if qwen_weights:
             super().load_weights(qwen_weights)
+        if not self._baseline_initialized and loaded_head_keys and qwen_weights:
+            for b_param, p_param in zip(self.baseline_model.parameters(), self.model.parameters(), strict=True):
+                b_param.data.copy_(p_param.data)
+            self._baseline_initialized = True
         if self._has_uncommitted_rollout and (loaded_head_keys or qwen_weights):
             self._has_uncommitted_rollout = False
             self._commit_step_doc2k_updates()

@@ -7,39 +7,108 @@ Run:
 
 from __future__ import annotations
 
-import atexit
-import threading
-
-from examples.experimental.generative_retriever.utils.paths import absolute_path, symlink_target
-
 import argparse
+import atexit
+from collections.abc import Iterator
+from contextlib import asynccontextmanager, contextmanager
 import gc
 import logging
-from contextlib import asynccontextmanager, contextmanager
+import os
 from pathlib import Path
+import shutil
+import tempfile
+import threading
 from threading import RLock
+import time
 from typing import Annotated, Any
-from collections.abc import Iterator
 
+from fastapi import FastAPI, HTTPException, Request
+from filelock import FileLock
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
-import uvicorn
-from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field, StrictInt, field_validator
+import uvicorn
 
 from examples.experimental.generative_retriever.index.id_text_mapping import (
+    COLUMNAR_INDEX_FILES,
     PositionalID,
     is_columnar_index_dir,
     pack_docid_u32,
     validate_docid,
 )
 from examples.experimental.generative_retriever.reward.relevance_reward import DOC2K_PRUNE_FLOOR, DOCID_MAX_KEYWORDS
+from examples.experimental.generative_retriever.utils.paths import absolute_path, symlink_target
 
 logger = logging.getLogger(__name__)
 MAPPING_SERVICE_API_VERSION = 3
 _SERVICE_API_VERSION = MAPPING_SERVICE_API_VERSION
 _NA_LOCALE_ALIASES = frozenset({"NA", "EN-US", "EN-CA", "ES-US", "FR-CA"})
+RESUME_OVERLAY_FILENAME = "gr_doc2k_resume_overlay.parquet"
+
+
+def stage_local_mapping_dir(mapping_path: str | Path) -> Path:
+    resolved = Path(mapping_path).resolve()
+    local_root = Path(tempfile.gettempdir())
+    target = resolved if resolved.is_relative_to(local_root) else local_root / f"gr_mapping_{resolved.name}"
+    sentinel = target / ".staged_arrow_ok"
+    if not sentinel.is_file():
+        with FileLock(f"{target}.lock"):
+            if not sentinel.is_file():
+                target.mkdir(parents=True, exist_ok=True)
+                for fname in COLUMNAR_INDEX_FILES:
+                    src = resolved / fname
+                    if not src.is_file():
+                        raise FileNotFoundError(f"Columnar mapping file missing: {src}")
+                    dst = target / fname
+                    if dst != src and (not dst.is_file() or dst.stat().st_size != src.stat().st_size):
+                        tmp_fd, tmp_name = tempfile.mkstemp(prefix=f".{fname}.", dir=target)
+                        os.close(tmp_fd)
+                        tmp_path = Path(tmp_name)
+                        shutil.copyfile(src, tmp_path)
+                        tmp_path.replace(dst)
+                ipc_dst = target / "keywords_only.arrow"
+                if not ipc_dst.is_file():
+                    tmp_fd, tmp_name = tempfile.mkstemp(prefix=".keywords_only.arrow.", dir=target)
+                    os.close(tmp_fd)
+                    tmp_ipc = Path(tmp_name)
+                    tbl = pq.read_table(target / "keywords.parquet", columns=["keyword"])
+                    with pa.OSFile(str(tmp_ipc), "wb") as sink:
+                        with pa.ipc.new_file(sink, tbl.schema) as writer:
+                            writer.write_table(tbl)
+                    tmp_ipc.replace(ipc_dst)
+                sentinel.write_text(str(resolved), encoding="utf-8")
+    return target
+
+
+def stage_local_doc2k_state(
+    checkpoint_dir: str | Path | None = None,
+    *,
+    resume: bool = False,
+) -> None:
+    local_root = Path(tempfile.gettempdir())
+    for gpu_idx in range(16):
+        (local_root / f"gr_doc2k_local_gpu{gpu_idx}.pkl").unlink(missing_ok=True)
+        (local_root / f"gr_doc2k_global_gpu{gpu_idx}.pkl").unlink(missing_ok=True)
+    resume_dst = local_root / RESUME_OVERLAY_FILENAME
+    if not resume or checkpoint_dir is None:
+        resume_dst.unlink(missing_ok=True)
+        return
+    ckpt_root = Path(checkpoint_dir)
+    tracker = ckpt_root / "latest_checkpointed_iteration.txt"
+    if not tracker.is_file():
+        resume_dst.unlink(missing_ok=True)
+        return
+    iteration = int(tracker.read_text(encoding="utf-8").strip())
+    overlay_src = ckpt_root / f"iter_{iteration:07d}" / "mapping" / "overlay.parquet"
+    if not overlay_src.is_file():
+        resume_dst.unlink(missing_ok=True)
+        return
+    tmp_fd, tmp_name = tempfile.mkstemp(prefix=".gr_resume_overlay.", dir=local_root)
+    os.close(tmp_fd)
+    tmp_path = Path(tmp_name)
+    shutil.copyfile(overlay_src, tmp_path)
+    tmp_path.replace(resume_dst)
 
 
 class LookupRequest(BaseModel):
@@ -182,14 +251,20 @@ class ResidentMapping:
         self._csr_kw_ids = np.load(kid_path, mmap_mode="r")
 
         self.rows = int(len(self._csr_kw_ids))
-        if not self.read_only:
-            self._kw_degree = np.bincount(self._csr_kw_ids, minlength=n_kw).astype(np.int32)
+        self._kw_degree = np.bincount(self._csr_kw_ids, minlength=n_kw).astype(np.int32)
         self.byte_count = int(kw_path.stat().st_size + pairs_path.stat().st_size)
+        local_overlay = directory / "overlay.parquet"
+        staged_resume_overlay = Path(tempfile.gettempdir()) / RESUME_OVERLAY_FILENAME
+        if local_overlay.is_file():
+            self.load_overlay_file(local_overlay)
+        elif staged_resume_overlay.is_file():
+            self.load_overlay_file(staged_resume_overlay)
         logger.info(
-            "Columnar mapping ready: %d IDs, %d keywords, %d pairs",
+            "Columnar mapping ready: %d IDs, %d keywords, %d pairs (overlay=%d)",
             len(self._unique_docids_u32),
             n_kw,
             self.rows,
+            len(self._overlay_kw_ids),
         )
 
 
@@ -249,16 +324,34 @@ class ResidentMapping:
                 self._active_requests -= 1
 
     def replace_overlay(self, overlay: dict[int, tuple[int, ...]]) -> None:
-        for docid in self._overlay_kw_ids.keys() | overlay.keys():
-            base = self._base_kw_ids_one(docid) or ()
-            previous = set(self._overlay_kw_ids.get(docid, base))
-            current = set(overlay.get(docid, base))
-            for kid in previous - current:
-                self._kw_degree[kid] -= 1
-            for kid in current - previous:
-                self._kw_degree[kid] += 1
+        has_deg = len(self._kw_degree) > 0
+        if has_deg:
+            for docid in self._overlay_kw_ids.keys() | overlay.keys():
+                base = self._base_kw_ids_one(docid) or ()
+                previous = set(self._overlay_kw_ids.get(docid, base))
+                current = set(overlay.get(docid, base))
+                for kid in previous - current:
+                    self._kw_degree[kid] -= 1
+                for kid in current - previous:
+                    self._kw_degree[kid] += 1
         self._overlay_kw_ids = overlay
         self._docid_kw_cache.clear()
+
+    def load_overlay_file(self, overlay_path: str | Path) -> int:
+        ov_file = Path(overlay_path)
+        if not ov_file.is_file():
+            raise FileNotFoundError(f"Mapping overlay file does not exist: {ov_file}")
+        tbl = pq.read_table(ov_file, columns=["docid_u32", "keyword_ids"])
+        u32_list = tbl.column("docid_u32").to_pylist()
+        kids_list = tbl.column("keyword_ids").to_pylist()
+        overlay = {
+            int(u32): tuple(dict.fromkeys(int(k) for k in kids))
+            for u32, kids in zip(u32_list, kids_list, strict=True)
+            if kids
+        }
+        with self._lock:
+            self.replace_overlay(overlay)
+        return len(overlay)
 
     def lookup_u32(
         self,
@@ -372,26 +465,48 @@ class ResidentMapping:
         updated_u32: set[int] = set()
         added_edges = 0
         removed_edges = 0
-        for u32, rem_kids in removals.items():
+        has_deg = len(self._kw_degree) > 0
+        for u32, rem_kids in list(removals.items()):
             if not rem_kids:
+                removals.pop(u32, None)
                 continue
             current_kids = self._overlay_kw_ids.get(u32)
             if current_kids is None:
                 current_kids = self._base_kw_ids_one(u32)
                 if not current_kids:
+                    removals.pop(u32, None)
                     continue
             if len(current_kids) <= DOC2K_PRUNE_FLOOR:
+                removals.pop(u32, None)
                 continue
-            filtered_list: list[int] = []
-            for idx_k, kid in enumerate(current_kids):
-                remaining_slots = len(current_kids) - idx_k
-                if (len(filtered_list) + remaining_slots) > DOC2K_PRUNE_FLOOR and kid in rem_kids:
-                    removed_edges += 1
-                else:
-                    filtered_list.append(kid)
-            if len(filtered_list) < len(current_kids):
+            max_rem = max(0, len(current_kids) - DOC2K_PRUNE_FLOOR)
+            candidates = [
+                int(kid)
+                for kid in current_kids
+                if kid in rem_kids and (not has_deg or int(self._kw_degree[kid]) > 1)
+            ]
+            if len(candidates) > max_rem:
+                seed = (int(u32) ^ (len(current_kids) << 16)) & 0xFFFFFFFF
+                order = np.random.default_rng(seed).permutation(len(candidates)).tolist()
+                ordered_candidates = [candidates[idx] for idx in order]
+            else:
+                ordered_candidates = candidates
+            chosen_rem: set[int] = set()
+            for kid in ordered_candidates:
+                if len(chosen_rem) >= max_rem:
+                    break
+                if not has_deg or int(self._kw_degree[kid]) > 1:
+                    chosen_rem.add(kid)
+                    if has_deg:
+                        self._kw_degree[kid] -= 1
+            if chosen_rem:
+                removals[u32] = chosen_rem
+                filtered_list = [kid for kid in current_kids if kid not in chosen_rem]
+                removed_edges += len(current_kids) - len(filtered_list)
                 self._overlay_kw_ids[u32] = tuple(filtered_list)
                 updated_u32.add(u32)
+            else:
+                removals.pop(u32, None)
         for u32, add_kids in additions.items():
             if not add_kids:
                 continue
@@ -409,6 +524,8 @@ class ResidentMapping:
                 if kid not in existing_kids:
                     kid_list.append(kid)
                     existing_kids.add(kid)
+                    if has_deg:
+                        self._kw_degree[kid] += 1
                     added_edges += 1
                     changed = True
             if changed:
@@ -544,11 +661,6 @@ class ResidentMapping:
         stage_dir: str | Path | None = None,
         async_transfer: bool = True,
     ) -> dict[str, Any]:
-        import os
-        import shutil
-        import tempfile
-        import time
-
         self.flush_async_saves()
         with self._lock:
             overlay_snapshot = dict(self._overlay_kw_ids)

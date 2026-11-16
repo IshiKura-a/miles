@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import pickle
 import tempfile
-from typing import Any
+from typing import Any, cast
 
 import torch
 import torch.distributed as dist
@@ -21,8 +21,10 @@ from examples.experimental.generative_retriever.model.constrained_decode import 
     SortedU32Constraint,
     load_constraint,
 )
-from examples.experimental.generative_retriever.services.mapping_service import ResidentMapping
-from examples.experimental.generative_retriever.sglang_models.gr_policy import _stage_local_mapping_dir
+from examples.experimental.generative_retriever.services.mapping_service import (
+    ResidentMapping,
+    stage_local_mapping_dir,
+)
 from examples.experimental.generative_retriever.reward.relevance_reward import (
     DEFAULT_TRAIN_GROUP_SIZE,
     DOC2K_ADD_MIN_QUERIES,
@@ -185,13 +187,9 @@ class GRStage5Policy(nn.Module):
                 harvested_u32.append((u32, kids_tup))
                 if len(kids_tup) <= DOC2K_PRUNE_FLOOR:
                     continue
-                max_rem = max(0, len(kids_tup) - DOC2K_PRUNE_FLOOR)
-                dead_kids: set[int] = set()
-                for kid in kids_tup:
-                    if edge_passes.get((u32, kid), 0) == 0:
-                        dead_kids.add(kid)
-                        if len(dead_kids) >= max_rem:
-                            break
+                dead_kids = {
+                    kid for kid in kids_tup if edge_passes.get((u32, kid), 0) == 0
+                }
                 if dead_kids:
                     removals[u32] = dead_kids
             for u32, kids_tup in harvested_u32:
@@ -242,7 +240,7 @@ class GRStage5Policy(nn.Module):
         raw_mapping = os.environ.get("GR_ID_MAPPING")
         if not raw_mapping:
             return None
-        staged_dir = _stage_local_mapping_dir(raw_mapping)
+        staged_dir = stage_local_mapping_dir(raw_mapping)
         sync_map = ResidentMapping(staged_dir, read_only=True)
         object.__setattr__(self, "_doc2k_sync_mapping", sync_map)
         return sync_map
@@ -264,7 +262,7 @@ class GRStage5Policy(nn.Module):
                     async_transfer=async_transfer,
                 )
         if dist.is_initialized():
-            dist.barrier(group=get_gloo_group())
+            dist.barrier(group=cast(Any, get_gloo_group()))
 
     def state_dict(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         self._sync_global_doc2k_votes()

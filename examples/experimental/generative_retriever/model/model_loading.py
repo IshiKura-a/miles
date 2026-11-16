@@ -21,7 +21,9 @@ from torch.distributed.checkpoint.filesystem import FileSystemReader
 from torch.distributed.checkpoint.metadata import TensorStorageMetadata
 from torch.distributed.checkpoint.state_dict_loader import load
 
+_POLICY_ENCODER_PREFIX = "encoder_list.0.model.encoder.model."
 _POLICY_HEAD_PREFIXES = ("docEnc2decoder.", "decoder.", "lm_head.")
+_POLICY_EXPORT_PREFIXES = (_POLICY_ENCODER_PREFIX, *_POLICY_HEAD_PREFIXES)
 _WEIGHT_SUFFIXES = (".bin", ".safetensors", ".pt", ".pth", ".onnx", ".tar")
 _STAGE_ASSETS = (
     "added_tokens.json",
@@ -222,19 +224,21 @@ def load_policy_head_checkpoint(model: Any, checkpoint: str | Path) -> int:
         state_dict = payload["model_state"]["model"]
     except (KeyError, TypeError) as error:
         raise ValueError(f"Policy checkpoint has an invalid state-dict structure: {path}") from error
+    has_encoder = any(name.startswith(_POLICY_ENCODER_PREFIX) for name in state_dict)
+    active_prefixes = _POLICY_EXPORT_PREFIXES if has_encoder else _POLICY_HEAD_PREFIXES
     selected = {
         name: tensor
         for name, tensor in state_dict.items()
-        if name.startswith(_POLICY_HEAD_PREFIXES)
+        if name.startswith(active_prefixes)
     }
     expected = {
-        name for name in model.state_dict() if name.startswith(_POLICY_HEAD_PREFIXES)
+        name for name in model.state_dict() if name.startswith(active_prefixes)
     }
     missing = expected - selected.keys()
     unexpected = selected.keys() - expected
     if missing or unexpected:
         raise ValueError(
-            f"Policy checkpoint head keys mismatch: missing={sorted(missing)}, "
+            f"Policy checkpoint keys mismatch: missing={sorted(missing)}, "
             f"unexpected={sorted(unexpected)}"
         )
     model.load_state_dict(selected, strict=False)
@@ -253,7 +257,7 @@ def export_policy_head_checkpoint(
     out_pt.parent.mkdir(parents=True, exist_ok=True)
 
     dcp_prefix = "model_state.model."
-    prefixes = tuple(dcp_prefix + head for head in _POLICY_HEAD_PREFIXES)
+    prefixes = tuple(dcp_prefix + head for head in _POLICY_EXPORT_PREFIXES)
     with tempfile.TemporaryDirectory(prefix="gr_dcp_head_") as tmp_dir_str:
         tmp_dir = Path(tmp_dir_str)
         shutil.copyfile(metadata_file, tmp_dir / ".metadata")

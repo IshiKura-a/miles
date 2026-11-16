@@ -39,9 +39,9 @@ from examples.experimental.generative_retriever.model.model_loading import (
     stage_local_model_dir,
 )
 from examples.experimental.generative_retriever.reward.relevance_model import (
-    _stage_local_relevance_model,
-    _stage_local_relevance_source,
     relevance_source_path,
+    stage_local_relevance_model,
+    stage_local_relevance_source,
 )
 from examples.experimental.generative_retriever.reward.relevance_reward import (
     PROMPT_DATASET_ROWS,
@@ -72,8 +72,9 @@ from examples.experimental.generative_retriever.runtime.service_processes import
 from examples.experimental.generative_retriever.runtime.training_common import (
     ScriptArgs, count_records, expanded_path, prepare_prompt_data, required_directory,
 )
-from examples.experimental.generative_retriever.sglang_models.gr_policy import (
-    _stage_local_mapping_dir,
+from examples.experimental.generative_retriever.services.mapping_service import (
+    stage_local_doc2k_state,
+    stage_local_mapping_dir,
 )
 from miles.utils.external_utils.command_utils import create_run_id
 
@@ -211,9 +212,13 @@ def prepare_node_assets(manifest: Manifest) -> None:
 
     local_ckpt = stage_local_model_dir(manifest["checkpoint"], "checkpoint")
     local_qwen = stage_local_model_dir(manifest["qwen_model"], "Qwen model")
-    local_mapping = _stage_local_mapping_dir(manifest["mapping"])
-    _stage_local_relevance_source(relevance_source_path(manifest["relevance_model"]))
-    local_relevance = _stage_local_relevance_model(manifest["relevance_model"])
+    local_mapping = stage_local_mapping_dir(manifest["mapping"])
+    stage_local_doc2k_state(
+        run_dir / "checkpoints",
+        resume="--load" in manifest["train_argv"],
+    )
+    stage_local_relevance_source(relevance_source_path(manifest["relevance_model"]))
+    local_relevance = stage_local_relevance_model(manifest["relevance_model"])
     bundle = prepare_bundle(
         checkpoint=local_ckpt,
         qwen_model=local_qwen,

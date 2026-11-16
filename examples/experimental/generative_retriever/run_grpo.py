@@ -23,9 +23,9 @@ if str(_MILES_REPO_ROOT) not in sys.path:
 from examples.experimental.generative_retriever.index.id_text_mapping import is_columnar_index_dir
 from examples.experimental.generative_retriever.model.model_loading import stage_local_model_dir
 from examples.experimental.generative_retriever.reward.relevance_model import (
-    _stage_local_relevance_model,
-    _stage_local_relevance_source,
     relevance_source_path,
+    stage_local_relevance_model,
+    stage_local_relevance_source,
 )
 from examples.experimental.generative_retriever.reward.relevance_reward import REWARD_MODES
 from examples.experimental.generative_retriever.runtime.prepare_rocm_env import (
@@ -43,7 +43,10 @@ from examples.experimental.generative_retriever.runtime.training_common import (
     prepare_prompt_data,
     required_directory,
 )
-from examples.experimental.generative_retriever.sglang_models.gr_policy import _stage_local_mapping_dir
+from examples.experimental.generative_retriever.services.mapping_service import (
+    stage_local_doc2k_state,
+    stage_local_mapping_dir,
+)
 from examples.experimental.generative_retriever.utils.paths import absolute_path
 import miles.utils.external_utils.command_utils as U
 from miles.utils.misc import get_current_node_ip
@@ -137,9 +140,10 @@ def execute(args: ScriptArgs) -> None:
         )
     local_ckpt = str(stage_local_model_dir(checkpoint, "checkpoint"))
     local_qwen = str(stage_local_model_dir(qwen_model, "Qwen model"))
-    local_mapping = str(_stage_local_mapping_dir(mapping))
-    _stage_local_relevance_source(relevance_source_path(relevance_model))
-    local_relevance = _stage_local_relevance_model(relevance_model)
+    local_mapping = str(stage_local_mapping_dir(mapping))
+    stage_local_doc2k_state(checkpoint_dir, resume=args.resume)
+    stage_local_relevance_source(relevance_source_path(relevance_model))
+    local_relevance = stage_local_relevance_model(relevance_model)
     bundle = Path(f"/tmp/gr_sglang_bundle_{args.run_id}")
     quote = shlex.quote
     U.exec_command_cpu(

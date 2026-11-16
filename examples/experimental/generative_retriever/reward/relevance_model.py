@@ -774,8 +774,8 @@ class MultiGpuRelevanceScorer:
             CacheStats(capacity=keyword_cache_size, size=0, hits=0, misses=0, evictions=0)
             for _ in range(self.num_gpus)
         ]
-        staged_source = _stage_local_relevance_source(Path(relevance_source))
-        staged_model = _stage_local_relevance_model(relevance_model)
+        staged_source = stage_local_relevance_source(Path(relevance_source))
+        staged_model = stage_local_relevance_model(relevance_model)
         ctx = mp.get_context("spawn")
         self._executor = ThreadPoolExecutor(max_workers=self.num_gpus)
         self._conns: list[Connection] = []
@@ -1057,7 +1057,7 @@ def relevance_source_path(relevance_model: str | Path) -> Path:
     cosmos_root = os.environ.get("cosmos_data_path")
     if not cosmos_root or not cosmos_root.strip():
         raise ValueError("cosmos_data_path must be set for the relevance source")
-    staged_model = Path(_stage_local_relevance_model(relevance_model))
+    staged_model = Path(stage_local_relevance_model(relevance_model))
     pointer = staged_model / "SOURCE_CHECKPOINT.txt"
     source_checkpoint = pointer.read_text(encoding="utf-8").strip()
     _, marker, relative = source_checkpoint.partition("/local/")
@@ -1076,7 +1076,7 @@ _RELEVANCE_FILES = (
 )
 
 
-def _stage_local_relevance_model(model_dir: str | Path) -> str:
+def stage_local_relevance_model(model_dir: str | Path) -> str:
     resolved = absolute_path(model_dir)
     local_root = Path(tempfile.gettempdir())
     if resolved.is_relative_to(local_root):
@@ -1105,7 +1105,7 @@ def _stage_local_relevance_model(model_dir: str | Path) -> str:
     return os.fspath(target)
 
 
-def _stage_local_relevance_source(source: Path) -> Path:
+def stage_local_relevance_source(source: Path) -> Path:
     resolved = _validate_source(source)
     local_root = Path(tempfile.gettempdir())
     if resolved.is_relative_to(local_root):
@@ -1131,7 +1131,7 @@ def _stage_local_relevance_source(source: Path) -> Path:
 
 
 def load_relevance_pipeline_factory(source: str | Path) -> RelevancePipelineFactory:
-    staged = _stage_local_relevance_source(Path(source))
+    staged = stage_local_relevance_source(Path(source))
     source_text = os.fspath(staged)
     if source_text not in sys.path:
         sys.path.append(source_text)
