@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from collections.abc import Mapping
 from typing import Literal
@@ -194,6 +195,11 @@ def score_and_summarize_docid(
     base_pm = baseline.pm
     base_sm = baseline.sm
     is_cont = mode == "continuous_relevance_unique"
+    pm_primary = os.environ.get("GR_PM_PRIMARY_REWARD") == "1"
+    w_pm_base = 1.5 if pm_primary else 1.0
+    w_sm_base = 0.5 if pm_primary else 1.0
+    w_pm_uniq = 0.75 if pm_primary else 0.5
+    w_sm_uniq = 0.25 if pm_primary else 0.5
 
     sum_pm = 0.0
     sum_sm = 0.0
@@ -233,9 +239,9 @@ def score_and_summarize_docid(
         s_ok = sm_f >= SM_THRESHOLD
         pm_p = 1.0 if p_ok else 0.0
         sm_p = 1.0 if s_ok else 0.0
-        disc_b = pm_p + sm_p
-        cont_b = norm_pm + norm_sm
-        rel_q = cont_b * 0.5
+        disc_b = w_pm_base * pm_p + w_sm_base * sm_p
+        cont_b = w_pm_base * norm_pm + w_sm_base * norm_sm
+        rel_q = (norm_pm + norm_sm) * 0.5
 
         u_pm = kw not in base_pm
         u_sm = kw not in base_sm
@@ -244,8 +250,8 @@ def score_and_summarize_docid(
         u_el = pm_u_el or sm_u_el
         rel_el = p_ok or s_ok
 
-        pm_ub = (0.5 * UNIQUE_WEIGHT * rel_q) if pm_u_el else 0.0
-        sm_ub = (0.5 * UNIQUE_WEIGHT * rel_q) if sm_u_el else 0.0
+        pm_ub = (w_pm_uniq * UNIQUE_WEIGHT * rel_q) if pm_u_el else 0.0
+        sm_ub = (w_sm_uniq * UNIQUE_WEIGHT * rel_q) if sm_u_el else 0.0
         ub = pm_ub + sm_ub
         disc_t = disc_b + ub
         cont_t = cont_b + ub
@@ -280,7 +286,8 @@ def score_and_summarize_docid(
             cnt_any_uniq += 1
         if rel_el:
             cnt_rel_elig += 1
-            passed_keywords.append(kw)
+            if not pm_primary or p_ok:
+                passed_keywords.append(kw)
         if p_ok and s_ok and u_pm and u_sm:
             unique_good_keywords.append(kw)
         if pm_u_el:

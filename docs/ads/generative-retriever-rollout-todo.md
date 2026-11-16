@@ -526,9 +526,11 @@ mapping 版本和 relevance 模型路径；policy 同时保存 PM/SM 的 good co
 Mapping 查询按最多 4,096 个不同 ID 分批；baseline 服务缓存 query 生成结果。
 
 - [model_loading.py](../../examples/experimental/generative_retriever/model/model_loading.py)
-  中的 `export_policy_head_checkpoint` 仅读取 FSDP DCP checkpoint（`checkpoints/iter_XXXXXXX/model`）
-  中训练更新的 44 个解码头张量（`docEnc2decoder.`、`decoder.`、`lm_head.`）所在分片前缀，
-  快速导出 `policy-head-step<step>.pt` 供 `baseline_service.py --policy-checkpoint` 加载。
+  中的 `export_policy_head_checkpoint` 读取 FSDP DCP checkpoint（`checkpoints/iter_XXXXXXX/model`）
+  中训练更新的 Qwen3-4B 编码器与解码头张量（`encoder_list.0.model.encoder.model.`、`docEnc2decoder.`、`decoder.`、`lm_head.`），
+  快速导出 `policy-head-step<step>.pt` 供 `baseline_service.py --policy-checkpoint` 加载（同时向后兼容仅含解码头的旧版导出文件）。
+- 关于全量索引桶结构、1,000-query DocID 级与 Keyword 级候选分布诊断及 32 卡机制消融实验设计，参见
+  [generative-retriever-ablation-study.md](./generative-retriever-ablation-study.md)。
 - 离线 generator 使用 `--docids-per-query 64`（默认在 GPU 0–3 上并行），
   评分服务默认在全 8 卡 GPU 0–7 上以 `--batch-size 8192` 运行，评测客户端默认
   `--batch-size 1024`；当前批评分与下一批生成流水线并行，且支持从已完成 query 断点续跑。

@@ -536,10 +536,20 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
                 metrics_mat[b, m_idx] = acc[m_idx] * inv_group
 
             if group_size >= DOC2K_MIN_GROUP_SAMPLES and group_size > head_cutoff:
+                deep_consolidate = os.environ.get("GR_DOC2K_DEEP_CONSOLIDATE") == "1"
+                if deep_consolidate:
+                    lp_sums = token_logprobs[b].detach().cpu().numpy().sum(axis=-1)
+                    beam_order = np.argsort(-lp_sums, kind="mergesort").tolist()
+                    head_indices = beam_order[:head_cutoff]
+                    tail_indices = beam_order[head_cutoff:]
+                else:
+                    head_indices = list(range(head_cutoff))
+                    tail_indices = list(range(head_cutoff, group_size))
+
                 under_floor_heads: list[int] = []
                 under_prune_heads: list[int] = []
                 head_keywords: set[str] = set()
-                for hi in range(head_cutoff):
+                for hi in head_indices:
                     hkws = q_sample_kws[hi]
                     head_keywords.update(hkws)
                     hlen = len(hkws)
@@ -549,25 +559,38 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
                         under_prune_heads.append(hi)
                 if not under_floor_heads and not under_prune_heads:
                     continue
-                under_floor_heads.sort(key=lambda hi: len(q_sample_kws[hi]))
-                under_prune_heads.sort(key=lambda hi: len(q_sample_kws[hi]))
+                if deep_consolidate:
+                    under_floor_heads.sort(key=lambda hi: -len(q_sample_kws[hi]))
+                    under_prune_heads.sort(key=lambda hi: -len(q_sample_kws[hi]))
+                else:
+                    under_floor_heads.sort(key=lambda hi: len(q_sample_kws[hi]))
+                    under_prune_heads.sort(key=lambda hi: len(q_sample_kws[hi]))
                 candidate_tiers = (under_floor_heads, under_prune_heads)
 
                 added_for_query = 0
                 seen_tail: set[str] = set()
-                for ti in range(head_cutoff, group_size):
+                for ti in tail_indices:
                     if added_for_query >= DOC2K_MAX_ADDS_PER_QUERY:
                         break
                     ug_kws = sample_unique_good[ti]
                     if not ug_kws:
                         continue
                     tail_u32 = row_u32_list[ti]
+                    tail_p3 = tail_u32 >> 8
                     tail_p2 = tail_u32 >> 16
                     tail_p1 = tail_u32 >> 24
                     target_u32: int | None = None
                     for tier in candidate_tiers:
                         if not tier:
                             continue
+                        if deep_consolidate:
+                            for hi in tier:
+                                hu = row_u32_list[hi]
+                                if (hu >> 8) == tail_p3:
+                                    target_u32 = hu
+                                    break
+                            if target_u32 is not None:
+                                break
                         for hi in tier:
                             hu = row_u32_list[hi]
                             if (hu >> 16) == tail_p2:
@@ -575,13 +598,14 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
                                 break
                         if target_u32 is not None:
                             break
-                        for hi in tier:
-                            hu = row_u32_list[hi]
-                            if (hu >> 24) == tail_p1:
-                                target_u32 = hu
+                        if not deep_consolidate:
+                            for hi in tier:
+                                hu = row_u32_list[hi]
+                                if (hu >> 24) == tail_p1:
+                                    target_u32 = hu
+                                    break
+                            if target_u32 is not None:
                                 break
-                        if target_u32 is not None:
-                            break
                     if target_u32 is None:
                         continue
                     tail_kws_list = q_sample_kws[ti]

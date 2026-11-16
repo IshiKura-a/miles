@@ -6,6 +6,7 @@ from examples.experimental.generative_retriever.utils.paths import absolute_path
 
 from collections.abc import Callable
 from functools import lru_cache
+import os
 from pathlib import Path
 import shutil
 import tempfile
@@ -269,6 +270,13 @@ def generate_beams_tree(
     all_tokens: list[torch.Tensor] = []
     all_scores: list[torch.Tensor] = []
     prefix_cache: dict[tuple[int, ...], list[int]] = {}
+    raw_step_temps = os.environ.get("GR_STEP_TEMPERATURES", "").strip()
+    step_temps: tuple[float, ...] | None = None
+    if raw_step_temps:
+        parsed_temps = tuple(float(x) for x in raw_step_temps.split(",") if x.strip())
+        if len(parsed_temps) != code_num or any(t <= 0 for t in parsed_temps):
+            raise ValueError(f"GR_STEP_TEMPERATURES must contain {code_num} positive floats, got {raw_step_temps!r}")
+        step_temps = parsed_temps
 
     for q_start in range(0, total_queries, query_chunk_size):
         q_end = min(q_start + query_chunk_size, total_queries)
@@ -324,7 +332,15 @@ def generate_beams_tree(
             if next_k <= 0:
                 raise RuntimeError(f"Constrained beam tree has no valid continuations at step {step}")
             if do_sample:
-                scaled_3d = cand_cum_3d / temperature if temperature != 1.0 else cand_cum_3d
+                if step_temps is not None:
+                    t_cur = step_temps[step]
+                    if step > 0:
+                        t_prev = step_temps[step - 1]
+                        scaled_3d = cum_scores.unsqueeze(-1) / t_prev + step_log_probs / t_cur
+                    else:
+                        scaled_3d = cand_cum_3d / t_cur
+                else:
+                    scaled_3d = cand_cum_3d / temperature if temperature != 1.0 else cand_cum_3d
                 gumbel_3d = -torch.empty_like(scaled_3d).exponential_().clamp_min_(1e-38).log()
                 raw_g = torch.where(mask_3d, scaled_3d + gumbel_3d, float("-inf"))
                 if step > 0:

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 import logging
 import math
+import os
 from typing import Any
 
 import httpx
@@ -103,6 +104,27 @@ def apply_hierarchical_tree_credit(args: Any, samples: list[Any]) -> None:
             g_meta = samples[g * g_size].metadata["generative_retriever"]
             raw_1d.extend(g_meta.pop("group_raw_rewards"))
         first_meta["batch_raw_rewards_1d"] = raw_1d
+        if os.environ.get("GR_CAUSAL_TREE_CREDIT") == "1" and "group_u32" in first_meta:
+            u32_mat = np.stack(
+                [samples[g * g_size].metadata["generative_retriever"]["group_u32"] for g in range(num_groups)],
+                axis=0,
+            )
+            r_mat = np.asarray(raw_1d, dtype=np.float64).reshape(num_groups, g_size)
+            rows = np.arange(num_groups)[:, None]
+            ord1 = np.argsort(-r_mat, axis=1, kind="mergesort")
+            u_sorted = u32_mat[rows, ord1]
+            r_sorted = r_mat[rows, ord1]
+            k0, k1, k2 = TREE_CREDIT_TOP_K
+            v0 = _topk_mean_from_sorted_rewards(u_sorted >> np.uint32(24), r_sorted, ord1, k0)
+            v1 = _topk_mean_from_sorted_rewards(u_sorted >> np.uint32(16), r_sorted, ord1, k1)
+            v2 = _topk_mean_from_sorted_rewards(u_sorted >> np.uint32(8), r_sorted, ord1, k2)
+            c0_ret = 0.25 * (v0 + v1 + v2 + r_mat)
+            c1_ret = (v1 + v2 + r_mat) / 3.0
+            c2_ret = 0.5 * (v2 + r_mat)
+            c3_ret = r_mat
+            first_meta["batch_causal_returns_2d"] = np.stack(
+                (c0_ret, c1_ret, c2_ret, c3_ret), axis=-1
+            ).reshape(-1, RQ_CODE_NUM).astype(np.float32)
         return
 
     if _is_regular_group_layout(samples, g_size) and "group_u32" in first_meta:
@@ -316,19 +338,31 @@ def convert_gr_samples_to_train_data(args: Any, samples: list[Any]) -> dict[str,
             float(s.metadata["raw_reward"]) if (s.metadata and "raw_reward" in s.metadata) else float(s.get_reward_value(args))
             for s in samples
         ]
-    rewards_t = torch.tensor(
-        [float(s.reward if isinstance(s.reward, (int, float)) else s.get_reward_value(args)) for s in samples],
-        dtype=torch.float32,
-    )
-    if args.rewards_normalization and n % g_size == 0:
-        r_mat = rewards_t.view(-1, g_size)
-        centered = r_mat - r_mat.mean(dim=1, keepdim=True)
-        if args.advantage_estimator in ["grpo", "gspo"] and args.grpo_std_normalization:
-            std = r_mat.std(dim=1, keepdim=True)
-            centered = torch.where(std > 0, centered / (std + 1e-6), centered)
-        norm_rewards = centered.reshape(-1).tolist()
+    causal_2d = first_meta.pop("batch_causal_returns_2d", None)
+    if causal_2d is not None and n % g_size == 0:
+        r_3d = torch.from_numpy(causal_2d).view(-1, g_size, RQ_CODE_NUM)
+        if args.rewards_normalization:
+            centered = r_3d - r_3d.mean(dim=1, keepdim=True)
+            if args.advantage_estimator in ["grpo", "gspo"] and args.grpo_std_normalization:
+                std = r_3d.std(dim=1, keepdim=True)
+                centered = torch.where(std > 0, centered / (std + 1e-6), centered)
+            norm_rewards: list[Any] = centered.reshape(-1, RQ_CODE_NUM).tolist()
+        else:
+            norm_rewards = r_3d.reshape(-1, RQ_CODE_NUM).tolist()
     else:
-        norm_rewards = rewards_t.tolist()
+        rewards_t = torch.tensor(
+            [float(s.reward if isinstance(s.reward, (int, float)) else s.get_reward_value(args)) for s in samples],
+            dtype=torch.float32,
+        )
+        if args.rewards_normalization and n % g_size == 0:
+            r_mat = rewards_t.view(-1, g_size)
+            centered = r_mat - r_mat.mean(dim=1, keepdim=True)
+            if args.advantage_estimator in ["grpo", "gspo"] and args.grpo_std_normalization:
+                std = r_mat.std(dim=1, keepdim=True)
+                centered = torch.where(std > 0, centered / (std + 1e-6), centered)
+            norm_rewards = centered.reshape(-1).tolist()
+        else:
+            norm_rewards = rewards_t.tolist()
 
     tokens = [s.tokens for s in samples]
     if n > 0 and n % g_size == 0:

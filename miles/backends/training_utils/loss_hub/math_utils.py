@@ -481,11 +481,16 @@ def get_grpo_returns(
         return []
     lengths = [k.numel() for k in kl]
     if len(set(lengths)) == 1:
+        if rewards.ndim == 2 and rewards.shape[1] == lengths[0]:
+            return list(rewards.to(dtype=kl[0].dtype).contiguous().unbind(0))
         expanded = rewards.to(dtype=kl[0].dtype).unsqueeze(1).expand(len(rewards), lengths[0]).contiguous()
         return list(expanded.unbind(0))
     returns = []
     for i in range(len(rewards)):
-        returns.append(torch.ones_like(kl[i]) * rewards[i])
+        if rewards.ndim == 2 and rewards[i].numel() == kl[i].numel():
+            returns.append(rewards[i].to(dtype=kl[i].dtype))
+        else:
+            returns.append(torch.ones_like(kl[i]) * rewards[i])
     return returns
 
 

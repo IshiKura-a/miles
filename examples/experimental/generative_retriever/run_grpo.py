@@ -250,6 +250,16 @@ def execute(args: ScriptArgs) -> None:
         "GR_ID_MAPPING": local_mapping,
         "GR_RELEVANCE_MODEL": local_relevance,
         "GR_REWARD_MODE": args.reward_mode,
+        **{
+            k: os.environ[k]
+            for k in (
+                "GR_STEP_TEMPERATURES",
+                "GR_DOC2K_DEEP_CONSOLIDATE",
+                "GR_CAUSAL_TREE_CREDIT",
+                "GR_PM_PRIMARY_REWARD",
+            )
+            if k in os.environ
+        },
         "SGLANG_EXTERNAL_MODEL_PACKAGE": (
             "examples.experimental.generative_retriever.sglang_models"
         ),
