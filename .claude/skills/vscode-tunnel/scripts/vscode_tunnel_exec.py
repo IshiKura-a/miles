@@ -31,6 +31,7 @@ CLUSTER_TUNNEL_URL_TEMPLATE = (
 DEVTUNNEL_DOWNLOAD_URL = "https://aka.ms/TunnelsCliDownload/linux-x64"
 CONTROL_PORT = 31545
 _FORWARD_RE = re.compile(rf"Forwarding from 127\.0\.0\.1:(\d+) to host port {CONTROL_PORT}\.")
+_LISTENING_RE = re.compile(r"PortForwardingService listening on 127\.0\.0\.1:(\d+)\.")
 SYSTEM_TAGS = frozenset({"protocolv6", "vscode-server-launcher", "_flag4"})
 
 
@@ -222,9 +223,10 @@ def _wait_for_forwarded_socket(proc: subprocess.Popen[str], timeout_sec: float =
     sel.register(proc.stdout, selectors.EVENT_READ)
     output_lines: list[str] = []
     local_port: int | None = None
+    port_ready = False
     deadline = time.monotonic() + timeout_sec
     try:
-        while local_port is None and time.monotonic() < deadline:
+        while not port_ready and time.monotonic() < deadline:
             if proc.poll() is not None:
                 rem = proc.stdout.read() or ""
                 if rem:
@@ -240,7 +242,12 @@ def _wait_for_forwarded_socket(proc: subprocess.Popen[str], timeout_sec: float =
                 match = _FORWARD_RE.search(line)
                 if match:
                     local_port = int(match.group(1))
-                    break
+                    continue
+                if local_port is not None:
+                    listen_match = _LISTENING_RE.search(line)
+                    if listen_match and int(listen_match.group(1)) == local_port:
+                        port_ready = True
+                        break
     finally:
         sel.close()
 
