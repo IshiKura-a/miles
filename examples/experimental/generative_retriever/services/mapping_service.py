@@ -96,10 +96,8 @@ def stage_local_doc2k_state(
         return
     ckpt_root = Path(checkpoint_dir)
     tracker = ckpt_root / "latest_checkpointed_iteration.txt"
-    if not tracker.is_file():
-        resume_dst.unlink(missing_ok=True)
-        return
-    iteration = int(tracker.read_text(encoding="utf-8").strip())
+    raw_tracker = tracker.read_text(encoding="utf-8").strip() if tracker.is_file() else ""
+    iteration = int(raw_tracker) if raw_tracker.isdigit() else -1
     for entry in ckpt_root.iterdir():
         if entry.name.startswith("iter_") and entry.name[5:].isdigit():
             cand = int(entry.name[5:])
@@ -109,6 +107,9 @@ def stage_local_doc2k_state(
                 and (entry / "mapping" / "overlay.parquet").is_file()
             ):
                 iteration = cand
+    if iteration < 0:
+        resume_dst.unlink(missing_ok=True)
+        return
     overlay_src = ckpt_root / f"iter_{iteration:07d}" / "mapping" / "overlay.parquet"
     if not overlay_src.is_file():
         resume_dst.unlink(missing_ok=True)

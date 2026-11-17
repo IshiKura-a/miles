@@ -340,9 +340,11 @@ def save(actor: Any, iteration: int, force_sync: bool = False) -> None:
                         shutil.copyfile(src_item, dst_tmp)
                         dst_tmp.replace(dst_item)
                 if rank == 0:
+                    tracker_path = base_dir / "latest_checkpointed_iteration.txt"
                     tracker_tmp = base_dir / f"latest_checkpointed_iteration.txt.tmp.s{step_id}"
                     tracker_tmp.write_text(str(step_id))
-                    tracker_tmp.replace(base_dir / "latest_checkpointed_iteration.txt")
+                    tracker_tmp.replace(tracker_path)
+                    tracker_path.write_text(str(step_id))
                     logger.info(
                         "[FSDP] Synced staged checkpoint to %s in %.2fs",
                         checkpoint_dir,
