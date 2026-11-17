@@ -104,12 +104,16 @@ def _discover_working_token_and_tunnels() -> tuple[str, list[dict[str, Any]]]:
             "No GitHub token found. Set VSCODE_TUNNEL_GITHUB_TOKEN / GH_TOKEN or run `gh auth login`."
         )
     last_err: Exception | None = None
+    best_empty: tuple[str, list[dict[str, Any]]] | None = None
     for tok in candidates:
         try:
             data = _api_get_json(GLOBAL_TUNNELS_URL, tok)
             tunnels = data.get("value", data) if isinstance(data, dict) else data
             if isinstance(tunnels, list):
-                return tok, tunnels
+                if tunnels:
+                    return tok, tunnels
+                if best_empty is None:
+                    best_empty = (tok, tunnels)
         except urllib.error.HTTPError as exc:
             last_err = exc
             if exc.code in (401, 403):
@@ -117,6 +121,8 @@ def _discover_working_token_and_tunnels() -> tuple[str, list[dict[str, Any]]]:
             raise
         except Exception as exc:
             last_err = exc
+    if best_empty is not None:
+        return best_empty
     raise RuntimeError(f"All discovered GitHub tokens failed DevTunnels authentication: {last_err}")
 
 
