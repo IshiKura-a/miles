@@ -23,6 +23,7 @@ from examples.experimental.generative_retriever.model.constrained_decode import 
 )
 from examples.experimental.generative_retriever.services.mapping_service import (
     ResidentMapping,
+    save_static_mapping_snapshot,
     stage_local_mapping_dir,
 )
 from examples.experimental.generative_retriever.reward.relevance_reward import (
@@ -30,6 +31,7 @@ from examples.experimental.generative_retriever.reward.relevance_reward import (
     DOC2K_ADD_MIN_QUERIES,
     DOC2K_PRUNE_FLOOR,
     DOC2K_PRUNE_MIN_QUERIES,
+    is_doc2k_disabled,
 )
 
 from examples.experimental.generative_retriever.model.model_loading import (
@@ -73,6 +75,7 @@ class GRStage5Policy(nn.Module):
         self._global_docid_q_count: dict[int, int] = {}
         self._global_docid_kids: dict[int, tuple[int, ...]] = {}
         self._global_edge_passes: dict[tuple[int, int], int] = {}
+        self._disable_doc2k = is_doc2k_disabled()
         object.__setattr__(self, "_doc2k_sync_mapping", None)
 
         self.encoder_list: Any = source.encoder_list
@@ -104,7 +107,7 @@ class GRStage5Policy(nn.Module):
         return backbone
 
     def _sync_global_doc2k_votes(self) -> None:
-        if not dist.is_initialized():
+        if self._disable_doc2k or not dist.is_initialized():
             return
         rank = dist.get_rank()
         world_size = dist.get_world_size()
@@ -252,6 +255,19 @@ class GRStage5Policy(nn.Module):
         stage_dir: str | Path | None = None,
         async_transfer: bool = True,
     ) -> None:
+        if self._disable_doc2k:
+            if not dist.is_initialized() or dist.get_rank() == 0:
+                raw_mapping = os.environ.get("GR_ID_MAPPING")
+                if raw_mapping:
+                    save_static_mapping_snapshot(
+                        output_dir,
+                        base_mapping=raw_mapping,
+                        stage_dir=stage_dir,
+                        async_transfer=async_transfer,
+                    )
+            if dist.is_initialized():
+                dist.barrier(group=cast(Any, get_gloo_group()))
+            return
         self._sync_global_doc2k_votes()
         if not dist.is_initialized() or dist.get_rank() == 0:
             sync_map = self._ensure_doc2k_sync_mapping()

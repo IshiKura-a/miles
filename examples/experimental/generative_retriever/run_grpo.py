@@ -257,6 +257,7 @@ def execute(args: ScriptArgs) -> None:
                 "GR_DOC2K_DEEP_CONSOLIDATE",
                 "GR_CAUSAL_TREE_CREDIT",
                 "GR_PM_PRIMARY_REWARD",
+                "GR_DISABLE_DOC2K",
             )
             if k in os.environ
         },

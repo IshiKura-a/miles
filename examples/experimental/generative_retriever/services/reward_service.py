@@ -60,6 +60,7 @@ from examples.experimental.generative_retriever.reward.relevance_reward import (
     RewardMode,
     build_baseline_set,
     calculate_keyword_rewards,
+    is_doc2k_disabled,
     score_and_summarize_docid,
 )
 
@@ -215,6 +216,7 @@ class KeywordRewardEngine:
         self._step_docid_queries: dict[tuple[int, int, int, int], set[str]] = {}
         self._step_docid_keywords: dict[tuple[int, int, int, int], list[str]] = {}
         self._step_edge_passes: dict[tuple[tuple[int, int, int, int], str], int] = {}
+        self._disable_doc2k = is_doc2k_disabled()
 
     def _score_pairs_local(
         self,
@@ -582,7 +584,7 @@ class KeywordRewardEngine:
                 )
                 inline_kws = None
             sample_unique_good.append(uniq_good_kws)
-            if len(keywords) > DOC2K_PRUNE_FLOOR:
+            if not self._disable_doc2k and len(keywords) > DOC2K_PRUNE_FLOOR:
                 local_docid_queries.setdefault(docid, set()).add(sample.prompt)
                 local_docid_keywords[docid] = keywords
                 for kw in passed_kws:
@@ -610,7 +612,7 @@ class KeywordRewardEngine:
                         request.reward_mode, docid, len(keywords), value)
 
         local_candidate_votes: list[tuple[tuple[int, int, int, int], str, str]] = []
-        for query_text, indices in query_group_indices.items():
+        for query_text, indices in ([] if self._disable_doc2k else query_group_indices.items()):
             if len(indices) < DOC2K_MIN_GROUP_SAMPLES:
                 continue
             head_cutoff = min(DOC2K_HEAD_RANK_CUTOFF, max(DOC2K_MIN_HEAD_RANKS, len(indices) // 2))
@@ -712,6 +714,8 @@ class KeywordRewardEngine:
 
     def harvest_step_delta(self, min_queries: int = DOC2K_PRUNE_MIN_QUERIES) -> dict[str, Any]:
         self.scorer.empty_cache()
+        if self._disable_doc2k:
+            return {"additions": [], "removals": [], "mapping_url": self.mapping_url}
         with self._lock:
             additions = [
                 {"docid": list(docid), "keywords": list(keywords)}

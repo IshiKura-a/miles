@@ -224,7 +224,7 @@ R_continuous = continuous_base + unique_bonus
   每个 rollout step 期间，各 GPU 上的 SGLang 引擎在进程内打分后将本步候选投票写入本地 `/tmp/gr_doc2k_local_gpu{local_gpu}.pkl`；权重更新时，FSDP learner 通过 `GRStage5Policy._sync_global_doc2k_votes` 使用 NCCL `all_gather_into_tensor` / `broadcast` 汇总全集群投票并广播合并后的全局增量至 `/tmp/gr_doc2k_global_gpu{local_gpu}.pkl`，供同卡 SGLang 引擎在下一次 rollout 前就地更新内存中的 `ResidentMapping`（同一 rollout 内映射不变）：
   1. **Tail-to-Head 同前缀双头共投注入**：将尾部（rank $\ge$ `DOC2K_HEAD_RANK_CUTOFF = 64`）同时满足 `PM >= 0.58 and SM >= 0.82` 且双头 Unique 的好词，优先路由至共享 RQ 前缀且词数 `< DOCID_REWARD_FLOOR = 10` 的头部 doc ID，全集群累计被至少 `DOC2K_ADD_MIN_QUERIES = 10` 个不同 query 验证通过后注入（每 query 最多投票 `DOC2K_MAX_ADDS_PER_QUERY = 8` 个，单 doc ID 词数上限 `DOCID_MAX_KEYWORDS = 150`）；
   2. **大桶冗余死词裁剪（`DOC2K_PRUNE_FLOOR = 32` 下界保护）**：对词数 `> DOC2K_PRUNE_FLOOR = 32` 的肥桶 doc ID，每当全集群累计被至少 `DOC2K_PRUNE_MIN_QUERIES = 32` 个不同 query 召回时，裁剪该窗口内 0 次过 PM/SM 阈值的死词，且每桶至少保留 `32` 个词。
-  同时，Baseline 始终查询初始静态映射（`use_initial=True`），保证 $B(q)$ 参照系固定不变。保存 checkpoint 时（默认 `save_interval=5`），`save_doc2k_mapping` 先在本地 `/tmp` 暂存映射快照（`overlay.parquet` 与基础索引符号链接），再异步同步至 `$cosmos_data_path` 下的 `checkpoints/iter_XXXXXXX/mapping/`。
+  同时，Baseline 始终查询初始静态映射（`use_initial=True`），保证 $B(q)$ 参照系固定不变。保存 checkpoint 时（默认 `save_interval=5`），`save_doc2k_mapping` 先在本地 `/tmp` 暂存映射快照（`overlay.parquet` 与基础索引符号链接），再异步同步至 `$cosmos_data_path` 下的 `checkpoints/iter_XXXXXXX/mapping/`。设置环境变量 `GR_DISABLE_DOC2K=1` 可完全关闭在线 `doc2k` 投票、全局聚合与内存映射更新（全程保持初始静态索引，并在 checkpoint 中仅写出空 `overlay.parquet` 与静态索引符号链接）。
 
 GRPO launcher 以 `--reward-mode` 指定训练模式，HTTP reward 请求用 `reward_mode`；
 默认 `discrete_relevance_unique`。W&B 汇报 PM/SM 原始分数、pass、threshold

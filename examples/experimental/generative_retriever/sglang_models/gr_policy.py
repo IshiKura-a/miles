@@ -44,6 +44,7 @@ from examples.experimental.generative_retriever.reward.relevance_reward import (
     TREE_CREDIT_LEVEL_WEIGHT,
     TREE_CREDIT_TOP_K,
     build_baseline_set,
+    is_doc2k_disabled,
     score_and_summarize_docid,
 )
 from examples.experimental.generative_retriever.services.lru_cache import LRUCache
@@ -294,6 +295,7 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
         self._step_edge_passes: dict[tuple[int, int], int] = {}
         self._query_seq_id = 0
         self._doc2k_sync_step = 0
+        self._disable_doc2k = is_doc2k_disabled()
         self._local_gpu_id = _resolve_physical_gpu_id()
 
     def _ensure_in_process_reward_engine(self, device: torch.device) -> None:
@@ -517,7 +519,7 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
                 )
                 raw_rewards_b.append(val)
                 sample_unique_good.append(uniq_good_kws)
-                if len(kws) > DOC2K_PRUNE_FLOOR and u32_val not in seen_fat_u32:
+                if not self._disable_doc2k and len(kws) > DOC2K_PRUNE_FLOOR and u32_val not in seen_fat_u32:
                     seen_fat_u32.add(u32_val)
                     kids_tup = u32_to_kids[u32_val]
                     self._step_docid_q_count[u32_val] = self._step_docid_q_count.get(u32_val, 0) + 1
@@ -535,7 +537,7 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
             for m_idx in range(26):
                 metrics_mat[b, m_idx] = acc[m_idx] * inv_group
 
-            if group_size >= DOC2K_MIN_GROUP_SAMPLES and group_size > head_cutoff:
+            if not self._disable_doc2k and group_size >= DOC2K_MIN_GROUP_SAMPLES and group_size > head_cutoff:
                 deep_consolidate = os.environ.get("GR_DOC2K_DEEP_CONSOLIDATE") == "1"
                 if deep_consolidate:
                     lp_sums = token_logprobs[b].detach().cpu().numpy().sum(axis=-1)
@@ -661,8 +663,9 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
         raw_t = torch.from_numpy(raw_mat).to(device=device).unsqueeze(-1)
         core = torch.cat((token_ids.float(), token_logprobs.float(), credited_t, raw_t), dim=-1).flatten(1)
         self._local_gpu_id = _resolve_physical_gpu_id(token_ids.device)
-        self._stage_local_doc2k_votes()
-        self._has_uncommitted_rollout = True
+        if not self._disable_doc2k:
+            self._stage_local_doc2k_votes()
+            self._has_uncommitted_rollout = True
         metrics_t = torch.from_numpy(metrics_mat).to(device=device)
         packed = torch.cat((core, metrics_t), dim=-1)
         if device.type == "cuda" and (
@@ -828,7 +831,7 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
             self._commit_step_doc2k_updates()
 
     def _commit_step_doc2k_updates(self) -> None:
-        if self._mapping_engine is None:
+        if self._disable_doc2k or self._mapping_engine is None:
             return
         mapping_engine = self._mapping_engine
         self._doc2k_sync_step += 1

@@ -40,6 +40,10 @@ TREE_CREDIT_TOP_K = (8, 4, 2)
 TREE_CREDIT_LEVEL_WEIGHT = 0.25
 
 
+def is_doc2k_disabled() -> bool:
+    return os.environ.get("GR_DISABLE_DOC2K") == "1"
+
+
 @dataclass(frozen=True, slots=True)
 class BaselineSets:
     pm: frozenset[str] = frozenset()

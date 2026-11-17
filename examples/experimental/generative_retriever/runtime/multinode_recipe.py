@@ -154,7 +154,7 @@ def build_multinode_runtime_env(
         "NCCL_SOCKET_IFNAME", "NCCL_IB_HCA", "NCCL_IB_TIMEOUT",
         "NCCL_IB_PCI_RELAXED_ORDERING", "NCCL_NET_GDR_LEVEL", "cosmos_data_path",
         "WANDB_MODE", "GR_STEP_TEMPERATURES", "GR_DOC2K_DEEP_CONSOLIDATE",
-        "GR_CAUSAL_TREE_CREDIT", "GR_PM_PRIMARY_REWARD",
+        "GR_CAUSAL_TREE_CREDIT", "GR_PM_PRIMARY_REWARD", "GR_DISABLE_DOC2K",
     )
     return {
         **{key: os.environ[key] for key in inherited if key in os.environ},

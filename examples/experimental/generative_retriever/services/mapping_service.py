@@ -37,7 +37,11 @@ from examples.experimental.generative_retriever.index.id_text_mapping import (
     pack_docid_u32,
     validate_docid,
 )
-from examples.experimental.generative_retriever.reward.relevance_reward import DOC2K_PRUNE_FLOOR, DOCID_MAX_KEYWORDS
+from examples.experimental.generative_retriever.reward.relevance_reward import (
+    DOC2K_PRUNE_FLOOR,
+    DOCID_MAX_KEYWORDS,
+    is_doc2k_disabled,
+)
 from examples.experimental.generative_retriever.utils.paths import absolute_path, symlink_target
 
 logger = logging.getLogger(__name__)
@@ -91,7 +95,7 @@ def stage_local_doc2k_state(
         (local_root / f"gr_doc2k_local_gpu{gpu_idx}.pkl").unlink(missing_ok=True)
         (local_root / f"gr_doc2k_global_gpu{gpu_idx}.pkl").unlink(missing_ok=True)
     resume_dst = local_root / RESUME_OVERLAY_FILENAME
-    if not resume or checkpoint_dir is None:
+    if is_doc2k_disabled() or not resume or checkpoint_dir is None:
         resume_dst.unlink(missing_ok=True)
         return
     ckpt_root = Path(checkpoint_dir)
@@ -265,9 +269,10 @@ class ResidentMapping:
         self.byte_count = int(kw_path.stat().st_size + pairs_path.stat().st_size)
         local_overlay = directory / "overlay.parquet"
         staged_resume_overlay = Path(tempfile.gettempdir()) / RESUME_OVERLAY_FILENAME
-        if local_overlay.is_file():
+        doc2k_disabled = is_doc2k_disabled()
+        if local_overlay.is_file() and not (self.read_only and doc2k_disabled):
             self.load_overlay_file(local_overlay)
-        elif staged_resume_overlay.is_file():
+        elif staged_resume_overlay.is_file() and not doc2k_disabled:
             self.load_overlay_file(staged_resume_overlay)
         logger.info(
             "Columnar mapping ready: %d IDs, %d keywords, %d pairs (overlay=%d)",
@@ -783,6 +788,78 @@ class ResidentMapping:
             "id_count": int(n_unique),
             "rows": int(len(csr_kw_ids)),
         }
+
+
+def save_static_mapping_snapshot(
+    output_dir: str | Path,
+    *,
+    base_mapping: str | Path,
+    stage_dir: str | Path | None = None,
+    async_transfer: bool = True,
+) -> dict[str, str]:
+    target_dir = absolute_path(output_dir)
+    resolved_base = Path(base_mapping).resolve()
+    staged_marker = resolved_base / ".staged_arrow_ok"
+    if staged_marker.is_file():
+        origin_text = staged_marker.read_text(encoding="utf-8").strip()
+        if origin_text and Path(origin_text).is_dir():
+            resolved_base = Path(origin_text).resolve()
+
+    overlay_table = pa.table({
+        "docid_u32": pa.array([], type=pa.uint32()),
+        "keyword_ids": pa.array([], type=pa.list_(pa.uint32())),
+    }).replace_schema_metadata({b"base_mapping": str(resolved_base).encode()})
+
+    def _link_target_for(fname: str) -> str:
+        src_f = resolved_base / fname
+        try:
+            common = os.path.commonpath([str(target_dir), str(src_f)])
+        except ValueError:
+            return str(src_f)
+        if common not in {"", os.sep}:
+            return os.path.relpath(src_f, start=target_dir)
+        return str(src_f)
+
+    def _populate_dir(local_d: Path) -> None:
+        local_d.mkdir(parents=True, exist_ok=True)
+        pq.write_table(overlay_table, local_d / "overlay.parquet", compression="zstd")
+        for link_name in COLUMNAR_INDEX_FILES:
+            src_f = resolved_base / link_name
+            dst_f = local_d / link_name
+            if not dst_f.exists() and not dst_f.is_symlink() and src_f.is_file():
+                dst_f.symlink_to(_link_target_for(link_name))
+
+    if stage_dir is not None:
+        _populate_dir(Path(stage_dir))
+        return {"output_dir": str(target_dir), "staged_dir": str(stage_dir)}
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="gr_save_static_map_"))
+    _populate_dir(tmp_dir)
+
+    def _sync_worker() -> None:
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            dst_tmp = target_dir / "overlay.parquet.tmp"
+            shutil.copyfile(tmp_dir / "overlay.parquet", dst_tmp)
+            dst_tmp.replace(target_dir / "overlay.parquet")
+            for link_name in COLUMNAR_INDEX_FILES:
+                src_link = tmp_dir / link_name
+                dst_link = target_dir / link_name
+                if src_link.is_symlink() and not dst_link.exists() and not dst_link.is_symlink():
+                    dst_link.symlink_to(os.readlink(src_link))
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    if async_transfer:
+        t = threading.Thread(
+            target=_sync_worker,
+            name=f"gr-static-map-sync-{target_dir.name}",
+            daemon=False,
+        )
+        t.start()
+    else:
+        _sync_worker()
+    return {"output_dir": str(target_dir)}
 
 
 def create_app(mapping: str | Path) -> FastAPI:
