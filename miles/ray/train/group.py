@@ -58,11 +58,7 @@ class TrainerController:
 
         self._indep_dp_quorum_id = 0
 
-        self._health_checker_config = (
-            SimpleHealthCheckerConfig.from_args(args, prefix="trainer_heartbeat_checker")
-            if self._expected_num_cells > 1
-            else None
-        )
+        self._health_checker_config = SimpleHealthCheckerConfig.from_args(args, prefix="trainer_heartbeat_checker")
 
         self._health_checker_activeness = ActivenessTracker(active=True)
 

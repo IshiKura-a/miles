@@ -24,20 +24,6 @@ class RayWorkerHandle(BaseWorkerHandle):
             raise AttributeError(name)
 
         async def call(**kwargs: Any) -> Any:
-            if name != "kill_self":
-                for probe_attempt in range(3):
-                    try:
-                        await asyncio.wait_for(self._actor_handle.__ray_ready__.remote(), timeout=15.0)
-                        break
-                    except (ray.exceptions.ActorUnavailableError, TimeoutError, asyncio.TimeoutError) as exc:
-                        if probe_attempt < 2:
-                            logger.warning(
-                                "Actor channel probe failed before calling %r (attempt %d/3): %r; retrying",
-                                name,
-                                probe_attempt + 1,
-                                exc,
-                            )
-                            await asyncio.sleep(1.0)
             try:
                 return await getattr(self._actor_handle, name).remote(**kwargs)
             except ray.exceptions.RayActorError as e:

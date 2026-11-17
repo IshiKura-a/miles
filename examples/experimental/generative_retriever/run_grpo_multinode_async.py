@@ -29,6 +29,17 @@ import tempfile
 import time
 from typing import cast
 
+for _ray_env_k, _ray_env_v in (
+    ("RAY_grpc_client_idle_timeout_ms", "36000000"),
+    ("RAY_grpc_client_keepalive_time_ms", "30000"),
+    ("RAY_grpc_client_keepalive_timeout_ms", "600000"),
+    ("RAY_grpc_keepalive_time_ms", "30000"),
+    ("RAY_grpc_keepalive_timeout_ms", "600000"),
+    ("RAY_timeout_ms_task_wait_for_death_info", "600000"),
+    ("RAY_core_worker_rpc_server_reconnect_timeout_max_s", "600"),
+):
+    os.environ.setdefault(_ray_env_k, _ray_env_v)
+
 import ray
 from ray._private import ray_constants
 from ray._private.node import Node
