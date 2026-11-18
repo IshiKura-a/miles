@@ -194,4 +194,5 @@ def build_sglang_args(args: ScriptArgs, mem_fraction: float) -> list[str]:
         "--sglang-attention-backend", "triton", "--sglang-disable-cuda-graph",
         "--sglang-server-concurrency", str(args.sglang_server_concurrency),
         "--sglang-mem-fraction-static", str(mem_fraction),
+        "--sglang-watchdog-timeout", "3600",
     ]

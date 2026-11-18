@@ -126,12 +126,16 @@ def load(actor: Any) -> dict[str, Any] | None:
         logger.info(f"[FSDP] Model checkpoint {model_dir} not found; skipping load.")
         return None
 
+    from miles.utils.distributed_utils import get_gloo_group
+
+    gloo_group = get_gloo_group()
+
     # Load model weights (always)
     model_state = ModelState(actor.model)
     state_dict = {"model_state": model_state}
 
     try:
-        dcp.load(state_dict=state_dict, checkpoint_id=str(model_dir))
+        dcp.load(state_dict=state_dict, checkpoint_id=str(model_dir), process_group=gloo_group)
         logger.info(f"[FSDP] Loaded model from {model_dir}")
     except Exception as e:
         logger.error(f"[FSDP] Failed to load model from {model_dir}: {e}")
@@ -143,7 +147,7 @@ def load(actor: Any) -> dict[str, Any] | None:
         optimizer_state = OptimizerState(actor.model, actor.optimizer)
         optim_state_dict = {"optim_state": optimizer_state}
         try:
-            dcp.load(state_dict=optim_state_dict, checkpoint_id=str(optimizer_dir))
+            dcp.load(state_dict=optim_state_dict, checkpoint_id=str(optimizer_dir), process_group=gloo_group)
             logger.info(f"[FSDP] Loaded optimizer from {optimizer_dir}")
         except Exception as e:
             logger.warning(f"[FSDP] Failed to load optimizer from {optimizer_dir}: {e}")
@@ -156,7 +160,7 @@ def load(actor: Any) -> dict[str, Any] | None:
         lr_scheduler_state = LRSchedulerState(actor.lr_scheduler)
         lr_scheduler_state_dict = {"lr_scheduler_state": lr_scheduler_state}
         try:
-            dcp.load(state_dict=lr_scheduler_state_dict, checkpoint_id=str(lr_scheduler_dir))
+            dcp.load(state_dict=lr_scheduler_state_dict, checkpoint_id=str(lr_scheduler_dir), process_group=gloo_group)
             logger.info(f"[FSDP] Loaded LR scheduler from {lr_scheduler_dir}")
         except Exception as e:
             logger.warning(f"[FSDP] Failed to load LR scheduler from {lr_scheduler_dir}: {e}")
@@ -325,7 +329,10 @@ def save(actor: Any, iteration: int, force_sync: bool = False) -> None:
         def _sync_staged_to_target() -> None:
             t0 = time.perf_counter()
             try:
-                for src_item in sorted(write_ckpt_dir.rglob("*")):
+                for src_item in sorted(
+                    write_ckpt_dir.rglob("*"),
+                    key=lambda p: ("mapping" in p.parts, str(p)),
+                ):
                     rel = src_item.relative_to(write_ckpt_dir)
                     dst_item = checkpoint_dir / rel
                     if src_item.is_symlink():
