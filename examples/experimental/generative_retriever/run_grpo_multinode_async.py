@@ -139,9 +139,14 @@ def build_manifest(
     if validate_checkpoints:
         if resume:
             tracker = checkpoint_dir / "latest_checkpointed_iteration.txt"
-            if not tracker.is_file():
-                raise FileNotFoundError(f"Resume checkpoint missing: {tracker}")
-            iteration = int(tracker.read_text().strip())
+            raw_tracker = tracker.read_text().strip() if tracker.is_file() else ""
+            iteration = int(raw_tracker) if raw_tracker.isdigit() else -1
+            if checkpoint_dir.is_dir():
+                for entry in checkpoint_dir.iterdir():
+                    if entry.name.startswith("iter_") and entry.name[5:].isdigit():
+                        cand = int(entry.name[5:])
+                        if cand > iteration and (entry / "meta.json").is_file():
+                            iteration = cand
             if iteration <= 0 or not (checkpoint_dir / f"iter_{iteration:07d}" / "meta.json").is_file():
                 raise ValueError(f"Incomplete checkpoint at iteration {iteration}")
             if not (
@@ -387,7 +392,13 @@ def run_cluster(manifest: Manifest) -> None:
         if training.returncode:
             raise RuntimeError(f"train.py exited {training.returncode}: {run_dir / 'training.log'}")
         tracker = run_dir / "checkpoints/latest_checkpointed_iteration.txt"
-        completed = int(tracker.read_text().strip())
+        raw_completed = tracker.read_text().strip() if tracker.is_file() else ""
+        completed = int(raw_completed) if raw_completed.isdigit() else -1
+        for entry in (run_dir / "checkpoints").iterdir():
+            if entry.name.startswith("iter_") and entry.name[5:].isdigit():
+                cand = int(entry.name[5:])
+                if cand > completed and (entry / "meta.json").is_file():
+                    completed = cand
         if completed != manifest["num_rollout"]:
             raise RuntimeError(f"Expected {manifest['num_rollout']} checkpointed steps, got {completed}")
         print(f"Completed {completed} GRPO optimizer steps: {run_dir}", flush=True)

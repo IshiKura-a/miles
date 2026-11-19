@@ -109,6 +109,11 @@ def load(actor: Any) -> dict[str, Any] | None:
         tracker_file = root_path / "latest_checkpointed_iteration.txt"
         tracker_text = tracker_file.read_text().strip() if tracker_file.exists() else ""
         target_step = int(tracker_text) if tracker_text.isdigit() else -1
+        for entry in root_path.iterdir():
+            if entry.name.startswith("iter_") and entry.name[5:].isdigit():
+                cand = int(entry.name[5:])
+                if cand > target_step and (entry / "meta.json").is_file():
+                    target_step = cand
         if dist.is_initialized():
             step_tensor = torch.tensor([target_step], dtype=torch.int64, device="cuda")
             dist.all_reduce(step_tensor, op=dist.ReduceOp.MAX)

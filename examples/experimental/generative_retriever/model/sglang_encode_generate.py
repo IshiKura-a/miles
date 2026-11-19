@@ -142,6 +142,7 @@ def resolve_engine_url(args: Any) -> str:
 _AIOHTTP_SESSIONS: dict[asyncio.AbstractEventLoop, aiohttp.ClientSession] = {}
 _WORKER_URLS_BY_ROUTER: dict[str, list[str]] = {}
 _WORKER_URL_LOCKS: dict[asyncio.AbstractEventLoop, asyncio.Lock] = {}
+_DEAD_WORKER_URLS: set[str] = set()
 _RR_COUNTER: int = 0
 
 
@@ -150,7 +151,7 @@ def _get_aiohttp_session() -> aiohttp.ClientSession:
     sess = _AIOHTTP_SESSIONS.get(loop)
     if sess is None or sess.closed:
         connector = aiohttp.TCPConnector(limit=0, limit_per_host=0, ttl_dns_cache=300, keepalive_timeout=600)
-        timeout = aiohttp.ClientTimeout(total=None, connect=30.0, sock_connect=30.0, sock_read=None)
+        timeout = aiohttp.ClientTimeout(total=None, connect=30.0, sock_connect=30.0, sock_read=300.0)
         sess = aiohttp.ClientSession(connector=connector, timeout=timeout)
         _AIOHTTP_SESSIONS[loop] = sess
     return sess
@@ -159,18 +160,26 @@ def _get_aiohttp_session() -> aiohttp.ClientSession:
 async def _resolve_target_url(router_url: str, session: aiohttp.ClientSession) -> str:
     global _RR_COUNTER
     urls = _WORKER_URLS_BY_ROUTER.get(router_url)
+    if urls:
+        urls = [u for u in urls if u not in _DEAD_WORKER_URLS]
     if not urls:
         loop = asyncio.get_running_loop()
         lock = _WORKER_URL_LOCKS.setdefault(loop, asyncio.Lock())
         async with lock:
             urls = _WORKER_URLS_BY_ROUTER.get(router_url)
+            if urls:
+                urls = [u for u in urls if u not in _DEAD_WORKER_URLS]
             if not urls:
                 try:
                     async with session.get(f"{router_url}/workers") as resp:
                         if resp.status == 200:
                             info = await resp.json()
                             workers = info.get("workers", [])
-                            extracted = [w["url"].rstrip("/") for w in workers if isinstance(w, dict) and w.get("url")]
+                            extracted = [
+                                w["url"].rstrip("/")
+                                for w in workers
+                                if isinstance(w, dict) and w.get("url") and w["url"].rstrip("/") not in _DEAD_WORKER_URLS
+                            ]
                             if extracted:
                                 urls = extracted
                                 _WORKER_URLS_BY_ROUTER[router_url] = urls
@@ -202,6 +211,9 @@ async def request_embedding(args: Any, router_url: str, prompt_ids: list[int]) -
                 payload = await response.json()
             break
         except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+            if target_base != router_url and isinstance(error, (aiohttp.ClientConnectorError, asyncio.TimeoutError)):
+                _DEAD_WORKER_URLS.add(target_base)
+                logger.warning("Marking SGLang worker %s as dead after %s", target_base, type(error).__name__)
             _WORKER_URLS_BY_ROUTER.pop(router_url, None)
             if attempt == _TRANSPORT_ATTEMPTS:
                 raise

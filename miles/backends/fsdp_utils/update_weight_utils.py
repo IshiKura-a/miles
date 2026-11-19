@@ -70,6 +70,23 @@ class UpdateWeight(abc.ABC):
         self.model = model
         self.weight_version = 0
         self.conn_status = ConnStatusManager()
+        self._dead_engines: set[SGLangApiClient] = set()
+        self._local_engine_dead: bool = False
+
+    async def _safe_engine_call(self, client: SGLangApiClient, coro):
+        if client in self._dead_engines:
+            coro.close()
+            return None
+        try:
+            return await coro
+        except Exception as exc:
+            self._dead_engines.add(client)
+            logger.warning(
+                "[FSDP] Rollout engine %s unreachable during weight update (%s); marking dead and skipping",
+                getattr(client, "base_url", client),
+                exc,
+            )
+            return None
 
     @abc.abstractmethod
     def connect_rollout_engines(
@@ -85,11 +102,13 @@ class UpdateWeight(abc.ABC):
 
         if dist.get_rank() == 0:
             async_utils.wait_futures(
-                [async_utils.submit(client.pause_generation()) for client in self.rollout_engines]
+                [async_utils.submit(self._safe_engine_call(client, client.pause_generation())) for client in self.rollout_engines]
             )
-            async_utils.wait_futures([async_utils.submit(client.flush_cache()) for client in self.rollout_engines])
             async_utils.wait_futures(
-                [async_utils.submit(client.begin_weight_update()) for client in self.rollout_engines]
+                [async_utils.submit(self._safe_engine_call(client, client.flush_cache())) for client in self.rollout_engines]
+            )
+            async_utils.wait_futures(
+                [async_utils.submit(self._safe_engine_call(client, client.begin_weight_update())) for client in self.rollout_engines]
             )
         dist.barrier(group=get_gloo_group())
         gc.collect()
@@ -126,10 +145,10 @@ class UpdateWeight(abc.ABC):
         dist.barrier(group=get_gloo_group())
         if dist.get_rank() == 0:
             async_utils.wait_futures(
-                [async_utils.submit(client.end_weight_update()) for client in self.rollout_engines]
+                [async_utils.submit(self._safe_engine_call(client, client.end_weight_update())) for client in self.rollout_engines]
             )
             async_utils.wait_futures(
-                [async_utils.submit(client.continue_generation()) for client in self.rollout_engines]
+                [async_utils.submit(self._safe_engine_call(client, client.continue_generation())) for client in self.rollout_engines]
             )
         dist.barrier(group=get_gloo_group())
         gc.collect()
@@ -182,6 +201,8 @@ class UpdateWeightFromTensor(UpdateWeight):
                 self.tp_rank = dist.get_rank() - start_rank
 
     def update_bucket_weights(self, named_tensors, weight_version=None) -> None:
+        if getattr(self, "_local_engine_dead", False) and dist.get_world_size(self._ipc_gather_group) == 1:
+            return
         monkey_patch_torch_reductions()
         use_rocm_cpu_shm = torch.version.hip is not None
         if use_rocm_cpu_shm:
@@ -264,27 +285,40 @@ class UpdateWeightFromTensor(UpdateWeight):
             # TODO: assumes all ranks have the same number of dtype buckets
             num_dtypes = len(gathered_serialized_batches[0])
             assert num_dtypes > 0
-            for i in range(num_dtypes):
-                kwargs = {
-                    "serialized_named_tensors": [tensors[i] for tensors in gathered_serialized_batches],
-                    "load_format": "flattened_bucket",
-                    "flush_cache": False,
-                    "weight_version": str(weight_version),
-                }
-                result = async_utils.run(self._ipc_engine.update_weights_from_tensor(**kwargs))
-                if isinstance(result, dict):
-                    success = result.get("success", True)
-                    error_msg = result.get("error_message") or result.get("message", "unknown error")
-                else:
-                    success = getattr(result, "success", True)
-                    error_msg = getattr(result, "error_message", "unknown error")
-                if not success:
-                    raise RuntimeError(
-                        f"Weight sync failed on rollout engine: {error_msg}. " f"Check SGLang version compatibility."
-                    )
-
-        if dist.get_rank() == self._ipc_gather_src:
-            async_utils.run(self._ipc_engine.flush_cache())
+            try:
+                for i in range(num_dtypes):
+                    kwargs = {
+                        "serialized_named_tensors": [tensors[i] for tensors in gathered_serialized_batches],
+                        "load_format": "flattened_bucket",
+                        "flush_cache": False,
+                        "weight_version": str(weight_version),
+                    }
+                    result = async_utils.run(self._ipc_engine.update_weights_from_tensor(**kwargs))
+                    if isinstance(result, dict):
+                        success = result.get("success", True)
+                        error_msg = result.get("error_message") or result.get("message", "unknown error")
+                    else:
+                        success = getattr(result, "success", True)
+                        error_msg = getattr(result, "error_message", "unknown error")
+                    if not success:
+                        raise RuntimeError(
+                            f"Weight sync failed on rollout engine: {error_msg}. " f"Check SGLang version compatibility."
+                        )
+                async_utils.run(self._ipc_engine.flush_cache())
+            except Exception as exc:
+                self._local_engine_dead = True
+                logger.warning(
+                    "[FSDP] Local rollout engine unreachable on rank %d (%s); marking dead and skipping remaining buckets",
+                    dist.get_rank(),
+                    exc,
+                )
+                if use_rocm_cpu_shm:
+                    for batch in gathered_serialized_batches:
+                        for s in batch or ():
+                            try:
+                                MultiprocessingSerializer.deserialize(s)
+                            except Exception:
+                                pass
         del long_live_tensors
         torch.cuda.ipc_collect()
 
