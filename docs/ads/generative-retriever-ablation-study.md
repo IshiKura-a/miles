@@ -569,6 +569,38 @@ Frozen Stage5 Baseline 与 `261027-bs64-v2` Step 1560，同新版 **NA+INTL 统�
 2. **`R4_D3` 解释了为什么前两层不能彻底设为 `T=0`**：前两层完全贪心（`T=0`）切断了 `(c0, c1)` 与 Qwen Encoder 在粗粒度层面的探索梯度，换词探索量降至 `146.00`（`PM 323.25`），不如给前两层保留微量温度（如 `0.2`）。
 3. **`R4_D4`（`Z4 + sqrt_floor`）以 `1/17` 数据量全面刷新 64 卡主实验全周期纪录**：仅用 `240k` 条训练 Query，`PM Good Density` 达 **`341.25 (+48.69)`**、`SM Good Density` 达 **`630.39 (+72.65)`**、`Union Density` 达 **`660.64 (+79.23)`**，三项密度全部超越 64 卡主实验训练 `4.16M` 条 Query 的历史峰值（`337.87` / `629.79` / `657.98`），且北美 `en-us` 达 **`481.73`（PM）/ `932.87`（SM）**。
 
+---
+
+### 5.12 多机纯自产自销架构与高显存无损加速验收报告（`S4-Coloc`，4 机 32 卡 MI300X 实测 vs. 8 机 64 卡主实验遥测）
+
+针对单机测试未覆盖的多机星型通信瓶颈（`node-0` 单点 `RolloutExecutor` 跨机发送 `64,000` 次 HTTP、单进程聚合/切分 `3,277 万` 样本耗时 `209s` 且内存飙至 `77 GB`）以及 GPU 显存闲置（仅用 `49%~59%`）、FSDP 训练算力受限于每样本细粒度 kernel 启动等问题，在隔离分支 `ablation/speed-opt`（提交 `15fb39d5`，不含离线 Baseline）上实现并完成了 **4 机 32 卡（`pairs=2`，每卡负载 `1,000 Queries/step = 512,000 Samples/step` 与 8 机 64 卡完全等比例）** 完整 5 步联训验收（W&B Run: `j5h1zj7w`）：
+
+1. **本机本卡纯“自产自销”去中心化 Rollout（`GR_LOCAL_COLOC_ROLLOUT=1` + `gr_compact_shard`）**：
+   - 每台机器部署 1 个节点亲和 `_NodeColocRolloutWorker`，本机直接批量向本机 8 个 SGLang 引擎发送 `125-Query` 批请求（每卡每步仅 `8` 次本机回环调用，**0 跨机 HTTP**）；
+   - 将每个 DP 分片压缩为 **5 个连续零拷贝 `np.ndarray / torch.Tensor` 缓冲区（`0` 个 Python 列表对象）** 直接写入本机 `/dev/shm` Ray Plasma，由同机同卡的 FSDP Actor 直接零网络读取（**0 跨机样本传输**，消除 `142s` GIL 序列化与 `209s` 单点等待）。
+2. **HBM3 常驻高频预编译词向量缓存 + 全 GPU 向量化打分与规约（`HbmKeywordCache` + `score_batch_gpu_vectorized`）**：
+   - 按自适应显存水位将高频预编译 Keyword 特征（加动态 FIFO 环缓）常驻每张 GPU 的 HBM3 显存，未命中冷词走 Pinned `/dev/shm` DMA（`max_diff = 0.0`）；
+   - 将 `score_batch_with_precompiled_kids` 的百万次三层 Python 循环全量搬上 GPU（`float64` 精度，实测 `raw_max_diff = 0.0`、`metrics26_max_diff = 0.0`、`doc2k` 投票字典 `100%` 逐项一致），同时为 Rollout 树搜索补齐 Grouped Cross-Attention（`128-Query` chunk）。
+3. **FSDP 大微批与向量化损失前反向（`mbs = 25,600` + Vectorized `get_batch / get_log_probs`）**：
+   - 消除 `get_batch` 与 `get_log_probs_and_entropy` 中每微批 `2.56 万` 次逐样本 `F.pad / torch.arange / SliceBackward` 小 kernel 启动，改为单次 `index_select` / 分段前缀和（前反向逐位等价），将多机 `actor_train_time` 从 `260.8s` 压至 **`26.2s`**。
+
+#### 表 5P：多机等单卡负载（`1,000 Queries = 512,000 Samples / GPU / step`）端到端性能与硬件遥测对比
+
+| 核心性能 / 硬件指标（同单卡负载口径） | 64 卡 Fix 主实验 (`tod6o6tg`) | 64 卡 Update 主实验 (`wi49s1wh`) | **32 卡 4 机 `S4-Coloc + R4_D4` 稳态实测 (`j5h1zj7w`, Steps 1~4 均值)** | **相对 Update 主实验加速 / 改善** |
+| :--- | ---: | ---: | :---: | :---: |
+| **`perf/step_time`（单步端到端总耗时）** | `1,365.3s` (`22.8 min`) | `1,685.9s` (`28.1 min`) | **`64.22s` (`1.07 min`)**<br>*(各步: `62.28s, 63.47s, 64.96s, 66.17s`)* | **`26.25×` 端到端提速！**<br>*(远超 `<= 3.0 min` 验收线)* |
+| **`perf/rollout_time`（编码 + 树搜索 + 打分 + 本地入库）** | `926.7s` | `1,026.9s` | **`16.43s`** | **`62.5×` 提速** |
+| **单条 Query 打分延迟 (`score/latency_seconds`)** | `0.624s` | `0.674s` | **`0.0085s`** (`8.5 ms`) | **`79.3×` 提速** |
+| **Rollout 有效吞吐 (`tokens_per_gpu_per_sec`)** | `2,213` | `1,995` | **`125,020`** | **`62.7×` 吞吐提升** |
+| **跨机分发与后处理干等 (`train_wait - rollout - upd_w`)** | `135.5s` | `209.0s` | **`2.42s`** | **`86.4×` 削减（0 跨机样本传输）** |
+| **Learner 数据上卡解包 (`train_time - actor_train_time`)** | `46.6s` | `48.3s` | **`4.08s`** *(含 4 机 Gloo 日志聚合)* | **`11.8×` 提速** |
+| **`perf/actor_train_time`（多机 FSDP 前反向）** | `241.0s` (`24.9 TF`) | `260.8s` (`23.1 TF`) | **`26.32s`** (`71.5 TF` 名义 / 含紧凑序列实际 **`10×`**) | **`9.91×` 提速** |
+| **`perf/update_weights_time`（含动态 `doc2k` 全局同步）** | `15.6s` *(无 `doc2k`)* | `140.9s ~ 198.9s` | **`14.86s`** *(含动态 `doc2k` GPU 归并)* | **`10.9× ~ 13.4×` 提速（追平无 `doc2k`！）** |
+| **GPU 显存容量利用率 (`memoryAllocated` / `191.5 GiB`)** | 均值 `49%` / 峰值 `68.5%` | 均值 `59%` / 峰值 `78.6%` | **均值 `70.7%` / 训练峰值 `91.3%` (`174.8 GiB`)**<br>*(含 `12.3%` 保活进程；纯任务峰值 `~79.0%`)* | **显存打满甜点区，全程 0 OOM** |
+| **GPU 满载功耗占比 (`powerPercent` / `750W`)** | 均值 `60.6%` / p95 `100%` | 均值 `63.3%` / p50 `43.9%` | **计算期（`42.7s / 64.2s`）持续 `86% ~ 92%` (`650~698W`)** | 消除碎 kernel 半休眠，剩余 `14.9s` 为框架权重同步 |
+| **`node-0` 驱动进程内存峰值 (`proc.memory.rssMB`)** | `76.3 GB` | `77.0 GB` | **`13.5 GB`** | **主节点内存暴降 `-82.5%`** |
+
+
 
 
 
