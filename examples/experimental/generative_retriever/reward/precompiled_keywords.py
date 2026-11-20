@@ -19,7 +19,6 @@ from examples.experimental.generative_retriever.reward.relevance_model import (
     GRAPHENE_FEATURE_DIM,
     GRAPHENE_NUM_SCORE_HEADS,
     GRAPHENE_NUM_TOKENS,
-    RelevanceScorer,
     load_graphene_tower_and_cross_builders,
     optimize_graphene_pipeline,
     relevance_source_path,
@@ -28,7 +27,7 @@ from examples.experimental.generative_retriever.reward.relevance_model import (
 )
 from examples.experimental.generative_retriever.runtime.gr_config import GRConfig
 from examples.experimental.generative_retriever.services.lru_cache import LRUCache
-from examples.experimental.generative_retriever.services.mapping_service import ResidentMapping
+from examples.experimental.generative_retriever.services.mapping_staging import resolve_mapping_origin_dir
 
 PRECOMPILED_KW_BIN_NAME = "keyword_features_gv21_large.bf16.bin"
 PRECOMPILED_KW_META_NAME = "keyword_features_gv21_large.meta.json"
@@ -67,13 +66,15 @@ class PackedPairScorer(Protocol):
 def resolve_precompiled_kw_paths(
     staged_map_dir: Path,
     original_map_dir: str | Path,
-) -> tuple[Path, Path] | None:
-    """Locate validated precompiled keyword feature files alongside the active index if available."""
-    candidates = [
+) -> tuple[Path, Path]:
+    """Locate and validate precompiled keyword feature files for the active index."""
+    raw_candidates = (
         Path("/scratch/gr_kw_precompile"),
-        staged_map_dir,
-        Path(os.path.expandvars(str(original_map_dir))).resolve(),
-    ]
+        staged_map_dir.resolve(),
+        resolve_mapping_origin_dir(staged_map_dir),
+        resolve_mapping_origin_dir(original_map_dir),
+    )
+    candidates = list(dict.fromkeys(raw_candidates))
     for folder in candidates:
         bin_p = folder / PRECOMPILED_KW_BIN_NAME
         meta_p = folder / PRECOMPILED_KW_META_NAME
@@ -84,13 +85,52 @@ def resolve_precompiled_kw_paths(
                     f"Precompiled keyword commit mismatch in {meta_p}: {meta.get('graphene_commit')}"
                 )
             expected_bytes = int(meta["num_keywords"]) * GRAPHENE_NUM_TOKENS * GRAPHENE_FEATURE_DIM * 2
-            if bin_p.stat().st_size == expected_bytes:
-                return bin_p, meta_p
-    return None
+            if bin_p.stat().st_size != expected_bytes:
+                raise ValueError(
+                    f"Precompiled keyword file size mismatch in {bin_p}: "
+                    f"expected {expected_bytes}, got {bin_p.stat().st_size}"
+                )
+            return bin_p, meta_p
+    searched = ", ".join(os.fspath(p) for p in candidates)
+    raise FileNotFoundError(
+        f"Precompiled keyword table ({PRECOMPILED_KW_BIN_NAME}, {PRECOMPILED_KW_META_NAME}) "
+        f"not found in any candidate directory: {searched}"
+    )
+
+
+def stage_precompiled_keywords_to_shm(bin_path: Path, meta_path: Path) -> Path:
+    """Copy the validated bf16 keyword feature table into node-shared /dev/shm if space permits."""
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    expected_bytes = int(meta["num_keywords"]) * int(meta["num_tokens"]) * int(meta["feature_dim"]) * 2
+    if bin_path.stat().st_size != expected_bytes:
+        raise ValueError(f"Precompiled keyword file size mismatch: {bin_path}")
+    tag = str(meta.get("mapping_name", "part25"))
+    shm_root = Path("/dev/shm")
+    if not shm_root.is_dir():
+        return bin_path
+    shm_dst = shm_root / f"gr_precompiled_kw_{tag}_gv21.bf16.bin"
+    with FileLock(str(shm_root / f"gr_precompiled_kw_{tag}_gv21.lock")):
+        if shm_dst.is_file() and shm_dst.stat().st_size == expected_bytes:
+            return shm_dst
+        if shutil.disk_usage(shm_root).free >= expected_bytes + _SHM_HEADROOM_BYTES:
+            tmp_dst = shm_dst.with_suffix(f".tmp.{os.getpid()}")
+            try:
+                with open(bin_path, "rb") as src_f, open(tmp_dst, "wb") as dst_f:
+                    shutil.copyfileobj(src_f, dst_f, length=_COPY_CHUNK_BYTES)
+                tmp_dst.replace(shm_dst)
+                return shm_dst
+            finally:
+                tmp_dst.unlink(missing_ok=True)
+    return bin_path
+
+
+def ensure_precompiled_keywords_staged(staged_map_dir: Path, original_map_dir: str | Path) -> Path:
+    bin_path, meta_path = resolve_precompiled_kw_paths(staged_map_dir, original_map_dir)
+    return stage_precompiled_keywords_to_shm(bin_path, meta_path)
 
 
 class PrecompiledKeywordStore:
-    """Read-only node-shared /dev/shm (or local NVMe fallback) bf16 keyword feature table."""
+    """Read-only node-shared /dev/shm (or local NVMe) bf16 keyword feature table."""
 
     def __init__(self, bin_path: Path, meta_path: Path, *, stage_to_shm: bool = True) -> None:
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -101,27 +141,10 @@ class PrecompiledKeywordStore:
         if bin_path.stat().st_size != expected_bytes:
             raise ValueError(f"Precompiled keyword file size mismatch: {bin_path}")
 
-        target_path = bin_path
         self.tag = str(meta.get("mapping_name", "part25"))
-        shm_root = Path("/dev/shm")
-        if stage_to_shm and shm_root.is_dir():
-            shm_dst = shm_root / f"gr_precompiled_kw_{self.tag}_gv21.bf16.bin"
-            with FileLock(str(shm_root / f"gr_precompiled_kw_{self.tag}_gv21.lock")):
-                if shm_dst.is_file() and shm_dst.stat().st_size == expected_bytes:
-                    target_path = shm_dst
-                elif shutil.disk_usage(shm_root).free >= expected_bytes + _SHM_HEADROOM_BYTES:
-                    tmp_dst = shm_dst.with_suffix(f".tmp.{os.getpid()}")
-                    try:
-                        with open(bin_path, "rb") as src_f, open(tmp_dst, "wb") as dst_f:
-                            shutil.copyfileobj(src_f, dst_f, length=_COPY_CHUNK_BYTES)
-                        tmp_dst.replace(shm_dst)
-                        target_path = shm_dst
-                    finally:
-                        tmp_dst.unlink(missing_ok=True)
-
-        self.active_path = target_path
+        self.active_path = stage_precompiled_keywords_to_shm(bin_path, meta_path) if stage_to_shm else bin_path
         self._mmap = np.memmap(
-            target_path,
+            self.active_path,
             dtype=np.uint16,
             mode="r",
             shape=(self.num_keywords, self.num_tokens, self.feature_dim),
@@ -266,44 +289,3 @@ class FastPrecompileScorer:
             "k_hits": int(unique_kids_t.numel()),
         }
 
-
-class LiveRelevancePairScorer:
-    """Adapter allowing live dual-tower ``RelevanceScorer`` to share the vectorized GPU batch reducer."""
-
-    def __init__(self, scorer: RelevanceScorer, mapping_engine: ResidentMapping) -> None:
-        self._scorer = scorer
-        self._mapping = mapping_engine
-        self.device = scorer.pipeline.device
-
-    @property
-    def query_cache_size(self) -> int:
-        return int(self._scorer.query_features.stats().size)
-
-    @property
-    def keyword_cache_size(self) -> int:
-        return int(self._scorer.keyword_features.stats().size)
-
-    def score_packed_qk_gpu(
-        self,
-        unique_queries: list[str],
-        unique_qk_gpu: torch.Tensor,
-    ) -> tuple[torch.Tensor, dict[str, int]]:
-        n_pairs = int(unique_qk_gpu.numel())
-        if n_pairs == 0:
-            return (
-                torch.empty((0, 2), dtype=torch.float32, device=self.device),
-                {"q_hits": 0, "q_misses": 0, "k_hits": 0},
-            )
-        packed_cpu = unique_qk_gpu.detach().cpu().numpy()
-        q_idx_list = (packed_cpu >> 32).tolist()
-        raw_kids_np = packed_cpu & 0xFFFFFFFF
-        unique_kids_np, k_inv_np = np.unique(raw_kids_np, return_inverse=True)
-        kw_texts = self._mapping.decode_kids(unique_kids_np.tolist())
-        pairs = [(unique_queries[int(qi)], kw_texts[int(ki)]) for qi, ki in zip(q_idx_list, k_inv_np.tolist(), strict=True)]
-        pair_scores, deltas = self._scorer.score_with_deltas(pairs)
-        arr = np.asarray([pair_scores[p] for p in pairs], dtype=np.float32)
-        return torch.from_numpy(arr).to(device=self.device), {
-            "q_hits": int(deltas["query_features"]["hits"]),
-            "q_misses": int(deltas["query_features"]["misses"]),
-            "k_hits": int(deltas["keyword_features"]["hits"]),
-        }

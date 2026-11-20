@@ -39,6 +39,9 @@ from examples.experimental.generative_retriever.index.id_text_mapping import COL
 from examples.experimental.generative_retriever.model.model_loading import (
     stage_local_model_dir,
 )
+from examples.experimental.generative_retriever.reward.precompiled_keywords import (
+    ensure_precompiled_keywords_staged,
+)
 from examples.experimental.generative_retriever.reward.relevance_model import (
     relevance_source_path,
     stage_local_relevance_model,
@@ -222,6 +225,7 @@ def prepare_node_assets(manifest: Manifest) -> None:
     local_ckpt = stage_local_model_dir(manifest["checkpoint"], "checkpoint")
     local_qwen = stage_local_model_dir(manifest["qwen_model"], "Qwen model")
     local_mapping = stage_local_mapping_dir(manifest["mapping"])
+    ensure_precompiled_keywords_staged(local_mapping, manifest["mapping"])
     stage_local_doc2k_state(
         run_dir / "checkpoints",
         resume="--load" in manifest["train_argv"],

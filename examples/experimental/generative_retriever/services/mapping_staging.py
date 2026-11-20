@@ -17,13 +17,26 @@ from examples.experimental.generative_retriever.reward.relevance_reward import i
 from examples.experimental.generative_retriever.utils.paths import absolute_path
 
 RESUME_OVERLAY_FILENAME = "gr_doc2k_resume_overlay.parquet"
+STAGED_MAPPING_SENTINEL = ".staged_arrow_ok"
+
+
+def resolve_mapping_origin_dir(mapping_path: str | Path) -> Path:
+    resolved = Path(os.path.expandvars(str(mapping_path))).resolve()
+    sentinel = resolved / STAGED_MAPPING_SENTINEL
+    if sentinel.is_file():
+        origin_text = sentinel.read_text(encoding="utf-8").strip()
+        if origin_text:
+            origin_path = Path(origin_text).resolve()
+            if origin_path.is_dir():
+                return origin_path
+    return resolved
 
 
 def stage_local_mapping_dir(mapping_path: str | Path) -> Path:
     resolved = Path(mapping_path).resolve()
     local_root = Path(tempfile.gettempdir())
     target = resolved if resolved.is_relative_to(local_root) else local_root / f"gr_mapping_{resolved.name}"
-    sentinel = target / ".staged_arrow_ok"
+    sentinel = target / STAGED_MAPPING_SENTINEL
     if not sentinel.is_file():
         with FileLock(f"{target}.lock"):
             if not sentinel.is_file():
@@ -93,12 +106,7 @@ def save_static_mapping_snapshot(
     async_transfer: bool = True,
 ) -> dict[str, str]:
     target_dir = absolute_path(output_dir)
-    resolved_base = Path(base_mapping).resolve()
-    staged_marker = resolved_base / ".staged_arrow_ok"
-    if staged_marker.is_file():
-        origin_text = staged_marker.read_text(encoding="utf-8").strip()
-        if origin_text and Path(origin_text).is_dir():
-            resolved_base = Path(origin_text).resolve()
+    resolved_base = resolve_mapping_origin_dir(base_mapping)
 
     overlay_table = pa.table({
         "docid_u32": pa.array([], type=pa.uint32()),

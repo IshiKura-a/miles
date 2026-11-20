@@ -50,10 +50,12 @@ call out deviations in review.
   constants and typed configuration.
 - **Do not hide bugs with `getattr` or silent fallbacks.** Access expected
   attributes directly instead of wrapping known contracts in
-  `getattr(obj, "attr", default)`. Prefer fail-fast validation and atomic
-  invariants over exception swallowing, silent step skipping, or partial
-  worker/state degradation. Fix root causes at the source boundary rather than
-  adding workarounds across downstream callers.
+  `getattr(obj, "attr", default)`. Fallbacks are permitted only for explicitly
+  expected runtime conditions; never add silent fallbacks for unexpected missing
+  assets, broken paths, or contract violations. Prefer fail-fast validation and
+  atomic invariants over exception swallowing, silent step skipping, or partial
+  worker/state degradation, and fix root causes at the source boundary rather
+  than adding workarounds across downstream callers.
 - **Prefer keyword arguments where they improve clarity.** Use keywords for
   internal calls with multiple or ambiguous arguments, especially configuration
   values and boolean flags. Preserve positional calling when it is conventional

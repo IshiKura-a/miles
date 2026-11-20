@@ -37,17 +37,9 @@ from examples.experimental.generative_retriever.reward.in_process_protocol impor
 from examples.experimental.generative_retriever.reward.precompiled_keywords import (
     BaselineKidSets,
     FastPrecompileScorer,
-    LiveRelevancePairScorer,
     PackedPairScorer,
     PrecompiledKeywordStore,
     resolve_precompiled_kw_paths,
-)
-from examples.experimental.generative_retriever.reward.relevance_model import (
-    RelevanceScorer,
-    load_relevance_pipeline_factory,
-    relevance_source_path,
-    stage_local_relevance_model,
-    stage_local_relevance_source,
 )
 from examples.experimental.generative_retriever.runtime.gr_config import GRConfig, RewardModeLiteral
 from examples.experimental.generative_retriever.services.lru_cache import LRUCache
@@ -211,55 +203,31 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
             object.__setattr__(self, "_mapping_engine", mapping_engine)
         assert self._mapping_engine is not None
 
-        pre_paths = resolve_precompiled_kw_paths(self._mapping_engine.path, self.id_mapping_path)
-        if pre_paths is not None:
-            kw_store = PrecompiledKeywordStore(pre_paths[0], pre_paths[1])
-            fast_scorer = FastPrecompileScorer(
-                self.relevance_model_path,
-                kw_store,
-                device,
-                gr_config=self.runtime_cfg,
-                kw_degrees=self._mapping_engine.keyword_degrees,
-            )
-            object.__setattr__(self, "_pair_scorer", fast_scorer)
-            hbm_gib = (
-                fast_scorer.hbm_cache.total_slots
-                * kw_store.num_tokens
-                * kw_store.feature_dim
-                * 2
-                / (1024**3)
-            )
-            logger.info(
-                "[GR precompiled kw] gpu=%d ready: rows=%d hbm_slots=%d (%.1f GiB) src=%s",
-                self._local_gpu_id,
-                kw_store.num_keywords,
-                fast_scorer.hbm_cache.total_slots,
-                hbm_gib,
-                kw_store.active_path,
-            )
-            return
-
-        rel_src = stage_local_relevance_source(relevance_source_path(self.relevance_model_path))
-        rel_model = stage_local_relevance_model(self.relevance_model_path)
-        factory = load_relevance_pipeline_factory(rel_src)
-        dev_str = f"cuda:{device.index or 0}" if device.type == "cuda" else str(device)
-        pipeline = factory(
-            rel_model,
-            cup="large",
-            device=dev_str,
-            dtype="bf16",
-            batch_size=4096,
-            cross_batch_size=16384,
-            show_progress=False,
+        bin_path, meta_path = resolve_precompiled_kw_paths(self._mapping_engine.path, self.id_mapping_path)
+        kw_store = PrecompiledKeywordStore(bin_path, meta_path)
+        fast_scorer = FastPrecompileScorer(
+            self.relevance_model_path,
+            kw_store,
+            device,
+            gr_config=self.runtime_cfg,
+            kw_degrees=self._mapping_engine.keyword_degrees,
         )
-        live_scorer = RelevanceScorer(
-            pipeline,
-            feature_cache_size=32_768,
-            score_cache_size=524_288,
-            pair_batch_size=65_536,
-            keyword_cache_size=33_554_432,
+        object.__setattr__(self, "_pair_scorer", fast_scorer)
+        hbm_gib = (
+            fast_scorer.hbm_cache.total_slots
+            * kw_store.num_tokens
+            * kw_store.feature_dim
+            * 2
+            / (1024**3)
         )
-        object.__setattr__(self, "_pair_scorer", LiveRelevancePairScorer(live_scorer, self._mapping_engine))
+        logger.info(
+            "[GR precompiled kw] gpu=%d ready: rows=%d hbm_slots=%d (%.1f GiB) src=%s",
+            self._local_gpu_id,
+            kw_store.num_keywords,
+            fast_scorer.hbm_cache.total_slots,
+            hbm_gib,
+            kw_store.active_path,
+        )
 
     def _extract_queries(self, input_ids: torch.Tensor, forward_batch: ForwardBatch) -> list[str | None] | None:
         tokenizer = self._qwen_tokenizer

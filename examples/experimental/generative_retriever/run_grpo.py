@@ -22,6 +22,9 @@ if str(_MILES_REPO_ROOT) not in sys.path:
 
 from examples.experimental.generative_retriever.index.id_text_mapping import is_columnar_index_dir
 from examples.experimental.generative_retriever.model.model_loading import stage_local_model_dir
+from examples.experimental.generative_retriever.reward.precompiled_keywords import (
+    ensure_precompiled_keywords_staged,
+)
 from examples.experimental.generative_retriever.reward.relevance_model import (
     relevance_source_path,
     stage_local_relevance_model,
@@ -284,7 +287,9 @@ def execute(args: ScriptArgs) -> None:
         )
     local_ckpt = str(stage_local_model_dir(checkpoint, "checkpoint"))
     local_qwen = str(stage_local_model_dir(qwen_model, "Qwen model"))
-    local_mapping = str(stage_local_mapping_dir(mapping))
+    staged_mapping = stage_local_mapping_dir(mapping)
+    ensure_precompiled_keywords_staged(staged_mapping, mapping)
+    local_mapping = str(staged_mapping)
     stage_local_doc2k_state(checkpoint_dir, resume=args.resume)
     stage_local_relevance_source(relevance_source_path(relevance_model))
     local_relevance = stage_local_relevance_model(relevance_model)
