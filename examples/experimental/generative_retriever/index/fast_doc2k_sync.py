@@ -157,53 +157,57 @@ def _all_to_all_kv_u64(
     vals_i32: np.ndarray,
     owners: np.ndarray,
     world_size: int,
-    device: torch.device,
+    group: dist.ProcessGroup | None,
 ) -> tuple[np.ndarray, np.ndarray]:
     if world_size == 1:
         return keys_u64, vals_i32
     if len(keys_u64) > 0:
         perm = np.argsort(owners, kind="mergesort")
-        s_keys = keys_u64[perm]
-        s_vals = vals_i32[perm]
+        s_keys = np.ascontiguousarray(keys_u64[perm])
+        s_vals = np.ascontiguousarray(vals_i32[perm])
         send_counts = np.bincount(owners[perm], minlength=world_size).astype(np.int64)
     else:
-        s_keys = keys_u64
-        s_vals = vals_i32
+        s_keys = np.empty(0, dtype=np.uint64)
+        s_vals = np.empty(0, dtype=np.int32)
         send_counts = np.zeros(world_size, dtype=np.int64)
 
-    send_cnt_t = torch.from_numpy(send_counts).to(device=device)
-    recv_cnt_t = torch.empty(world_size, dtype=torch.int64, device=device)
-    dist.all_to_all_single(recv_cnt_t, send_cnt_t)
-    recv_counts = recv_cnt_t.cpu().numpy()
+    send_cnt_t = torch.from_numpy(send_counts)
+    recv_cnt_t = torch.empty(world_size, dtype=torch.int64)
+    dist.all_to_all_single(recv_cnt_t, send_cnt_t, group=group)
+    recv_counts = recv_cnt_t.numpy()
     total_recv = int(recv_counts.sum())
     in_splits = send_counts.tolist()
     out_splits = recv_counts.tolist()
 
-    sk_t = torch.from_numpy(s_keys.view(np.int64)).to(device=device)
-    sv_t = torch.from_numpy(s_vals).to(device=device)
-    rk_t = torch.empty(total_recv, dtype=torch.int64, device=device)
-    rv_t = torch.empty(total_recv, dtype=torch.int32, device=device)
-    dist.all_to_all_single(rk_t, sk_t, output_split_sizes=out_splits, input_split_sizes=in_splits)
-    dist.all_to_all_single(rv_t, sv_t, output_split_sizes=out_splits, input_split_sizes=in_splits)
-    return rk_t.cpu().numpy().view(np.uint64), rv_t.cpu().numpy()
+    sk_t = torch.from_numpy(s_keys.view(np.int64))
+    sv_t = torch.from_numpy(s_vals)
+    rk_t = torch.empty(total_recv, dtype=torch.int64)
+    rv_t = torch.empty(total_recv, dtype=torch.int32)
+    dist.all_to_all_single(rk_t, sk_t, output_split_sizes=out_splits, input_split_sizes=in_splits, group=group)
+    dist.all_to_all_single(rv_t, sv_t, output_split_sizes=out_splits, input_split_sizes=in_splits, group=group)
+    return rk_t.numpy().view(np.uint64), rv_t.numpy()
 
 
-def _all_gather_u64_to_all(arr_u64: np.ndarray, world_size: int, device: torch.device) -> np.ndarray:
+def _all_gather_u64_to_all(
+    arr_u64: np.ndarray,
+    world_size: int,
+    group: dist.ProcessGroup | None,
+) -> np.ndarray:
     if world_size == 1:
         return arr_u64
-    len_t = torch.tensor([len(arr_u64)], dtype=torch.int64, device=device)
-    all_lens_t = torch.empty(world_size, dtype=torch.int64, device=device)
-    dist.all_gather_into_tensor(all_lens_t, len_t)
-    lens = all_lens_t.cpu().tolist()
+    len_t = torch.tensor([len(arr_u64)], dtype=torch.int64)
+    all_lens_t = torch.empty(world_size, dtype=torch.int64)
+    dist.all_gather_into_tensor(all_lens_t, len_t, group=group)
+    lens = all_lens_t.tolist()
     max_len = max(lens)
     if max_len == 0:
         return np.empty(0, dtype=np.uint64)
-    send_t = torch.zeros(max_len, dtype=torch.int64, device=device)
+    send_t = torch.zeros(max_len, dtype=torch.int64)
     if len(arr_u64) > 0:
-        send_t[: len(arr_u64)] = torch.from_numpy(arr_u64.view(np.int64)).to(device=device)
-    recv_t = torch.empty(world_size * max_len, dtype=torch.int64, device=device)
-    dist.all_gather_into_tensor(recv_t, send_t)
-    recv_np = recv_t.cpu().numpy().view(np.uint64)
+        send_t[: len(arr_u64)] = torch.from_numpy(np.ascontiguousarray(arr_u64).view(np.int64))
+    recv_t = torch.empty(world_size * max_len, dtype=torch.int64)
+    dist.all_gather_into_tensor(recv_t, send_t, group=group)
+    recv_np = recv_t.numpy().view(np.uint64)
     chunks = [recv_np[r * max_len : r * max_len + r_len] for r, r_len in enumerate(lens) if r_len > 0]
     return np.concatenate(chunks) if chunks else np.empty(0, dtype=np.uint64)
 
@@ -272,6 +276,16 @@ class FastDoc2kSyncState:
         self.docq_cnts_i32 = np.empty(0, dtype=np.int32)
         self.edge_keys_u64 = np.empty(0, dtype=np.uint64)
         self.edge_cnts_i32 = np.empty(0, dtype=np.int32)
+        self._cpu_group: dist.ProcessGroup | None = None
+
+    def _ensure_cpu_group(self, world_size: int) -> dist.ProcessGroup | None:
+        if world_size <= 1:
+            return None
+        if self._cpu_group is None:
+            pg = dist.new_group(backend="gloo")
+            assert isinstance(pg, dist.ProcessGroup)
+            self._cpu_group = pg
+        return self._cpu_group
 
     def harvest_local_shard(
         self,
@@ -328,28 +342,35 @@ class FastDoc2kSyncState:
         device: torch.device,
         ensure_sync_map_fn: Any,
     ) -> None:
+        del device
+        cpu_group = self._ensure_cpu_group(world_size)
         ck, cv, dk_u32, dv, ek, ev = consume_local_doc2k_delta(local_gpu)
         dk_u64 = dk_u32.astype(np.uint64)
         has_any_t = torch.tensor(
             [int(len(ck) > 0 or len(dk_u64) > 0 or len(ek) > 0)],
             dtype=torch.int64,
-            device=device,
         )
         if world_size > 1:
-            dist.all_reduce(has_any_t, op=dist.ReduceOp.SUM)
+            dist.all_reduce(has_any_t, op=dist.ReduceOp.SUM, group=cpu_group)
         if int(has_any_t.item()) == 0:
             return
 
-        r_ck, r_cv = _all_to_all_kv_u64(ck, cv, ((ck >> np.uint64(32)) % np.uint64(world_size)).astype(np.int64), world_size, device)
-        r_dk, r_dv = _all_to_all_kv_u64(dk_u64, dv, (dk_u64 % np.uint64(world_size)).astype(np.int64), world_size, device)
-        r_ek, r_ev = _all_to_all_kv_u64(ek, ev, ((ek >> np.uint64(32)) % np.uint64(world_size)).astype(np.int64), world_size, device)
+        r_ck, r_cv = _all_to_all_kv_u64(
+            ck, cv, ((ck >> np.uint64(32)) % np.uint64(world_size)).astype(np.int64), world_size, cpu_group
+        )
+        r_dk, r_dv = _all_to_all_kv_u64(
+            dk_u64, dv, (dk_u64 % np.uint64(world_size)).astype(np.int64), world_size, cpu_group
+        )
+        r_ek, r_ev = _all_to_all_kv_u64(
+            ek, ev, ((ek >> np.uint64(32)) % np.uint64(world_size)).astype(np.int64), world_size, cpu_group
+        )
 
         prom_u64, harv_u64, harv_edges_u64 = self.harvest_local_shard(
-            r_ck, r_cv, r_dk, r_dv, r_ek, r_ev, device=device
+            r_ck, r_cv, r_dk, r_dv, r_ek, r_ev, device=None
         )
-        all_prom_u64 = _all_gather_u64_to_all(prom_u64, world_size, device)
-        all_harv_u64 = _all_gather_u64_to_all(harv_u64, world_size, device)
-        all_edges_u64 = _all_gather_u64_to_all(harv_edges_u64, world_size, device)
+        all_prom_u64 = _all_gather_u64_to_all(prom_u64, world_size, cpu_group)
+        all_harv_u64 = _all_gather_u64_to_all(harv_u64, world_size, cpu_group)
+        all_edges_u64 = _all_gather_u64_to_all(harv_edges_u64, world_size, cpu_group)
 
         delta_bytes = (
             pickle.dumps(
@@ -359,17 +380,17 @@ class FastDoc2kSyncState:
             if rank == 0
             else b""
         )
-        delta_len_t = torch.tensor([len(delta_bytes)], dtype=torch.int64, device=device)
+        delta_len_t = torch.tensor([len(delta_bytes)], dtype=torch.int64)
         if world_size > 1:
-            dist.broadcast(delta_len_t, src=0)
+            dist.broadcast(delta_len_t, src=0, group=cpu_group)
         delta_len = int(delta_len_t.item())
         if delta_len == 0:
             return
         delta_buf = (
-            torch.frombuffer(bytearray(delta_bytes), dtype=torch.uint8).to(device)
+            torch.frombuffer(bytearray(delta_bytes), dtype=torch.uint8)
             if rank == 0
-            else torch.empty(delta_len, dtype=torch.uint8, device=device)
+            else torch.empty(delta_len, dtype=torch.uint8)
         )
         if world_size > 1:
-            dist.broadcast(delta_buf, src=0)
-        _stage_global_delta_for_local_gpu(local_gpu, pickle.loads(bytes(delta_buf.cpu().numpy())))
+            dist.broadcast(delta_buf, src=0, group=cpu_group)
+        _stage_global_delta_for_local_gpu(local_gpu, pickle.loads(bytes(delta_buf.numpy())))
