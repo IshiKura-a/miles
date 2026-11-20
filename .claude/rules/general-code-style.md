@@ -1,6 +1,7 @@
 ---
 paths:
   - "miles/**/*.py"
+  - "examples/**/*.py"
   - "scripts/**/*.py"
   - "tools/**/*.py"
   - "train.py"
@@ -10,9 +11,9 @@ paths:
 # General Code Style
 
 Default conventions for new and substantially modified Python code in Miles core
-modules and scripts. Prefer these unless there is a concrete reason not to.
-Preserve established framework contracts and avoid unrelated refactors; call out
-deviations in review.
+modules, examples, and scripts. Prefer these unless there is a concrete reason
+not to. Preserve established framework contracts and avoid unrelated refactors;
+call out deviations in review.
 
 - **Prefer stateless.** Favor pure functions over methods that mutate instance
   state. Keep state in lifecycle objects that are intentionally responsible for
@@ -38,9 +39,21 @@ deviations in review.
   mixin when required by a framework contract, consistent with an established
   Miles architecture, or when it represents cohesive behavior shared by
   multiple implementations.
-- **Keep public APIs intentional.** Default implementation details to protected
-  names, but preserve established public, plugin, and framework interfaces. Do
-  not rename public symbols without a migration plan.
+- **Keep public APIs intentional.** Use `_`-prefixed names only for module-local
+  implementation details; promote helpers imported across modules to clean
+  public names, and avoid redundant `from x import y as y` re-export shims.
+  Preserve established public, plugin, and framework interfaces, and do not
+  rename public symbols without a migration plan.
+- **Value code reuse and eliminate duplication.** Share logic through cohesive
+  helpers and modules rather than duplicating loops or formulas across call
+  sites. Replace magic numbers and ad-hoc environment variables with named
+  constants and typed configuration.
+- **Do not hide bugs with `getattr` or silent fallbacks.** Access expected
+  attributes directly instead of wrapping known contracts in
+  `getattr(obj, "attr", default)`. Prefer fail-fast validation and atomic
+  invariants over exception swallowing, silent step skipping, or partial
+  worker/state degradation. Fix root causes at the source boundary rather than
+  adding workarounds across downstream callers.
 - **Prefer keyword arguments where they improve clarity.** Use keywords for
   internal calls with multiple or ambiguous arguments, especially configuration
   values and boolean flags. Preserve positional calling when it is conventional
@@ -56,3 +69,6 @@ deviations in review.
   startup cost, and make the reason clear.
 - **Use absolute imports.** Prefer absolute project imports over relative imports
   so dependencies remain explicit and code is easier to move and search.
+- **Do not add, modify, or run `pytest` unless explicitly requested.** Keep test
+  files untouched and skip `pytest` execution by default; rely on static checks
+  (such as `ruff` and `pyright`) unless the user explicitly asks for `pytest`.
