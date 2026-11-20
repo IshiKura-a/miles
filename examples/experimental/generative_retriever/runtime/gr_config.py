@@ -21,6 +21,8 @@ UNIQUE_ANNEAL_MODES: tuple[UniqueAnnealMode, ...] = ("none", "off", "linear", "c
 GR_CONFIG_ENV_VAR = "GR_CONFIG_JSON"
 DEFAULT_STEP_TEMPERATURES: tuple[float, float, float, float] = (0.2, 0.25, 0.6, 0.8)
 DEFAULT_SGLANG_WATCHDOG_TIMEOUT_SECONDS = 600
+DEFAULT_HBM_KW_RESERVE_GIB = 96.0
+DEFAULT_HBM_KW_MAX_GIB = 42.0
 
 RAY_GRPC_KEEPALIVE_ENV: dict[str, str] = {
     "RAY_grpc_client_idle_timeout_ms": "36000000",
@@ -73,8 +75,8 @@ class GRConfig:
     grouped_cross_attention: bool = True
     tree_query_chunk_size: int = 128
     hbm_kw_cache_enabled: bool = True
-    hbm_kw_reserve_gib: float = 82.0
-    hbm_kw_max_gib: float = 60.0
+    hbm_kw_reserve_gib: float = DEFAULT_HBM_KW_RESERVE_GIB
+    hbm_kw_max_gib: float = DEFAULT_HBM_KW_MAX_GIB
     hbm_kw_explicit_gib: float | None = None
 
     def __post_init__(self) -> None:
