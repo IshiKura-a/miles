@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 import random
 from argparse import Namespace
@@ -568,8 +569,24 @@ class FSDPTrainRayActor(TrainRayActor):
                     grad_norm = grad_norm.full_tensor()
                 grad_norm = grad_norm.item()
 
-                self.optimizer.step()
-                self.lr_scheduler.step()
+                valid_step = math.isfinite(grad_norm)
+                if dist.is_initialized():
+                    valid_flag = torch.tensor(
+                        int(valid_step), dtype=torch.int32, device=torch.cuda.current_device()
+                    )
+                    dist.all_reduce(valid_flag, op=dist.ReduceOp.MIN)
+                    valid_step = bool(valid_flag.item())
+
+                if valid_step:
+                    self.optimizer.step()
+                    self.lr_scheduler.step()
+                else:
+                    self.optimizer.zero_grad(set_to_none=True)
+                    if not dist.is_initialized() or dist.get_rank() == 0:
+                        logger.warning(
+                            f"Skipping optimizer step due to non-finite grad_norm={grad_norm} "
+                            f"at rollout_id={rollout_id} step_id={step_id}"
+                        )
 
                 if self.args.ci_test:
                     check_grad_norm(
