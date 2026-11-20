@@ -9,11 +9,6 @@ from filelock import FileLock
 import numpy as np
 import torch
 
-from examples.experimental.generative_retriever.runtime.gr_config import (
-    DEFAULT_HBM_KW_MAX_GIB,
-    DEFAULT_HBM_KW_RESERVE_GIB,
-)
-
 _BYTES_PER_GIB = 1024**3
 _RING_FRACTION = 0.125
 _LOAD_CHUNK_ROWS = 4_194_304
@@ -50,8 +45,8 @@ def resolve_hbm_budget_bytes(
     *,
     num_keywords: int,
     enabled: bool = True,
-    reserve_gib: float = DEFAULT_HBM_KW_RESERVE_GIB,
-    max_gib: float = DEFAULT_HBM_KW_MAX_GIB,
+    reserve_gib: float = 82.0,
+    max_gib: float = 60.0,
     explicit_gib: float | None = None,
 ) -> int:
     if not enabled or device.type != "cuda":
@@ -82,8 +77,8 @@ class HbmKeywordCache:
         kw_degrees: np.ndarray | None = None,
         tag: str = "part25",
         enabled: bool = True,
-        reserve_gib: float = DEFAULT_HBM_KW_RESERVE_GIB,
-        max_gib: float = DEFAULT_HBM_KW_MAX_GIB,
+        reserve_gib: float = 82.0,
+        max_gib: float = 60.0,
         explicit_gib: float | None = None,
     ) -> None:
         self._mmap = mmap_u16
