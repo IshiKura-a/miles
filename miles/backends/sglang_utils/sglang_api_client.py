@@ -8,6 +8,9 @@ from miles.utils.http_utils import GeneralHttpClientProvider
 
 logger = logging.getLogger(__name__)
 
+_POST_MAX_ATTEMPTS = 3
+_POST_RETRY_BASE_DELAY_SECONDS = 0.5
+
 
 def _compute_headers(api_key: str | None) -> dict[str, str]:
     return {
@@ -70,7 +73,26 @@ class SGLangApiClient:
             The JSON response from the server
         """
         url = f"{self.server_url}/{endpoint}"
-        response = await GeneralHttpClientProvider.client().post(url, json=payload or {})
+        body = payload or {}
+        attempt = 1
+        while True:
+            try:
+                response = await GeneralHttpClientProvider.client().post(url, json=body)
+                break
+            except httpx.TransportError as exc:
+                if attempt >= _POST_MAX_ATTEMPTS:
+                    raise
+                delay = _POST_RETRY_BASE_DELAY_SECONDS * attempt
+                logger.warning(
+                    "Transient HTTP transport error on POST %s (attempt %d/%d): %r; retrying in %.1fs",
+                    url,
+                    attempt,
+                    _POST_MAX_ATTEMPTS,
+                    exc,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                attempt += 1
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as e:

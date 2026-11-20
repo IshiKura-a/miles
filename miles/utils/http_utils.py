@@ -222,8 +222,14 @@ class GeneralHttpClientProvider:
     _CONNECT_TIMEOUT = 10.0
     _WRITE_TIMEOUT = 60.0
     _POOL_TIMEOUT = 60.0
+    _KEEPALIVE_EXPIRY_SECONDS = 2.0
     _TIMEOUT = httpx.Timeout(connect=_CONNECT_TIMEOUT, read=None, write=_WRITE_TIMEOUT, pool=_POOL_TIMEOUT)
-    _LIMITS = httpx.Limits(max_connections=None, max_keepalive_connections=None)
+    # Expire idle HTTP/1.1 sockets well before uvicorn's 5s timeout_keep_alive close window.
+    _LIMITS = httpx.Limits(
+        max_connections=None,
+        max_keepalive_connections=None,
+        keepalive_expiry=_KEEPALIVE_EXPIRY_SECONDS,
+    )
 
     # TODO: entries are never evicted and the clients are never aclose()d, so a caller that keeps
     # creating event loops (repeated asyncio.run) leaks one client and its keep-alive sockets per
