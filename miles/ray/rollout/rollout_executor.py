@@ -124,6 +124,10 @@ class RolloutExecutor:
             dashboard_hooks.report_data_buffer(get_buffer_length())
         with timer("rollout"):
             data, metadata, metrics = await self._get_rollout_data(rollout_id=rollout_id)
+        presharded_refs = metadata.get("presharded_data_refs") if isinstance(metadata, dict) else None
+        if presharded_refs is not None:
+            log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
+            return dict(sample_indices=None, data_ref=presharded_refs)
         save_debug_rollout_data(self.args, data, rollout_id=rollout_id, evaluation=False, metadata=metadata)
         log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
         data = convert_samples_to_train_data(
@@ -218,17 +222,20 @@ class RolloutExecutor:
             metrics = None
         else:
             if not self.use_legacy_rollout_v1:
-                data = await asyncio.to_thread(
+                output = await asyncio.to_thread(
                     call_rollout_function,
                     self.generate_rollout,
                     RolloutFnTrainInput(rollout_id=rollout_id, weight_version=self.weight_version),
                 )
             else:
-                data = await asyncio.to_thread(
+                output = await asyncio.to_thread(
                     call_rollout_fn, self.generate_rollout, self.args, rollout_id, self.data_source, evaluation=False
                 )
-            metrics = data.metrics
-            data = data.samples
+            metrics = output.metrics
+            presharded_refs = getattr(output, "presharded_data_refs", None)
+            if presharded_refs is not None:
+                return [], {"presharded_data_refs": presharded_refs}, metrics
+            data = output.samples
             data, metadata = postprocess_rollout_data(
                 self.args, data, train_parallel_config=self.train_parallel_config
             )

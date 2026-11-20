@@ -181,7 +181,8 @@ def policy_loss_function(
         log_probs = torch.cat(log_probs, dim=0)
     else:
         old_log_probs = torch.cat(old_log_probs, dim=0)
-        log_probs = torch.cat(log_probs, dim=0)
+        flat_lp = log_probs_and_entropy.get("flat_log_probs")
+        log_probs = flat_lp if flat_lp is not None else torch.cat(log_probs, dim=0)
         ppo_kl = old_log_probs - log_probs
 
     local_loss_mask_list = get_local_response_loss_masks(

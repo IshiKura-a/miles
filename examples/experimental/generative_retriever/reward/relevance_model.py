@@ -1140,3 +1140,15 @@ def load_relevance_pipeline_factory(source: str | Path) -> RelevancePipelineFact
     if not callable(factory):
         raise TypeError("Graphene source does not expose MultiCupGraphenePipeline")
     return cast(RelevancePipelineFactory, factory)
+
+
+def load_graphene_tower_and_cross_builders(source: str | Path) -> tuple[Any, Any, dict[str, Any]]:
+    """Import Graphene tower/cross model builders from the staged relevance source."""
+    staged = stage_local_relevance_source(Path(source))
+    for extra_path in (staged, staged / "graphene", staged / "graphene/multi_cup"):
+        path_str = os.fspath(extra_path)
+        if path_str not in sys.path:
+            sys.path.insert(0, path_str)
+    infer_mod = importlib.import_module("graphene.multi_cup.inference_common")
+    models_mod = importlib.import_module("graphene.multi_cup.models")
+    return infer_mod.load_tower, infer_mod.resolve_dtype, models_mod.CUP_MODEL_CLASSES

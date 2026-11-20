@@ -4,36 +4,23 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-import pickle
-import tempfile
 from typing import Any, cast
 
 import torch
 import torch.distributed as dist
-from miles.utils.distributed_utils import get_gloo_group
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 from transformers import T5Config, T5ForConditionalGeneration
 from transformers.modeling_outputs import CausalLMOutput
 from transformers.models.t5.modeling_t5 import T5Attention
+
+from examples.experimental.generative_retriever.index.fast_doc2k_sync import FastDoc2kSyncState
 from examples.experimental.generative_retriever.model.constrained_decode import (
     PrefixConstraint,
     SortedU32Constraint,
+    install_grouped_cross_attention,
     load_constraint,
 )
-from examples.experimental.generative_retriever.services.mapping_service import (
-    ResidentMapping,
-    save_static_mapping_snapshot,
-    stage_local_mapping_dir,
-)
-from examples.experimental.generative_retriever.reward.relevance_reward import (
-    DEFAULT_TRAIN_GROUP_SIZE,
-    DOC2K_ADD_MIN_QUERIES,
-    DOC2K_PRUNE_FLOOR,
-    DOC2K_PRUNE_MIN_QUERIES,
-    is_doc2k_disabled,
-)
-
 from examples.experimental.generative_retriever.model.model_loading import (
     build_run_arguments,
     checkpoint_tensor_shape,
@@ -42,6 +29,21 @@ from examples.experimental.generative_retriever.model.model_loading import (
     require_directory,
     stage_local_model_dir,
 )
+from examples.experimental.generative_retriever.reward.in_process_protocol import (
+    resolve_physical_gpu_id,
+)
+from examples.experimental.generative_retriever.reward.relevance_reward import (
+    DEFAULT_TRAIN_GROUP_SIZE,
+)
+from examples.experimental.generative_retriever.runtime.gr_config import GRConfig
+from examples.experimental.generative_retriever.services.mapping_service import ResidentMapping
+from examples.experimental.generative_retriever.services.mapping_staging import (
+    save_static_mapping_snapshot,
+    stage_local_mapping_dir,
+)
+from miles.utils.distributed_utils import get_gloo_group
+
+_INVALID_DOCID_LOGIT = -1.0e9
 
 
 def _required_path(variable: str) -> Path:
@@ -70,18 +72,17 @@ class GRStage5Policy(nn.Module):
         self.code_dim: int = source.docid_dim
         self.code_num: int = source.docid_size
         self.constraint = constraint
+        self.gr_config = GRConfig.from_env()
         self._prefix_allowed_cache: dict[tuple[int, ...], tuple[torch.Tensor, set[int]]] = {}
-        self._global_cand_votes: dict[tuple[int, int], int] = {}
-        self._global_docid_q_count: dict[int, int] = {}
-        self._global_docid_kids: dict[int, tuple[int, ...]] = {}
-        self._global_edge_passes: dict[tuple[int, int], int] = {}
-        self._disable_doc2k = is_doc2k_disabled()
+        self._fast_doc2k_state = FastDoc2kSyncState()
         object.__setattr__(self, "_doc2k_sync_mapping", None)
 
         self.encoder_list: Any = source.encoder_list
         self.docEnc2decoder: Any = source.docEnc2decoder
         self.decoder: Any = source.decoder
         self.lm_head: Any = source.lm_head
+        if self.gr_config.grouped_cross_attention:
+            install_grouped_cross_attention(self.decoder)
 
         causal_lm = self.encoder_list[0].model.encoder
         if hasattr(causal_lm, "lm_head"):
@@ -107,134 +108,21 @@ class GRStage5Policy(nn.Module):
         return backbone
 
     def _sync_global_doc2k_votes(self) -> None:
-        if self._disable_doc2k or not dist.is_initialized():
+        if self.gr_config.doc2k_disabled or not dist.is_initialized():
             return
         rank = dist.get_rank()
         world_size = dist.get_world_size()
-        local_gpu = rank % 8
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        local_gpu = resolve_physical_gpu_id(device, fallback_rank=rank)
         if rank == 0:
             self._ensure_doc2k_sync_mapping()
-        local_path = Path(tempfile.gettempdir()) / f"gr_doc2k_local_gpu{local_gpu}.pkl"
-        local_bytes = b""
-        if local_path.is_file():
-            try:
-                local_bytes = local_path.read_bytes()
-            finally:
-                local_path.unlink(missing_ok=True)
-        local_len_t = torch.tensor([len(local_bytes)], dtype=torch.int64, device=device)
-        all_lens_t = torch.zeros(world_size, dtype=torch.int64, device=device)
-        dist.all_gather_into_tensor(all_lens_t, local_len_t)
-        max_local_len = int(all_lens_t.max().item())
-        gathered: list[dict[str, Any] | None] | None = None
-        if max_local_len > 0:
-            send_buf = torch.zeros(max_local_len, dtype=torch.uint8, device=device)
-            if local_bytes:
-                send_buf[: len(local_bytes)] = torch.frombuffer(bytearray(local_bytes), dtype=torch.uint8).to(device)
-            recv_buf = torch.empty(world_size * max_local_len, dtype=torch.uint8, device=device)
-            dist.all_gather_into_tensor(recv_buf, send_buf)
-            if rank == 0:
-                recv_cpu = recv_buf.cpu().numpy()
-                lens_cpu = all_lens_t.cpu().tolist()
-                gathered = []
-                for r_idx, r_len in enumerate(lens_cpu):
-                    if r_len > 0:
-                        chunk = bytes(recv_cpu[r_idx * max_local_len : r_idx * max_local_len + r_len])
-                        gathered.append(pickle.loads(chunk))
-                    else:
-                        gathered.append(None)
-
-        delta_box: list[dict[str, Any] | None] = [None]
-        if rank == 0 and gathered is not None and any(item is not None for item in gathered):
-            cand_votes = self._global_cand_votes
-            docid_q_count = self._global_docid_q_count
-            edge_passes = self._global_edge_passes
-            sync_map = self._ensure_doc2k_sync_mapping()
-
-            for item in gathered:
-                if item is None:
-                    continue
-                for ckey, cnt in item["cand_votes"].items():
-                    cand_votes[ckey] = cand_votes.get(ckey, 0) + int(cnt)
-                for u32, qcnt in item["docid_q_count"].items():
-                    docid_q_count[u32] = docid_q_count.get(u32, 0) + int(qcnt)
-                for ekey, pcnt in item["edge_passes"].items():
-                    edge_passes[ekey] = edge_passes.get(ekey, 0) + int(pcnt)
-
-            additions: dict[int, list[int]] = {}
-            promoted_ckeys: list[tuple[int, int]] = []
-            for ckey, total_votes in sorted(cand_votes.items()):
-                if total_votes >= DOC2K_ADD_MIN_QUERIES:
-                    target_u32, kid = ckey
-                    bucket_list = additions.setdefault(target_u32, [])
-                    if kid not in bucket_list:
-                        bucket_list.append(kid)
-                    promoted_ckeys.append(ckey)
-            for ckey in promoted_ckeys:
-                cand_votes.pop(ckey, None)
-
-            removals: dict[int, set[int]] = {}
-            harvested_u32: list[tuple[int, tuple[int, ...]]] = []
-            for u32, total_q in sorted(docid_q_count.items()):
-                if total_q < DOC2K_PRUNE_MIN_QUERIES:
-                    continue
-                kids_tup: tuple[int, ...] = ()
-                if sync_map is not None:
-                    ov_kids = sync_map._overlay_kw_ids.get(u32)
-                    if ov_kids is not None:
-                        kids_tup = ov_kids
-                    else:
-                        base_kids = sync_map._base_kw_ids_one(u32)
-                        if base_kids is not None:
-                            kids_tup = tuple(dict.fromkeys(base_kids))
-                harvested_u32.append((u32, kids_tup))
-                if len(kids_tup) <= DOC2K_PRUNE_FLOOR:
-                    continue
-                dead_kids = {
-                    kid for kid in kids_tup if edge_passes.get((u32, kid), 0) == 0
-                }
-                if dead_kids:
-                    removals[u32] = dead_kids
-            for u32, kids_tup in harvested_u32:
-                docid_q_count.pop(u32, None)
-                for kid in kids_tup:
-                    edge_passes.pop((u32, kid), None)
-
-            if sync_map is not None:
-                sync_map.apply_u32_kid_delta(additions, removals)
-            delta_box[0] = {"additions": additions, "removals": removals}
-
-        delta_bytes = pickle.dumps(delta_box[0], protocol=pickle.HIGHEST_PROTOCOL) if (rank == 0 and delta_box[0] is not None) else b""
-        delta_len_t = torch.tensor([len(delta_bytes)], dtype=torch.int64, device=device)
-        dist.broadcast(delta_len_t, src=0)
-        delta_len = int(delta_len_t.item())
-        if delta_len == 0:
-            return
-        if rank == 0:
-            delta_buf = torch.frombuffer(bytearray(delta_bytes), dtype=torch.uint8).to(device)
-        else:
-            delta_buf = torch.empty(delta_len, dtype=torch.uint8, device=device)
-        dist.broadcast(delta_buf, src=0)
-        delta = pickle.loads(bytes(delta_buf.cpu().numpy()))
-
-        additions = delta["additions"]
-        removals = delta["removals"]
-        global_path = Path(tempfile.gettempdir()) / f"gr_doc2k_global_gpu{local_gpu}.pkl"
-        if global_path.is_file():
-            prev = pickle.loads(global_path.read_bytes())
-            for u32, kids in prev.get("additions", {}).items():
-                bl = additions.setdefault(u32, [])
-                for k in kids:
-                    if k not in bl:
-                        bl.append(k)
-            for u32, kids in prev.get("removals", {}).items():
-                removals.setdefault(u32, set()).update(kids)
-
-        tmp_path = global_path.with_suffix(".tmp")
-        tmp_path.write_bytes(
-            pickle.dumps({"additions": additions, "removals": removals}, protocol=pickle.HIGHEST_PROTOCOL)
+        self._fast_doc2k_state.sync_distributed(
+            local_gpu=local_gpu,
+            rank=rank,
+            world_size=world_size,
+            device=device,
+            ensure_sync_map_fn=self._ensure_doc2k_sync_mapping,
         )
-        tmp_path.replace(global_path)
 
     def _ensure_doc2k_sync_mapping(self) -> ResidentMapping | None:
         sync_map: ResidentMapping | None = getattr(self, "_doc2k_sync_mapping", None)
@@ -255,7 +143,7 @@ class GRStage5Policy(nn.Module):
         stage_dir: str | Path | None = None,
         async_transfer: bool = True,
     ) -> None:
-        if self._disable_doc2k:
+        if self.gr_config.doc2k_disabled:
             if not dist.is_initialized() or dist.get_rank() == 0:
                 raw_mapping = os.environ.get("GR_ID_MAPPING")
                 if raw_mapping:
@@ -286,20 +174,21 @@ class GRStage5Policy(nn.Module):
 
     def gradient_checkpointing_enable(self, **kwargs: Any) -> None:
         del kwargs
-        self.decoder.gradient_checkpointing = True
+        if not self.gr_config.compact_train_ipc:
+            self.decoder.gradient_checkpointing = True
 
     def _encode_prompts(
         self,
         sample_tokens: list[torch.Tensor],
         response_lengths: list[int],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[int]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, list[int], bool]:
         prompt_lengths = [
             tokens.shape[0] - response_length
             for tokens, response_length in zip(sample_tokens, response_lengths, strict=True)
         ]
         n = len(sample_tokens)
         g_size = DEFAULT_TRAIN_GROUP_SIZE
-        is_grouped = (
+        is_uniform_grouped = (
             n >= g_size
             and n % g_size == 0
             and all(
@@ -308,7 +197,18 @@ class GRStage5Policy(nn.Module):
                 for i in range(start + 1, start + g_size)
             )
         )
-        if is_grouped:
+        is_compact_grouped = (
+            not is_uniform_grouped
+            and n >= g_size
+            and n % g_size == 0
+            and all(
+                prompt_lengths[i] == 1
+                for start in range(0, n, g_size)
+                for i in range(start + 1, start + g_size)
+            )
+        )
+        group_inverse: torch.Tensor | None = None
+        if is_uniform_grouped or is_compact_grouped:
             group_prompts = [
                 sample_tokens[start][: prompt_lengths[start]].flip(0)
                 for start in range(0, n, g_size)
@@ -318,12 +218,9 @@ class GRStage5Policy(nn.Module):
                 batch_first=True,
                 padding_value=self.pad_token_id,
             ).flip(1)
-            unique_prompts, group_inverse = torch.unique(
-                padded_groups,
-                dim=0,
-                return_inverse=True,
-            )
-            inverse_indices = group_inverse.repeat_interleave(g_size)
+            unique_prompts, group_inv_t = torch.unique(padded_groups, dim=0, return_inverse=True)
+            group_inverse = group_inv_t
+            inverse_indices = group_inv_t.repeat_interleave(g_size)
         else:
             prompts = [
                 sample_tokens[index][:prompt_length]
@@ -334,21 +231,15 @@ class GRStage5Policy(nn.Module):
                 batch_first=True,
                 padding_value=self.pad_token_id,
             ).flip(1)
-            unique_prompts, inverse_indices = torch.unique(
-                padded_prompts,
-                dim=0,
-                return_inverse=True,
-            )
+            unique_prompts, inverse_indices = torch.unique(padded_prompts, dim=0, return_inverse=True)
         unique_mask = unique_prompts.ne(self.pad_token_id).long()
-        backbone = self._encoder_backbone()
-        outputs = backbone(
+        outputs = self._encoder_backbone()(
             input_ids=unique_prompts,
             attention_mask=unique_mask,
             return_dict=True,
             use_cache=False,
         )
-        unique_hidden_states = outputs.last_hidden_state
-        return unique_hidden_states, unique_mask, inverse_indices, prompt_lengths
+        return outputs.last_hidden_state, unique_mask, inverse_indices, group_inverse, prompt_lengths, is_compact_grouped
 
     def _allowed_for_prefix(self, prefix_tuple: tuple[int, ...]) -> tuple[torch.Tensor, set[int]]:
         cached = self._prefix_allowed_cache.get(prefix_tuple)
@@ -414,6 +305,66 @@ class GRStage5Policy(nn.Module):
             offset += total_length
         return samples, offsets
 
+    def _extract_response_matrix(
+        self,
+        input_ids: torch.Tensor,
+        sample_tokens: list[torch.Tensor],
+        output_offsets: list[int],
+        prompt_lengths: list[int],
+        total_lengths: list[int],
+        *,
+        is_compact_grouped: bool,
+    ) -> torch.Tensor:
+        input_batch_size = input_ids.shape[0]
+        sample_count = len(sample_tokens)
+        g_size = DEFAULT_TRAIN_GROUP_SIZE
+        if (
+            input_batch_size == 1
+            and is_compact_grouped
+            and all(
+                total_lengths[i] == self.code_num + 1
+                for start in range(0, sample_count, g_size)
+                for i in range(start + 1, start + g_size)
+            )
+        ):
+            compact_len = self.code_num + 1
+            chunks: list[torch.Tensor] = []
+            for start in range(0, sample_count, g_size):
+                off0 = output_offsets[start]
+                plen0 = prompt_lengths[start]
+                chunks.append(input_ids[0, off0 + plen0 : off0 + plen0 + self.code_num].unsqueeze(0))
+                off1 = output_offsets[start + 1]
+                chunks.append(
+                    input_ids[0, off1 : off1 + (g_size - 1) * compact_len].view(g_size - 1, compact_len)[:, 1:]
+                )
+            return torch.cat(chunks, dim=0)
+        if (
+            input_batch_size == 1
+            and sample_count >= g_size
+            and sample_count % g_size == 0
+            and all(
+                total_lengths[start] == total_lengths[i]
+                for start in range(0, sample_count, g_size)
+                for i in range(start + 1, start + g_size)
+            )
+        ):
+            return torch.cat(
+                [
+                    input_ids[
+                        0,
+                        output_offsets[start] : output_offsets[start] + g_size * total_lengths[start],
+                    ].view(g_size, total_lengths[start])[:, prompt_lengths[start] : prompt_lengths[start] + self.code_num]
+                    for start in range(0, sample_count, g_size)
+                ],
+                dim=0,
+            )
+        return torch.stack(
+            [
+                tokens[prompt_length : prompt_length + self.code_num]
+                for tokens, prompt_length in zip(sample_tokens, prompt_lengths, strict=True)
+            ]
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -428,56 +379,37 @@ class GRStage5Policy(nn.Module):
             raise ValueError(f"GR response lengths must all equal {self.code_num}")
         sample_tokens, output_offsets = self._unpack_tokens(input_ids, total_lengths)
 
-        unique_hidden_states, unique_mask, inverse_indices, prompt_lengths = self._encode_prompts(
-            sample_tokens,
-            response_lengths,
-        )
-        unique_hidden_states = unique_hidden_states.to(self.docEnc2decoder.weight.dtype)
-        unique_projected = self.docEnc2decoder(unique_hidden_states)
-        projected_hidden_states = unique_projected.index_select(0, inverse_indices)
-        attention_mask = unique_mask.index_select(0, inverse_indices)
+        (
+            unique_hidden_states,
+            unique_mask,
+            inverse_indices,
+            group_inverse,
+            prompt_lengths,
+            is_compact_grouped,
+        ) = self._encode_prompts(sample_tokens, response_lengths)
+        unique_projected = self.docEnc2decoder(unique_hidden_states.to(self.docEnc2decoder.weight.dtype))
+        if self.gr_config.grouped_cross_attention and group_inverse is not None:
+            projected_hidden_states = unique_projected.index_select(0, group_inverse)
+            attention_mask = unique_mask.index_select(0, group_inverse)
+        else:
+            projected_hidden_states = unique_projected.index_select(0, inverse_indices)
+            attention_mask = unique_mask.index_select(0, inverse_indices)
+
         input_batch_size, sequence_length = input_ids.shape
         sample_count = len(sample_tokens)
         vocab_size = self.code_num * self.code_dim + 2
-        logits = projected_hidden_states.new_zeros(
-            (input_batch_size, sequence_length, vocab_size)
-        )
+        logits = projected_hidden_states.new_zeros((input_batch_size, sequence_length, vocab_size))
 
-        g_size = DEFAULT_TRAIN_GROUP_SIZE
-        if (
-            input_batch_size == 1
-            and sample_count >= g_size
-            and sample_count % g_size == 0
-            and all(
-                total_lengths[start] == total_lengths[i]
-                for start in range(0, sample_count, g_size)
-                for i in range(start + 1, start + g_size)
-            )
-        ):
-            responses = torch.cat(
-                [
-                    input_ids[
-                        0,
-                        output_offsets[start] : output_offsets[start] + g_size * total_lengths[start],
-                    ].view(g_size, total_lengths[start])[:, prompt_lengths[start] : prompt_lengths[start] + self.code_num]
-                    for start in range(0, sample_count, g_size)
-                ],
-                dim=0,
-            )
-        else:
-            responses = torch.stack([
-                tokens[prompt_length : prompt_length + self.code_num]
-                for tokens, prompt_length in zip(sample_tokens, prompt_lengths, strict=True)
-            ])
+        responses = self._extract_response_matrix(
+            input_ids,
+            sample_tokens,
+            output_offsets,
+            prompt_lengths,
+            total_lengths,
+            is_compact_grouped=is_compact_grouped,
+        )
         decoder_input_ids = torch.cat(
-            (
-                torch.zeros(
-                    (sample_count, 1),
-                    dtype=torch.long,
-                    device=input_ids.device,
-                ),
-                responses[:, :-1],
-            ),
+            (torch.zeros((sample_count, 1), dtype=torch.long, device=input_ids.device), responses[:, :-1]),
             dim=-1,
         )
         decoder_outputs = self.decoder(
@@ -488,9 +420,8 @@ class GRStage5Policy(nn.Module):
             return_dict=True,
         )
         response_logits = self.lm_head(decoder_outputs.last_hidden_state)
-        invalid_logit = torch.finfo(response_logits.dtype).min
         allowed_mask = self._build_allowed_mask(responses, vocab_size)
-        masked_response_logits = response_logits.masked_fill(~allowed_mask, invalid_logit)
+        masked_response_logits = response_logits.masked_fill(~allowed_mask, _INVALID_DOCID_LOGIT)
         starts = torch.tensor(
             [
                 output_offset + prompt_length - 1

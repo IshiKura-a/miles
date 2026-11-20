@@ -12,7 +12,7 @@ from miles.utils.data import get_minimum_num_micro_batch_size
 from miles.utils.ft_utils.process_group_utils import GeneralPGUtil
 from miles.utils.object_store import ObjectStoreGetResult
 from miles.utils.seqlen_balancing import get_seqlen_balanced_partitions
-from miles.utils.types import RolloutBatch
+from miles.utils.types import COMPACT_TOKEN_SHARD_KEY, RolloutBatch
 
 from ...utils.data import process_rollout_data
 from ...utils.ray_utils import Box
@@ -32,6 +32,49 @@ def _rollout_logprob_dtype(args: Namespace) -> torch.dtype:
     return torch.float32
 
 
+def _unpack_compact_token_shard(
+    args: Namespace,
+    rollout_data: dict,
+    current_device: int,
+) -> RolloutBatch:
+    if args.enable_witness or args.qkv_format != "thd":
+        raise ValueError(
+            f"{COMPACT_TOKEN_SHARD_KEY} requires qkv_format='thd' and enable_witness=False "
+            f"(got qkv_format={args.qkv_format!r}, enable_witness={args.enable_witness})"
+        )
+    rollout_data.pop(COMPACT_TOKEN_SHARD_KEY, None)
+    total_lengths = rollout_data["total_lengths"]
+    n_samples = len(total_lengths)
+    response_len = int(rollout_data.pop("response_length"))
+    base_idx = int(rollout_data.pop("base_sample_idx"))
+    rollout_data.pop("token_lengths_i32", None)
+    flat_tok_gpu = torch.as_tensor(
+        rollout_data.pop("flat_tokens_i32"),
+        dtype=torch.long,
+        device=current_device,
+    )
+    rollout_data["tokens"] = list(flat_tok_gpu.split(total_lengths))
+    shared_mask_gpu = torch.ones(response_len, dtype=torch.int, device=current_device)
+    rollout_data["loss_masks"] = [shared_mask_gpu] * n_samples
+    rollout_data["rollout_mask_sums"] = torch.full(
+        (n_samples,),
+        float(response_len),
+        dtype=torch.float32,
+        device=current_device,
+    )
+    lp_2d_gpu = torch.as_tensor(
+        rollout_data.pop("rollout_log_probs_2d"),
+        dtype=_rollout_logprob_dtype(args),
+        device=current_device,
+    )
+    rollout_data["rollout_log_probs"] = list(lp_2d_gpu.unbind(0))
+    rollout_data["response_lengths"] = [response_len] * n_samples
+    rollout_data["truncated"] = torch.zeros(n_samples, dtype=torch.float32, device=current_device)
+    rollout_data["sample_indices"] = range(base_idx, base_idx + n_samples)
+    rollout_data["rollout_ids"] = range(base_idx, base_idx + n_samples)
+    return rollout_data
+
+
 def get_rollout_data(
     args: Namespace,
     rollout_data_ref: Box,
@@ -49,6 +92,8 @@ def get_rollout_data(
     )
     # move tokens to GPU in advance
     current_device = torch.cuda.current_device()
+    if rollout_data.get(COMPACT_TOKEN_SHARD_KEY):
+        return _unpack_compact_token_shard(args, rollout_data, current_device), store_get_result
     raw_tokens = rollout_data["tokens"]
     if raw_tokens and isinstance(raw_tokens[0], np.ndarray):
         token_lengths = [len(t) for t in raw_tokens]
@@ -162,6 +207,17 @@ def _prepare_loss_masks(
     parallel_state = get_parallel_state()
     cp_size = parallel_state.cp.size
     cp_rank = parallel_state.cp.rank
+    if cp_size == 1 and qkv_format == "thd" and loss_masks and len(set(response_lengths)) == 1:
+        response_len = response_lengths[0]
+        dev = loss_masks[0].device
+        ends = torch.tensor(total_lengths, dtype=torch.long, device=dev).cumsum(0)
+        total_unpadded = int(ends[-1].item())
+        out = torch.zeros(total_unpadded + pad, dtype=loss_masks[0].dtype, device=dev)
+        if response_len > 0:
+            resp_pos = (ends.unsqueeze(1) - response_len + torch.arange(response_len, device=dev).unsqueeze(0)).reshape(-1)
+            out[resp_pos] = torch.cat(loss_masks, dim=0)
+        return out.unsqueeze(0)
+
     aligned_masks = []
     for loss_mask, total_length, response_length in zip(loss_masks, total_lengths, response_lengths, strict=True):
         prompt_length = total_length - response_length
@@ -348,13 +404,22 @@ def get_batch(
         return ids
 
     if get_position_ids:
-        position_ids_list = []
-        for t in batch["unconcat_tokens"]:
-            seq_len = t.size(0)
-            pos_ids = torch.arange(seq_len, device=t.device, dtype=torch.long)
-            position_ids_list.append(pos_ids)
-
-        batch["position_ids"] = _compute_transform_like_token_ids(position_ids_list)
+        if cp_size == 1 and qkv_format == "thd" and batch["unconcat_tokens"]:
+            dev = batch["unconcat_tokens"][0].device
+            lens_t = torch.tensor(sample_token_lengths, dtype=torch.long, device=dev)
+            starts_t = lens_t.cumsum(0) - lens_t
+            total_unpadded = int((starts_t[-1] + lens_t[-1]).item())
+            pos_1d = torch.arange(total_unpadded, device=dev, dtype=torch.long) - torch.repeat_interleave(
+                starts_t, lens_t
+            )
+            if pad != 0:
+                pos_1d = F.pad(pos_1d, (0, pad), value=0)
+            batch["position_ids"] = pos_1d.unsqueeze(0)
+        else:
+            position_ids_list = [
+                torch.arange(t.size(0), device=t.device, dtype=torch.long) for t in batch["unconcat_tokens"]
+            ]
+            batch["position_ids"] = _compute_transform_like_token_ids(position_ids_list)
 
     if (witness_ids := batch.get("witness_ids")) is not None:
         batch["witness_ids"] = _compute_transform_like_token_ids(witness_ids)

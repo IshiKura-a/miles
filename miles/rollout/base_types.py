@@ -55,6 +55,7 @@ class RolloutFnEvalInput(RolloutFnBaseInput):
 class RolloutFnTrainOutput:
     samples: list[list[Sample]]
     metrics: dict[str, Any] = None
+    presharded_data_refs: list[Any] | None = None
 
 
 # TODO make it frozen

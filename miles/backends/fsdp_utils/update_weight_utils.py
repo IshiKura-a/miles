@@ -1,9 +1,6 @@
 import abc
-import base64
 import gc
 import logging
-from pathlib import Path
-import pickle
 import socket
 from argparse import Namespace
 from collections.abc import Sequence
@@ -64,29 +61,67 @@ def _iter_sync_named_params(name, param, model_type, model, sync_dtypes=None):
     yield from expand(name, full, model)
 
 
+def _ensure_rocm_cpu_shm_reductions() -> None:
+    """Ensure CPU weight buckets use POSIX /dev/shm file-system reductions after SGLang's CUDA patch."""
+    monkey_patch_torch_reductions()
+    if torch.version.hip is None:
+        return
+    if (
+        getattr(_mp_reductions, "_reduce_tensor_original", None) is not None
+        and not getattr(_mp_reductions, "_miles_cpu_safe_patch", False)
+    ):
+        sgl_reduce_tensor = _mp_reductions.reduce_tensor
+
+        def _cpu_safe_reduce_tensor(tensor):
+            if tensor.is_cuda:
+                return sgl_reduce_tensor(tensor)
+            return _mp_reductions._reduce_tensor_original(tensor)
+
+        _mp_reductions.reduce_tensor = _cpu_safe_reduce_tensor
+        _mp_reductions._miles_cpu_safe_patch = True
+        _mp_reductions.init_reductions()
+    if torch.multiprocessing.get_sharing_strategy() != "file_system":
+        torch.multiprocessing.set_sharing_strategy("file_system")
+
+
+def _serialize_dtype_buckets(
+    named_tensors: Sequence[tuple[str, torch.Tensor]],
+    *,
+    use_rocm_cpu_shm: bool,
+) -> tuple[list[str], list[tuple[object, dict[str, object]]]]:
+    if getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
+        named_tensors_by_dtypes = {"dtype": named_tensors}
+    else:
+        named_tensors_by_dtypes = {}
+        for name, tensor in named_tensors:
+            named_tensors_by_dtypes.setdefault(tensor.dtype, []).append((name, tensor))
+
+    serialized_tensors: list[str] = []
+    retained_refs: list[tuple[object, dict[str, object]]] = []
+    for group_tensors in named_tensors_by_dtypes.values():
+        flattened_bucket = FlattenedTensorBucket(named_tensors=group_tensors)
+        metadata = flattened_bucket.get_metadata()
+        if use_rocm_cpu_shm:
+            flattened_tensor = flattened_bucket.get_flattened_tensor().cpu()
+            del flattened_bucket
+            flattened_bucket = None
+        else:
+            flattened_tensor = flattened_bucket.get_flattened_tensor()
+        bucket_payload = {
+            "flattened_tensor": flattened_tensor,
+            "metadata": metadata,
+        }
+        retained_refs.append((flattened_bucket, bucket_payload))
+        serialized_tensors.append(MultiprocessingSerializer.serialize(bucket_payload, output_str=True))
+    return serialized_tensors, retained_refs
+
+
 class UpdateWeight(abc.ABC):
     def __init__(self, args: Namespace, model: torch.nn.Module) -> None:
         self.args = args
         self.model = model
         self.weight_version = 0
         self.conn_status = ConnStatusManager()
-        self._dead_engines: set[SGLangApiClient] = set()
-        self._local_engine_dead: bool = False
-
-    async def _safe_engine_call(self, client: SGLangApiClient, coro):
-        if client in self._dead_engines:
-            coro.close()
-            return None
-        try:
-            return await coro
-        except Exception as exc:
-            self._dead_engines.add(client)
-            logger.warning(
-                "[FSDP] Rollout engine %s unreachable during weight update (%s); marking dead and skipping",
-                getattr(client, "base_url", client),
-                exc,
-            )
-            return None
 
     @abc.abstractmethod
     def connect_rollout_engines(
@@ -101,14 +136,10 @@ class UpdateWeight(abc.ABC):
         self.weight_version += 1
 
         if dist.get_rank() == 0:
+            async_utils.wait_futures([async_utils.submit(client.pause_generation()) for client in self.rollout_engines])
+            async_utils.wait_futures([async_utils.submit(client.flush_cache()) for client in self.rollout_engines])
             async_utils.wait_futures(
-                [async_utils.submit(self._safe_engine_call(client, client.pause_generation())) for client in self.rollout_engines]
-            )
-            async_utils.wait_futures(
-                [async_utils.submit(self._safe_engine_call(client, client.flush_cache())) for client in self.rollout_engines]
-            )
-            async_utils.wait_futures(
-                [async_utils.submit(self._safe_engine_call(client, client.begin_weight_update())) for client in self.rollout_engines]
+                [async_utils.submit(client.begin_weight_update()) for client in self.rollout_engines]
             )
         dist.barrier(group=get_gloo_group())
         gc.collect()
@@ -118,7 +149,7 @@ class UpdateWeight(abc.ABC):
         bucket_size = 0
         model_type = getattr(getattr(self.model, "config", None), "model_type", "")
         sync_dtypes = getattr(self.model, "_fsdp_sync_dtypes", None)
-        include_prefixes = tuple(self.args.weight_sync_include_prefixes or ())
+        include_prefixes = tuple(getattr(self.args, "weight_sync_include_prefixes", None) or ())
         for raw_name, raw_param in self.model.state_dict().items():
             if include_prefixes and not raw_name.startswith(include_prefixes):
                 continue
@@ -144,11 +175,9 @@ class UpdateWeight(abc.ABC):
 
         dist.barrier(group=get_gloo_group())
         if dist.get_rank() == 0:
+            async_utils.wait_futures([async_utils.submit(client.end_weight_update()) for client in self.rollout_engines])
             async_utils.wait_futures(
-                [async_utils.submit(self._safe_engine_call(client, client.end_weight_update())) for client in self.rollout_engines]
-            )
-            async_utils.wait_futures(
-                [async_utils.submit(self._safe_engine_call(client, client.continue_generation())) for client in self.rollout_engines]
+                [async_utils.submit(client.continue_generation()) for client in self.rollout_engines]
             )
         dist.barrier(group=get_gloo_group())
         gc.collect()
@@ -201,79 +230,20 @@ class UpdateWeightFromTensor(UpdateWeight):
                 self.tp_rank = dist.get_rank() - start_rank
 
     def update_bucket_weights(self, named_tensors, weight_version=None) -> None:
-        if getattr(self, "_local_engine_dead", False) and dist.get_world_size(self._ipc_gather_group) == 1:
-            return
-        monkey_patch_torch_reductions()
+        _ensure_rocm_cpu_shm_reductions()
         use_rocm_cpu_shm = torch.version.hip is not None
-        if use_rocm_cpu_shm:
-            if (
-                getattr(_mp_reductions, "_reduce_tensor_original", None) is not None
-                and not getattr(_mp_reductions, "_miles_cpu_safe_patch", False)
-            ):
-                _sgl_reduce_tensor = _mp_reductions.reduce_tensor
-
-                def _cpu_safe_reduce_tensor(tensor):
-                    if tensor.is_cuda:
-                        return _sgl_reduce_tensor(tensor)
-                    return _mp_reductions._reduce_tensor_original(tensor)
-
-                _mp_reductions.reduce_tensor = _cpu_safe_reduce_tensor
-                _mp_reductions._miles_cpu_safe_patch = True
-                _mp_reductions.init_reductions()
-            if torch.multiprocessing.get_sharing_strategy() != "file_system":
-                torch.multiprocessing.set_sharing_strategy("file_system")
-            torch_lib = Path(torch.__file__).resolve().parent / "lib"
-            rocm_blas = torch_lib.parent.parent / "_rocm_sdk_core/lib/host-math/lib/librocm-openblas.so.0"
-            target_blas = torch_lib / "librocm-openblas.so.0"
-            if rocm_blas.is_file() and not target_blas.exists():
-                try:
-                    target_blas.symlink_to(rocm_blas)
-                except OSError:
-                    pass
-
         logger.info("Using flattened tensor bucket")
         torch.cuda.ipc_collect()
-        if getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
-            named_tensors_by_dtypes = {"dtype": named_tensors}
-        else:
-            named_tensors_by_dtypes = {}
-            for name, tensor in named_tensors:
-                dtype = tensor.dtype
-                if dtype not in named_tensors_by_dtypes:
-                    named_tensors_by_dtypes[dtype] = []
-                named_tensors_by_dtypes[dtype].append((name, tensor))
+        serialized_tensors, long_live_tensors = _serialize_dtype_buckets(
+            named_tensors,
+            use_rocm_cpu_shm=use_rocm_cpu_shm,
+        )
 
-        serialized_tensors = []
-        long_live_tensors = []
-        for _dtype, group_tensors in named_tensors_by_dtypes.items():
-            flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=group_tensors)
-            metadata = flattened_tensor_bucket.get_metadata()
-            if use_rocm_cpu_shm:
-                flattened_tensor = flattened_tensor_bucket.get_flattened_tensor().cpu()
-                del flattened_tensor_bucket
-                flattened_tensor_bucket = None
-            else:
-                flattened_tensor = flattened_tensor_bucket.get_flattened_tensor()
-            flattened_tensor_data = {
-                "flattened_tensor": flattened_tensor,
-                "metadata": metadata,
-            }
-            long_live_tensors.append((flattened_tensor_bucket, flattened_tensor_data))
-            try:
-                serialized = MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
-            except (torch.AcceleratorError, RuntimeError) as exc:
-                logger.warning("IPC serialize failed (%s); falling back to pickle payload", exc)
-                raw_bytes = pickle.dumps(flattened_tensor_data, protocol=pickle.HIGHEST_PROTOCOL)
-                serialized = base64.b64encode(raw_bytes).decode("utf-8")
-            serialized_tensors.append(serialized)
-
-        if self._ipc_gather_src == dist.get_rank():
-            # On rank 0, prepare a list to hold the gathered batches from all ranks.
-            gathered_serialized_batches = [None for _ in range(dist.get_world_size(self._ipc_gather_group))]
-        else:
-            gathered_serialized_batches = None
-
-        # Gather the serialized batches from all ranks to rank 0.
+        gathered_serialized_batches = (
+            [None for _ in range(dist.get_world_size(self._ipc_gather_group))]
+            if self._ipc_gather_src == dist.get_rank()
+            else None
+        )
         dist.gather_object(
             obj=serialized_tensors,
             object_gather_list=gathered_serialized_batches,
@@ -282,43 +252,28 @@ class UpdateWeightFromTensor(UpdateWeight):
         )
 
         if dist.get_rank() == self._ipc_gather_src:
-            # TODO: assumes all ranks have the same number of dtype buckets
+            assert gathered_serialized_batches is not None
             num_dtypes = len(gathered_serialized_batches[0])
             assert num_dtypes > 0
-            try:
-                for i in range(num_dtypes):
-                    kwargs = {
-                        "serialized_named_tensors": [tensors[i] for tensors in gathered_serialized_batches],
-                        "load_format": "flattened_bucket",
-                        "flush_cache": False,
-                        "weight_version": str(weight_version),
-                    }
-                    result = async_utils.run(self._ipc_engine.update_weights_from_tensor(**kwargs))
-                    if isinstance(result, dict):
-                        success = result.get("success", True)
-                        error_msg = result.get("error_message") or result.get("message", "unknown error")
-                    else:
-                        success = getattr(result, "success", True)
-                        error_msg = getattr(result, "error_message", "unknown error")
-                    if not success:
-                        raise RuntimeError(
-                            f"Weight sync failed on rollout engine: {error_msg}. " f"Check SGLang version compatibility."
-                        )
-                async_utils.run(self._ipc_engine.flush_cache())
-            except Exception as exc:
-                self._local_engine_dead = True
-                logger.warning(
-                    "[FSDP] Local rollout engine unreachable on rank %d (%s); marking dead and skipping remaining buckets",
-                    dist.get_rank(),
-                    exc,
-                )
-                if use_rocm_cpu_shm:
-                    for batch in gathered_serialized_batches:
-                        for s in batch or ():
-                            try:
-                                MultiprocessingSerializer.deserialize(s)
-                            except Exception:
-                                pass
+            for i in range(num_dtypes):
+                kwargs = {
+                    "serialized_named_tensors": [tensors[i] for tensors in gathered_serialized_batches],
+                    "load_format": "flattened_bucket",
+                    "flush_cache": False,
+                    "weight_version": str(weight_version),
+                }
+                result = async_utils.run(self._ipc_engine.update_weights_from_tensor(**kwargs))
+                if isinstance(result, dict):
+                    success = result.get("success", True)
+                    error_msg = result.get("error_message") or result.get("message", "unknown error")
+                else:
+                    success = getattr(result, "success", True)
+                    error_msg = getattr(result, "error_message", "unknown error")
+                if not success:
+                    raise RuntimeError(
+                        f"Weight sync failed on rollout engine: {error_msg}. Check SGLang version compatibility."
+                    )
+            async_utils.run(self._ipc_engine.flush_cache())
         del long_live_tensors
         torch.cuda.ipc_collect()
 

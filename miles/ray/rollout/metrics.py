@@ -79,6 +79,14 @@ def log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_t
     if args.load_debug_rollout_data:
         return
 
+    if not samples:
+        log_dict = {**(rollout_extra_metrics or {})}
+        logger.info(f"perf {rollout_id}: {log_dict}")
+        step = compute_rollout_step(args, rollout_id)
+        log_dict["rollout/step"] = step
+        tracking.log(args, log_dict, step_key="rollout/step")
+        return
+
     log_dict = {**(rollout_extra_metrics or {})}
     log_dict |= dict_add_prefix(_compute_metrics_from_samples(args, samples), "rollout/")
     log_dict |= dict_add_prefix(_compute_perf_metrics_from_samples(args, samples, rollout_time), "perf/")

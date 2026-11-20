@@ -6,37 +6,46 @@ from dataclasses import replace
 import os
 from pathlib import Path
 
-from examples.experimental.generative_retriever.runtime.training_common import (
-    ScriptArgs, build_algorithm_args, build_optimizer_args, build_sglang_args,
-)
 from examples.experimental.generative_retriever.reward.relevance_reward import (
     DEFAULT_TRAIN_GROUP_SIZE,
     PROMPT_DATASET_ROWS,
+)
+from examples.experimental.generative_retriever.runtime.gr_config import (
+    GRConfig,
+    RAY_GRPC_KEEPALIVE_ENV,
 )
 from examples.experimental.generative_retriever.runtime.prepare_rocm_env import (
     derive_reward_cache_sizes,
     derive_sglang_mem_fraction,
 )
+from examples.experimental.generative_retriever.runtime.training_common import (
+    ScriptArgs,
+    build_algorithm_args,
+    build_optimizer_args,
+    build_sglang_args,
+)
 
 _REPO = Path(__file__).absolute().parents[4]
 
-# Each pair has one rollout node and one learner node.
 REWARD_GPUS_PER_NODE = 8
 _LEARNER_GPUS_PER_NODE = 8
 ROLLOUT_GPUS_PER_PAIR = 16
 REWARD_NODES_PER_PAIR = 2
 
-# Batch size and step limit scale with the number of node pairs.
 QUERIES_PER_STEP_PER_PAIR = 16_000
 IN_FLIGHT_GROUPS_PER_PAIR = 512
 SAMPLES_PER_PROMPT = DEFAULT_TRAIN_GROUP_SIZE
 MAX_STEPS_PER_PAIR = PROMPT_DATASET_ROWS // QUERIES_PER_STEP_PER_PAIR
-
-# SGLang capacity per pair.
 _SGLANG_CONCURRENCY_PER_PAIR = 16_384
 
 
-def build_multinode_recipe(run_id: str, pairs: int, num_rollout: int) -> ScriptArgs:
+def build_multinode_recipe(
+    run_id: str,
+    pairs: int,
+    num_rollout: int,
+    *,
+    base_args: ScriptArgs | None = None,
+) -> ScriptArgs:
     if not run_id or "/" in run_id or run_id in {".", ".."}:
         raise ValueError("run-id must be a nonempty directory name without slashes")
     if pairs <= 0:
@@ -44,18 +53,31 @@ def build_multinode_recipe(run_id: str, pairs: int, num_rollout: int) -> ScriptA
     max_rollouts = MAX_STEPS_PER_PAIR // pairs
     if max_rollouts < 1 or not 1 <= num_rollout <= max_rollouts:
         raise ValueError(f"num-rollout must be between 1 and {max_rollouts}")
+
+    template = ScriptArgs() if base_args is None else base_args
     query_cache, kw_cache, score_cache = derive_reward_cache_sizes(
         QUERIES_PER_STEP_PER_PAIR * pairs,
         SAMPLES_PER_PROMPT,
         REWARD_NODES_PER_PAIR * pairs,
     )
-    mem_fraction = derive_sglang_mem_fraction(
+    derived_mem = derive_sglang_mem_fraction(
         _SGLANG_CONCURRENCY_PER_PAIR * pairs,
         SAMPLES_PER_PROMPT,
         ROLLOUT_GPUS_PER_PAIR * pairs,
     )
+    mem_fraction = (
+        template.sglang_mem_fraction_static
+        if template.sglang_mem_fraction_static > 0
+        else (min(derived_mem, 0.18) if template.compact_train_ipc else derived_mem)
+    )
+    default_mbs = (100 if template.compact_train_ipc else 10) * SAMPLES_PER_PROMPT
+    mbs = (
+        template.micro_batch_size
+        if base_args is not None and template.micro_batch_size != ScriptArgs.micro_batch_size
+        else default_mbs
+    )
     return replace(
-        ScriptArgs(),
+        template,
         run_id=run_id,
         num_rollout=num_rollout,
         rollout_batch_size=QUERIES_PER_STEP_PER_PAIR * pairs,
@@ -66,8 +88,8 @@ def build_multinode_recipe(run_id: str, pairs: int, num_rollout: int) -> ScriptA
         rollout_num_gpus=ROLLOUT_GPUS_PER_PAIR * pairs,
         rollout_num_gpus_per_engine=1,
         sglang_dp_size=1,
-        micro_batch_size=10 * SAMPLES_PER_PROMPT,
-        max_tokens_per_gpu=262144,
+        micro_batch_size=mbs,
+        max_tokens_per_gpu=max(262144, 6 * mbs),
         sglang_mem_fraction_static=mem_fraction,
         sglang_server_concurrency=_SGLANG_CONCURRENCY_PER_PAIR * pairs,
         reward_timeout=1800,
@@ -80,8 +102,13 @@ def build_multinode_recipe(run_id: str, pairs: int, num_rollout: int) -> ScriptA
 
 
 def build_multinode_train_args(
-    args: ScriptArgs, *, addresses: list[str], bundle: Path, prompt: Path,
-    checkpoint_dir: Path, resume: bool,
+    args: ScriptArgs,
+    *,
+    addresses: list[str],
+    bundle: Path,
+    prompt: Path,
+    checkpoint_dir: Path,
+    resume: bool,
 ) -> list[str]:
     blocks = [
         [
@@ -102,6 +129,14 @@ def build_multinode_train_args(
             "--prompt-data", str(prompt),
             "--input-key", "query",
             "--rollout-shuffle",
+            *(
+                [
+                    "--rollout-function-path",
+                    "examples.experimental.generative_retriever.model.local_coloc_rollout.GRLocalColocatedRolloutFn",
+                ]
+                if args.local_coloc_rollout
+                else []
+            ),
             "--custom-generate-function-path",
             "examples.experimental.generative_retriever.model.sglang_encode_generate.generate",
             "--custom-rm-path", "examples.experimental.generative_retriever.reward.reward.reward",
@@ -129,7 +164,7 @@ def build_multinode_train_args(
             "--num-gpus-per-node", str(args.num_gpus_per_node),
             "--dp-replicate-size", str(len(addresses)),
             "--router-policy", "round_robin",
-        ] + build_sglang_args(args, args.sglang_mem_fraction_static),
+        ] + build_sglang_args(args, args.sglang_mem_fraction_static, colocate=True),
         [
             "--save", str(checkpoint_dir),
             *(["--load", str(checkpoint_dir)] if resume else []),
@@ -144,8 +179,15 @@ def build_multinode_train_args(
 
 
 def build_multinode_runtime_env(
-    *, checkpoint: str, qwen: str, slm_root: str, mapping: str,
-    relevance_model: str, reward_mode: str, addresses: list[str],
+    *,
+    checkpoint: str,
+    qwen: str,
+    slm_root: str,
+    mapping: str,
+    relevance_model: str,
+    reward_mode: str,
+    addresses: list[str],
+    gr_config: GRConfig | None = None,
 ) -> dict[str, str]:
     inherited = (
         "ROCM_HOME", "ROCM_PATH", "PATH", "LD_LIBRARY_PATH", "LIBRARY_PATH",
@@ -153,9 +195,9 @@ def build_multinode_runtime_env(
         "GPU_ARCHS", "GPU_ARCH", "AMDGPU_TARGET", "AITER_USE_SYSTEM_TRITON",
         "NCCL_SOCKET_IFNAME", "NCCL_IB_HCA", "NCCL_IB_TIMEOUT",
         "NCCL_IB_PCI_RELAXED_ORDERING", "NCCL_NET_GDR_LEVEL", "cosmos_data_path",
-        "WANDB_MODE", "GR_STEP_TEMPERATURES", "GR_DOC2K_DEEP_CONSOLIDATE",
-        "GR_CAUSAL_TREE_CREDIT", "GR_PM_PRIMARY_REWARD", "GR_DISABLE_DOC2K",
+        "WANDB_MODE",
     )
+    active_cfg = GRConfig.from_env() if gr_config is None else gr_config
     return {
         **{key: os.environ[key] for key in inherited if key in os.environ},
         "GPU_MAX_HW_QUEUES": "1",
@@ -167,19 +209,13 @@ def build_multinode_runtime_env(
         "GR_ID_MAPPING": mapping,
         "GR_RELEVANCE_MODEL": relevance_model,
         "GR_REWARD_MODE": reward_mode,
-        "SGLANG_EXTERNAL_MODEL_PACKAGE":
-            "examples.experimental.generative_retriever.sglang_models",
+        **active_cfg.to_env_dict(),
+        "SGLANG_EXTERNAL_MODEL_PACKAGE": "examples.experimental.generative_retriever.sglang_models",
         "SGLANG_USE_AITER": "0",
         "MILES_HARDWARE_PLATFORM": "rocm",
         "RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO": "0",
         "RAY_ENABLE_UV_RUN_RUNTIME_ENV": "0",
-        "RAY_grpc_client_idle_timeout_ms": "36000000",
-        "RAY_grpc_client_keepalive_time_ms": "30000",
-        "RAY_grpc_client_keepalive_timeout_ms": "600000",
-        "RAY_grpc_keepalive_time_ms": "30000",
-        "RAY_grpc_keepalive_timeout_ms": "600000",
-        "RAY_timeout_ms_task_wait_for_death_info": "600000",
-        "RAY_core_worker_rpc_server_reconnect_timeout_max_s": "600",
+        **RAY_GRPC_KEEPALIVE_ENV,
         "PYTHONUNBUFFERED": "1",
         "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS", "8"),
         "MASTER_ADDR": addresses[0],

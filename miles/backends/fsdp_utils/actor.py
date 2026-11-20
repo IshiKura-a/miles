@@ -366,7 +366,10 @@ class FSDPTrainRayActor(TrainRayActor):
             return
 
         assert not self.args.async_save, "FSDPTrainRayActor does not support async_save yet."
-        checkpoint.save(self, rollout_id, force_sync=force_sync)
+        if force_sync:
+            checkpoint.save(self, rollout_id, force_sync=True)
+        else:
+            checkpoint.save(self, rollout_id)
 
     def _compute_log_prob(
         self,
@@ -569,24 +572,13 @@ class FSDPTrainRayActor(TrainRayActor):
                     grad_norm = grad_norm.full_tensor()
                 grad_norm = grad_norm.item()
 
-                valid_step = math.isfinite(grad_norm)
-                if dist.is_initialized():
-                    valid_flag = torch.tensor(
-                        int(valid_step), dtype=torch.int32, device=torch.cuda.current_device()
+                if not math.isfinite(grad_norm):
+                    raise FloatingPointError(
+                        f"Non-finite grad_norm={grad_norm} at rollout_id={rollout_id} step_id={step_id}"
                     )
-                    dist.all_reduce(valid_flag, op=dist.ReduceOp.MIN)
-                    valid_step = bool(valid_flag.item())
 
-                if valid_step:
-                    self.optimizer.step()
-                    self.lr_scheduler.step()
-                else:
-                    self.optimizer.zero_grad(set_to_none=True)
-                    if not dist.is_initialized() or dist.get_rank() == 0:
-                        logger.warning(
-                            f"Skipping optimizer step due to non-finite grad_norm={grad_norm} "
-                            f"at rollout_id={rollout_id} step_id={step_id}"
-                        )
+                self.optimizer.step()
+                self.lr_scheduler.step()
 
                 if self.args.ci_test:
                     check_grad_norm(

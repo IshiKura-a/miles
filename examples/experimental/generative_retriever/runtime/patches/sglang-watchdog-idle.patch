@@ -1,0 +1,13 @@
+diff --git a/python/sglang/srt/utils/watchdog.py b/python/sglang/srt/utils/watchdog.py
+index 70df32b..7eb19fe 100644
+--- a/python/sglang/srt/utils/watchdog.py
++++ b/python/sglang/srt/utils/watchdog.py
+@@ -144,6 +144,8 @@ class WatchdogRaw:
+                 else:
+                     watchdog_last_counter = current_counter
+                     watchdog_last_time = current
++            else:
++                watchdog_last_time = current
+             time.sleep(self.watchdog_timeout / 2)
+ 
+         if self.dump_info is not None and (info_msg := self.dump_info()):

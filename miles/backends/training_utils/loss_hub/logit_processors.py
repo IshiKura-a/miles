@@ -1,5 +1,6 @@
 from argparse import Namespace
 from collections.abc import Iterator, Sequence
+from typing import Any
 
 import torch
 
@@ -181,6 +182,47 @@ def get_responses(
         yield logits_chunk, tokens_chunk
 
 
+def _get_uniform_thd_log_probs_and_entropy(
+    logits: torch.Tensor,
+    *,
+    args: Namespace,
+    unconcat_tokens: list[torch.Tensor],
+    total_lengths: list[int],
+    response_len: int,
+    tp_group: Any,
+    with_entropy: bool,
+    entropy_requires_grad: bool,
+) -> dict[str, Any]:
+    n_seq = len(unconcat_tokens)
+    dev = logits.device
+    ends = torch.tensor(total_lengths, dtype=torch.long, device=dev).cumsum(0)
+    offsets = torch.arange(response_len, device=dev).unsqueeze(0)
+    logit_idx = (ends.unsqueeze(1) - response_len - 1 + offsets).reshape(-1)
+    tok_idx = logit_idx + 1
+    cat_logits = logits.squeeze(0).index_select(0, logit_idx)
+    cat_tokens = torch.cat(unconcat_tokens, dim=0).index_select(0, tok_idx)
+    cat_log_prob, cat_entropy = calculate_log_probs_and_entropy(
+        cat_logits,
+        cat_tokens,
+        tp_group,
+        with_entropy=with_entropy,
+        entropy_requires_grad=entropy_requires_grad,
+        chunk_size=args.log_probs_chunk_size,
+        true_on_policy=False,
+        vocab_size=getattr(args, "vocab_size", None),
+        sampling_mask=None,
+        temperature=args.rollout_temperature,
+    )
+    flat_lp = cat_log_prob.squeeze(-1)
+    res: dict[str, Any] = {
+        "log_probs": list(flat_lp.view(n_seq, response_len).unbind(0)),
+        "flat_log_probs": flat_lp,
+    }
+    if with_entropy and cat_entropy is not None:
+        res["entropy"] = list(cat_entropy.view(n_seq, response_len).unbind(0))
+    return res
+
+
 def get_log_probs_and_entropy(
     logits: torch.Tensor,
     *,
@@ -230,6 +272,25 @@ def get_log_probs_and_entropy(
                     f"{response_length} for sample {sample_index}"
                 )
     parallel_state = get_parallel_state()
+    if (
+        rollout_sampling_mask is None
+        and parallel_state.cp.size == 1
+        and args.qkv_format == "thd"
+        and not args.true_on_policy_mode
+        and unconcat_tokens
+        and len(set(response_lengths)) == 1
+        and response_lengths[0] > 0
+    ):
+        return _get_uniform_thd_log_probs_and_entropy(
+            logits,
+            args=args,
+            unconcat_tokens=unconcat_tokens,
+            total_lengths=total_lengths,
+            response_len=response_lengths[0],
+            tp_group=parallel_state.tp.group,
+            with_entropy=with_entropy,
+            entropy_requires_grad=entropy_requires_grad,
+        )
     log_probs_list = []
     entropy_list = []
     response_chunks = list(

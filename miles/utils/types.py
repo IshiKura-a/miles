@@ -391,6 +391,9 @@ class ParamInfo:
 # before being consumed by data iterators (see megatron_utils.actor._get_rollout_data).
 RolloutBatch = dict[str, list[torch.Tensor] | list[int] | list[float] | list[str]]
 
+# Marker key for zero-copy flat numpy/tensor DP shards produced on local nodes.
+COMPACT_TOKEN_SHARD_KEY = "compact_token_shard"
+
 
 @dataclass
 class MultimodalType:

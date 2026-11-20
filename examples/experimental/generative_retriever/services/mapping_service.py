@@ -7,11 +7,9 @@ Run:
 
 from __future__ import annotations
 
-import argparse
 import atexit
-from collections.abc import Iterator
-from contextlib import asynccontextmanager, contextmanager
-import gc
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 import logging
 import os
 from pathlib import Path
@@ -22,16 +20,13 @@ from threading import RLock
 import time
 from typing import Annotated, Any
 
-from fastapi import FastAPI, HTTPException, Request
-from filelock import FileLock
+from fastapi import FastAPI
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 from pydantic import BaseModel, Field, StrictInt, field_validator
-import uvicorn
 
 from examples.experimental.generative_retriever.index.id_text_mapping import (
-    COLUMNAR_INDEX_FILES,
     PositionalID,
     is_columnar_index_dir,
     pack_docid_u32,
@@ -42,87 +37,17 @@ from examples.experimental.generative_retriever.reward.relevance_reward import (
     DOCID_MAX_KEYWORDS,
     is_doc2k_disabled,
 )
+from examples.experimental.generative_retriever.services.mapping_http_app import (
+    build_mapping_app,
+    run_mapping_cli,
+)
+from examples.experimental.generative_retriever.services.mapping_staging import RESUME_OVERLAY_FILENAME
 from examples.experimental.generative_retriever.utils.paths import absolute_path, symlink_target
 
 logger = logging.getLogger(__name__)
 MAPPING_SERVICE_API_VERSION = 3
 _SERVICE_API_VERSION = MAPPING_SERVICE_API_VERSION
 _NA_LOCALE_ALIASES = frozenset({"NA", "EN-US", "EN-CA", "ES-US", "FR-CA"})
-RESUME_OVERLAY_FILENAME = "gr_doc2k_resume_overlay.parquet"
-
-
-def stage_local_mapping_dir(mapping_path: str | Path) -> Path:
-    resolved = Path(mapping_path).resolve()
-    local_root = Path(tempfile.gettempdir())
-    target = resolved if resolved.is_relative_to(local_root) else local_root / f"gr_mapping_{resolved.name}"
-    sentinel = target / ".staged_arrow_ok"
-    if not sentinel.is_file():
-        with FileLock(f"{target}.lock"):
-            if not sentinel.is_file():
-                target.mkdir(parents=True, exist_ok=True)
-                for fname in COLUMNAR_INDEX_FILES:
-                    src = resolved / fname
-                    if not src.is_file():
-                        raise FileNotFoundError(f"Columnar mapping file missing: {src}")
-                    dst = target / fname
-                    if dst != src and (not dst.is_file() or dst.stat().st_size != src.stat().st_size):
-                        tmp_fd, tmp_name = tempfile.mkstemp(prefix=f".{fname}.", dir=target)
-                        os.close(tmp_fd)
-                        tmp_path = Path(tmp_name)
-                        shutil.copyfile(src, tmp_path)
-                        tmp_path.replace(dst)
-                ipc_dst = target / "keywords_only.arrow"
-                if not ipc_dst.is_file():
-                    tmp_fd, tmp_name = tempfile.mkstemp(prefix=".keywords_only.arrow.", dir=target)
-                    os.close(tmp_fd)
-                    tmp_ipc = Path(tmp_name)
-                    tbl = pq.read_table(target / "keywords.parquet", columns=["keyword"])
-                    with pa.OSFile(str(tmp_ipc), "wb") as sink:
-                        with pa.ipc.new_file(sink, tbl.schema) as writer:
-                            writer.write_table(tbl)
-                    tmp_ipc.replace(ipc_dst)
-                sentinel.write_text(str(resolved), encoding="utf-8")
-    return target
-
-
-def stage_local_doc2k_state(
-    checkpoint_dir: str | Path | None = None,
-    *,
-    resume: bool = False,
-) -> None:
-    local_root = Path(tempfile.gettempdir())
-    for gpu_idx in range(16):
-        (local_root / f"gr_doc2k_local_gpu{gpu_idx}.pkl").unlink(missing_ok=True)
-        (local_root / f"gr_doc2k_global_gpu{gpu_idx}.pkl").unlink(missing_ok=True)
-    resume_dst = local_root / RESUME_OVERLAY_FILENAME
-    if is_doc2k_disabled() or not resume or checkpoint_dir is None:
-        resume_dst.unlink(missing_ok=True)
-        return
-    ckpt_root = Path(checkpoint_dir)
-    tracker = ckpt_root / "latest_checkpointed_iteration.txt"
-    raw_tracker = tracker.read_text(encoding="utf-8").strip() if tracker.is_file() else ""
-    iteration = int(raw_tracker) if raw_tracker.isdigit() else -1
-    for entry in ckpt_root.iterdir():
-        if entry.name.startswith("iter_") and entry.name[5:].isdigit():
-            cand = int(entry.name[5:])
-            if (
-                cand > iteration
-                and (entry / "meta.json").is_file()
-                and (entry / "mapping" / "overlay.parquet").is_file()
-            ):
-                iteration = cand
-    if iteration < 0:
-        resume_dst.unlink(missing_ok=True)
-        return
-    overlay_src = ckpt_root / f"iter_{iteration:07d}" / "mapping" / "overlay.parquet"
-    if not overlay_src.is_file():
-        resume_dst.unlink(missing_ok=True)
-        return
-    tmp_fd, tmp_name = tempfile.mkstemp(prefix=".gr_resume_overlay.", dir=local_root)
-    os.close(tmp_fd)
-    tmp_path = Path(tmp_name)
-    shutil.copyfile(overlay_src, tmp_path)
-    tmp_path.replace(resume_dst)
 
 
 class LookupRequest(BaseModel):
@@ -458,6 +383,136 @@ class ResidentMapping:
                     out_kws[u32_int] = kws
         return out_kws, out_kids
 
+    @property
+    def keyword_degrees(self) -> np.ndarray:
+        return self._kw_degree
+
+    @property
+    def num_keywords(self) -> int:
+        return int(len(self._kw_degree))
+
+    def decode_kids(self, kids: Sequence[int]) -> list[str]:
+        """Decode a sequence of integer keyword IDs into UTF-8 strings."""
+        return [self._decode_kid(int(k)) for k in kids]
+
+    def get_docid_kids(self, u32: int, *, use_initial: bool = False) -> tuple[int, ...]:
+        """Return deduplicated keyword IDs for one packed uint32 docID."""
+        if not use_initial:
+            ov = self._overlay_kw_ids.get(u32)
+            if ov is not None:
+                return tuple(dict.fromkeys(int(k) for k in ov))
+        base = self._base_kw_ids_one(u32)
+        if base is None:
+            return ()
+        return tuple(dict.fromkeys(int(k) for k in base))
+
+    def lookup_u32_kids_only(
+        self,
+        packed_u32: np.ndarray,
+        *,
+        use_initial: bool = False,
+    ) -> dict[int, tuple[int, ...]]:
+        out_kids: dict[int, tuple[int, ...]] = {}
+        missing_u32: list[int] = []
+        for u32_int in packed_u32.tolist():
+            if not use_initial:
+                ov = self._overlay_kw_ids.get(u32_int)
+                if ov is not None:
+                    out_kids[u32_int] = tuple(dict.fromkeys(int(k) for k in ov))
+                    continue
+            missing_u32.append(u32_int)
+        if missing_u32:
+            missing_arr = np.asarray(missing_u32, dtype=np.uint32)
+            positions = np.searchsorted(self._unique_docids_u32, missing_arr)
+            n_unique = len(self._unique_docids_u32)
+            for u32_int, pos in zip(missing_u32, positions.tolist(), strict=True):
+                idx = int(pos)
+                if idx >= n_unique or int(self._unique_docids_u32[idx]) != u32_int:
+                    raise LookupError(f"Official mapping packed u32 ID not found: {u32_int}")
+                start = int(self._csr_offsets[idx])
+                end = int(self._csr_offsets[idx + 1])
+                out_kids[u32_int] = tuple(dict.fromkeys(int(k) for k in self._csr_kw_ids[start:end]))
+        return out_kids
+
+    @staticmethod
+    def _gather_csr_segments(
+        values: np.ndarray,
+        starts: np.ndarray,
+        lens: np.ndarray,
+        out_offsets: np.ndarray,
+    ) -> np.ndarray:
+        total = int(out_offsets[-1])
+        if total == 0:
+            return np.empty(0, dtype=np.int64)
+        non_empty = lens > 0
+        ne_starts = starts[non_empty]
+        ne_lens = lens[non_empty]
+        ne_offs = out_offsets[:-1][non_empty]
+        gather_idx = np.ones(total, dtype=np.int64)
+        gather_idx[ne_offs[0]] = ne_starts[0]
+        if len(ne_offs) > 1:
+            gather_idx[ne_offs[1:]] = ne_starts[1:] - (ne_starts[:-1] + ne_lens[:-1] - 1)
+        np.cumsum(gather_idx, out=gather_idx)
+        return values[gather_idx].astype(np.int64, copy=False)
+
+    def lookup_flat_kids_csr(
+        self,
+        u32_1d: np.ndarray,
+        *,
+        use_initial: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Vectorized CSR lookup returning ``(lens_i32, edge_row_i64, flat_kids_i64)``."""
+        n_rows = int(u32_1d.shape[0])
+        if n_rows == 0:
+            return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+        uniq_u32, inv = np.unique(u32_1d.astype(np.uint32, copy=False), return_inverse=True)
+        n_uniq = int(uniq_u32.shape[0])
+        pos = np.searchsorted(self._unique_docids_u32, uniq_u32)
+        n_official = len(self._unique_docids_u32)
+        if bool(np.any(pos >= n_official)) or not bool(np.array_equal(self._unique_docids_u32[pos], uniq_u32)):
+            bad_mask = (pos >= n_official) | (self._unique_docids_u32[np.minimum(pos, n_official - 1)] != uniq_u32)
+            bad_idx = int(np.flatnonzero(bad_mask)[0])
+            raise LookupError(f"Official mapping packed u32 ID not found: {int(uniq_u32[bad_idx])}")
+
+        starts = self._csr_offsets[pos].astype(np.int64, copy=False)
+        u_lens = (self._csr_offsets[pos + 1].astype(np.int64, copy=False) - starts).astype(np.int32)
+        u_offs = np.empty(n_uniq + 1, dtype=np.int64)
+        u_offs[0] = 0
+        np.cumsum(u_lens, out=u_offs[1:])
+        u_kids = self._gather_csr_segments(self._csr_kw_ids, starts, u_lens, u_offs)
+
+        if not use_initial and self._overlay_kw_ids:
+            ov_hits = [
+                (ui, ov_tup)
+                for ui, u_val in enumerate(uniq_u32.tolist())
+                if (ov_tup := self._overlay_kw_ids.get(int(u_val))) is not None
+            ]
+            if ov_hits:
+                chunks: list[np.ndarray] = []
+                new_lens = u_lens.copy()
+                prev_ui = 0
+                for ui, ov_tup in ov_hits:
+                    if ui > prev_ui:
+                        chunks.append(u_kids[u_offs[prev_ui] : u_offs[ui]])
+                    chunks.append(np.asarray(ov_tup, dtype=np.int64))
+                    new_lens[ui] = len(ov_tup)
+                    prev_ui = ui + 1
+                if prev_ui < n_uniq:
+                    chunks.append(u_kids[u_offs[prev_ui] : u_offs[n_uniq]])
+                u_kids = np.concatenate(chunks) if chunks else np.empty(0, dtype=np.int64)
+                u_lens = new_lens
+                u_offs[0] = 0
+                np.cumsum(u_lens, out=u_offs[1:])
+
+        row_starts = u_offs[inv]
+        row_lens = u_lens[inv]
+        r_offs = np.empty(n_rows + 1, dtype=np.int64)
+        r_offs[0] = 0
+        np.cumsum(row_lens, out=r_offs[1:])
+        flat_kids = self._gather_csr_segments(u_kids, row_starts, row_lens, r_offs)
+        edge_row = np.repeat(np.arange(n_rows, dtype=np.int64), row_lens) if len(flat_kids) > 0 else np.empty(0, dtype=np.int64)
+        return row_lens, edge_row, flat_kids
+
     def resolve_kid_in_docid(self, u32: int, keyword: str) -> int | None:
         kids = self._overlay_kw_ids.get(u32)
         if kids is None:
@@ -790,189 +845,24 @@ class ResidentMapping:
         }
 
 
-def save_static_mapping_snapshot(
-    output_dir: str | Path,
-    *,
-    base_mapping: str | Path,
-    stage_dir: str | Path | None = None,
-    async_transfer: bool = True,
-) -> dict[str, str]:
-    target_dir = absolute_path(output_dir)
-    resolved_base = Path(base_mapping).resolve()
-    staged_marker = resolved_base / ".staged_arrow_ok"
-    if staged_marker.is_file():
-        origin_text = staged_marker.read_text(encoding="utf-8").strip()
-        if origin_text and Path(origin_text).is_dir():
-            resolved_base = Path(origin_text).resolve()
-
-    overlay_table = pa.table({
-        "docid_u32": pa.array([], type=pa.uint32()),
-        "keyword_ids": pa.array([], type=pa.list_(pa.uint32())),
-    }).replace_schema_metadata({b"base_mapping": str(resolved_base).encode()})
-
-    def _link_target_for(fname: str) -> str:
-        src_f = resolved_base / fname
-        try:
-            common = os.path.commonpath([str(target_dir), str(src_f)])
-        except ValueError:
-            return str(src_f)
-        if common not in {"", os.sep}:
-            return os.path.relpath(src_f, start=target_dir)
-        return str(src_f)
-
-    def _populate_dir(local_d: Path) -> None:
-        local_d.mkdir(parents=True, exist_ok=True)
-        pq.write_table(overlay_table, local_d / "overlay.parquet", compression="zstd")
-        for link_name in COLUMNAR_INDEX_FILES:
-            src_f = resolved_base / link_name
-            dst_f = local_d / link_name
-            if not dst_f.exists() and not dst_f.is_symlink() and src_f.is_file():
-                dst_f.symlink_to(_link_target_for(link_name))
-
-    if stage_dir is not None:
-        _populate_dir(Path(stage_dir))
-        return {"output_dir": str(target_dir), "staged_dir": str(stage_dir)}
-
-    tmp_dir = Path(tempfile.mkdtemp(prefix="gr_save_static_map_"))
-    _populate_dir(tmp_dir)
-
-    def _sync_worker() -> None:
-        try:
-            target_dir.mkdir(parents=True, exist_ok=True)
-            dst_tmp = target_dir / "overlay.parquet.tmp"
-            shutil.copyfile(tmp_dir / "overlay.parquet", dst_tmp)
-            dst_tmp.replace(target_dir / "overlay.parquet")
-            for link_name in COLUMNAR_INDEX_FILES:
-                src_link = tmp_dir / link_name
-                dst_link = target_dir / link_name
-                if src_link.is_symlink() and not dst_link.exists() and not dst_link.is_symlink():
-                    dst_link.symlink_to(os.readlink(src_link))
-        finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    if async_transfer:
-        t = threading.Thread(
-            target=_sync_worker,
-            name=f"gr-static-map-sync-{target_dir.name}",
-            daemon=False,
-        )
-        t.start()
-    else:
-        _sync_worker()
-    return {"output_dir": str(target_dir)}
-
-
 def create_app(mapping: str | Path) -> FastAPI:
-    path = absolute_path(mapping)
-
-    @asynccontextmanager
-    async def lifespan(app: FastAPI):
-        app.state.mapping = ResidentMapping(path)
-        gc.collect()
-        gc.freeze()
-        gc.set_threshold(100_000, 500, 500)
-        yield
-        del app.state.mapping
-
-    app = FastAPI(lifespan=lifespan)
-
-    @app.get("/health")
-    def health() -> dict[str, Any]:
-        loaded = app.state.mapping
-        return {"status": "ready", "mapping_version": loaded.version,
-                "id_count": loaded.id_count, "rows": loaded.rows, "bytes": loaded.byte_count,
-                "service_config": {
-                    "api_version": _SERVICE_API_VERSION,
-                    "mapping": str(path),
-                }}
-
-    @app.get("/runs/{owner}/health")
-    def run_health(owner: str) -> dict[str, Any]:
-        try:
-            with app.state.mapping.access(owner):
-                return health()
-        except ValueError as error:
-            raise HTTPException(status_code=409, detail=str(error)) from error
-
-    @app.post("/claim")
-    def claim(request: ClaimMappingRequest) -> None:
-        try:
-            app.state.mapping.claim(request.owner, request.checkpoint)
-        except ValueError as error:
-            raise HTTPException(status_code=409, detail=str(error)) from error
-
-    @app.post("/release")
-    def release(request: ClaimMappingRequest) -> None:
-        try:
-            app.state.mapping.release(request.owner)
-        except ValueError as error:
-            raise HTTPException(status_code=409, detail=str(error)) from error
-
-    @app.post("/lookup", response_model=LookupResponse)
-    @app.post("/runs/{owner}/lookup", response_model=LookupResponse)
-    def lookup(request: LookupRequest, http_request: Request) -> LookupResponse:
-        try:
-            with app.state.mapping.access(http_request.path_params.get("owner")):
-                return app.state.mapping.lookup(
-                    request.docids, market=request.market, use_initial=request.use_initial,
-                )
-        except ValueError as error:
-            raise HTTPException(status_code=409, detail=str(error)) from error
-
-    @app.post("/runs/{owner}/resolve_keywords")
-    def resolve_keywords(request: ResolveKeywordsRequest, http_request: Request) -> dict[str, list[int]]:
-        try:
-            with app.state.mapping.access(http_request.path_params["owner"]):
-                return {"keyword_ids": app.state.mapping.resolve_keywords(request.keywords)}
-        except (ValueError, KeyError) as error:
-            raise HTTPException(status_code=409, detail=str(error)) from error
-
-    @app.post("/update_delta")
-    @app.post("/runs/{owner}/update_delta")
-    def update_delta(request: DeltaMappingRequest, http_request: Request) -> dict[str, int]:
-        try:
-            with app.state.mapping.access(http_request.path_params.get("owner")):
-                return app.state.mapping.apply_delta(request)
-        except (ValueError, KeyError) as error:
-            raise HTTPException(status_code=400, detail=str(error)) from error
-
-    @app.post("/runs/{owner}/update_delta_ids")
-    def update_delta_ids(request: DeltaMappingIdsRequest, http_request: Request) -> dict[str, int]:
-        try:
-            with app.state.mapping.access(http_request.path_params["owner"]):
-                return app.state.mapping.apply_id_delta(request)
-        except ValueError as error:
-            raise HTTPException(status_code=400, detail=str(error)) from error
-
-    @app.post("/update")
-    @app.post("/runs/{owner}/update")
-    def update(request: UpdateMappingRequest, http_request: Request) -> dict[str, int]:
-        try:
-            with app.state.mapping.access(http_request.path_params.get("owner")):
-                return app.state.mapping.update_docid_mappings(request.entries, replace_all=request.replace_all)
-        except ValueError as error:
-            raise HTTPException(status_code=400, detail=str(error)) from error
-
-    @app.post("/save")
-    @app.post("/runs/{owner}/save")
-    def save(request: SaveMappingRequest, http_request: Request) -> dict[str, Any]:
-        try:
-            with app.state.mapping.access(http_request.path_params.get("owner")):
-                return app.state.mapping.save_docid_mappings(request.output_dir)
-        except ValueError as error:
-            raise HTTPException(status_code=400, detail=str(error)) from error
-
-    return app
+    return build_mapping_app(
+        mapping,
+        mapping_cls=ResidentMapping,
+        api_version=_SERVICE_API_VERSION,
+        claim_req_cls=ClaimMappingRequest,
+        lookup_req_cls=LookupRequest,
+        lookup_resp_cls=LookupResponse,
+        resolve_req_cls=ResolveKeywordsRequest,
+        delta_req_cls=DeltaMappingRequest,
+        delta_ids_req_cls=DeltaMappingIdsRequest,
+        update_req_cls=UpdateMappingRequest,
+        save_req_cls=SaveMappingRequest,
+    )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mapping", required=True)
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=30488)
-    args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO)
-    uvicorn.run(create_app(args.mapping), host=args.host, port=args.port, workers=1)
+    run_mapping_cli(create_app, doc=__doc__)
 
 
 if __name__ == "__main__":

@@ -4,12 +4,9 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Iterable
+import logging
 import os
-import sys
 import pickle
-from pathlib import Path
-import tempfile
-import time
 from typing import Any, cast
 
 import numpy as np
@@ -18,11 +15,32 @@ from torch import nn
 from transformers import AutoTokenizer, T5Config
 from transformers.models.t5.modeling_t5 import T5Stack
 
+from examples.experimental.generative_retriever.index.fast_doc2k_sync import (
+    append_local_doc2k_delta,
+    global_doc2k_delta_path,
+)
 from examples.experimental.generative_retriever.model.constrained_decode import (
     build_generation_model,
     generate_beams,
     generate_samples,
     load_constraint,
+)
+from examples.experimental.generative_retriever.reward.gpu_batch_scorer import (
+    score_batch_gpu_vectorized,
+)
+from examples.experimental.generative_retriever.reward.in_process_protocol import (
+    expected_in_process_embedding_width,
+    pack_docids_u32_from_tokens,
+    pack_in_process_embedding,
+    resolve_physical_gpu_id,
+)
+from examples.experimental.generative_retriever.reward.precompiled_keywords import (
+    BaselineKidSets,
+    FastPrecompileScorer,
+    LiveRelevancePairScorer,
+    PackedPairScorer,
+    PrecompiledKeywordStore,
+    resolve_precompiled_kw_paths,
 )
 from examples.experimental.generative_retriever.reward.relevance_model import (
     RelevanceScorer,
@@ -31,27 +49,10 @@ from examples.experimental.generative_retriever.reward.relevance_model import (
     stage_local_relevance_model,
     stage_local_relevance_source,
 )
-from examples.experimental.generative_retriever.reward.relevance_reward import (
-    BaselineSets,
-    DOC2K_HEAD_RANK_CUTOFF,
-    DOC2K_MAX_ADDS_PER_QUERY,
-    DOC2K_MIN_GROUP_SAMPLES,
-    DOC2K_MIN_HEAD_RANKS,
-    DOC2K_PRUNE_FLOOR,
-    DOCID_REWARD_FLOOR,
-    DOCID_TOKEN_OFFSET,
-    RewardMode,
-    TREE_CREDIT_LEVEL_WEIGHT,
-    TREE_CREDIT_TOP_K,
-    build_baseline_set,
-    is_doc2k_disabled,
-    score_and_summarize_docid,
-)
+from examples.experimental.generative_retriever.runtime.gr_config import GRConfig, RewardModeLiteral
 from examples.experimental.generative_retriever.services.lru_cache import LRUCache
-from examples.experimental.generative_retriever.services.mapping_service import (
-    ResidentMapping,
-    stage_local_mapping_dir,
-)
+from examples.experimental.generative_retriever.services.mapping_service import ResidentMapping
+from examples.experimental.generative_retriever.services.mapping_staging import stage_local_mapping_dir
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -60,123 +61,9 @@ from sglang.srt.models.qwen3 import Qwen3Model
 from sglang.srt.models.qwen3_classification import Qwen3ForPooledOutput
 from sglang.srt.utils import add_prefix
 
-IN_PROCESS_BEAM_COLS = 10
-IN_PROCESS_METRIC_KEYS: tuple[str, ...] = (
-    "pm_score",
-    "sm_score",
-    "pm_pass",
-    "sm_pass",
-    "normalized_pm",
-    "normalized_sm",
-    "pm_relevance",
-    "sm_relevance",
-    "relevance_quality",
-    "pm_unique_bonus",
-    "sm_unique_bonus",
-    "unique_bonus",
-    "discrete_base",
-    "continuous_base",
-    "discrete_total",
-    "continuous_total",
-    "reward",
-    "pm_unique_keyword_rate",
-    "sm_unique_keyword_rate",
-    "unique_keyword_rate",
-    "relevance_eligible_rate",
-    "pm_unique_eligible_rate",
-    "sm_unique_eligible_rate",
-    "unique_eligible_rate",
-    "unique_quality",
-    "train_total",
-    "score/latency_seconds",
-    "score/request_count",
-    "cache_gauge/baseline/size",
-    "cache_gauge/reward/size",
-    "cache_gauge/query_features/size",
-    "cache_gauge/keyword_features/size",
-    "cache_delta/baseline/hits",
-    "cache_delta/baseline/misses",
-    "cache_delta/reward/hits",
-    "cache_delta/reward/misses",
-    "cache_delta/query_features/hits",
-    "cache_delta/query_features/misses",
-    "cache_delta/keyword_features/hits",
-    "cache_delta/keyword_features/misses",
-)
-def _resolve_physical_gpu_id(device: torch.device | None = None) -> int:
-    argv = sys.argv
-    for idx, arg in enumerate(argv[:-1]):
-        if arg == "--base-gpu-id":
-            try:
-                return int(argv[idx + 1])
-            except ValueError:
-                pass
-        if arg.startswith("--base-gpu-id="):
-            try:
-                return int(arg.split("=", 1)[1])
-            except ValueError:
-                pass
-    for env_key in ("ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
-        val = os.environ.get(env_key, "").strip()
-        if val and "," not in val:
-            try:
-                return int(val)
-            except ValueError:
-                pass
-    if device is not None and device.type == "cuda" and device.index is not None:
-        return int(device.index)
-    return int(torch.cuda.current_device()) if torch.cuda.is_available() else 0
-
-
+logger = logging.getLogger(__name__)
 _PROMPT_PREFIX = 'Given the user Query: "'
 _PROMPT_SUFFIX = '", summarize it in one token:'
-
-
-def _level_top_k_means(sorted_keys: np.ndarray, sorted_rewards: np.ndarray, ord_desc: np.ndarray, k: int) -> np.ndarray:
-    n = len(sorted_keys)
-    ord_group = np.argsort(sorted_keys, kind="mergesort")
-    k_g = sorted_keys[ord_group]
-    r_g = sorted_rewards[ord_group]
-    orig_idx = ord_desc[ord_group]
-
-    is_start = np.ones(n, dtype=bool)
-    is_start[1:] = k_g[1:] != k_g[:-1]
-    idx = np.arange(n, dtype=np.int32)
-    start_pos = np.maximum.accumulate(np.where(is_start, idx, 0))
-    valid = (idx - start_pos) < k
-
-    cs_r = np.cumsum(np.where(valid, r_g, 0.0))
-    cs_c = np.cumsum(valid.astype(np.int32))
-
-    is_end = np.ones(n, dtype=bool)
-    is_end[:-1] = is_start[1:]
-    end_pos = np.minimum.accumulate(np.where(is_end[::-1], idx[::-1], n - 1))[::-1]
-
-    prev_pos = start_pos - 1
-    has_prev = prev_pos >= 0
-    safe_prev = np.maximum(0, prev_pos)
-    group_sum = cs_r[end_pos] - np.where(has_prev, cs_r[safe_prev], 0.0)
-    group_cnt = np.maximum(1, cs_c[end_pos] - np.where(has_prev, cs_c[safe_prev], 0))
-    means_sorted = group_sum / group_cnt.astype(np.float64)
-
-    out = np.empty(n, dtype=np.float64)
-    out[orig_idx] = means_sorted
-    return out
-
-
-def _compute_group_tree_credit_1d(u32_group: np.ndarray, raw_rewards: list[float]) -> list[float]:
-    n = len(raw_rewards)
-    if n <= 1:
-        return list(raw_rewards)
-    r = np.asarray(raw_rewards, dtype=np.float64)
-    ord_desc = np.argsort(-r, kind="mergesort")
-    u_sorted = u32_group[ord_desc]
-    r_sorted = r[ord_desc]
-    k0, k1, k2 = TREE_CREDIT_TOP_K
-    v0 = _level_top_k_means(u_sorted >> np.uint32(24), r_sorted, ord_desc, k0)
-    v1 = _level_top_k_means(u_sorted >> np.uint32(16), r_sorted, ord_desc, k1)
-    v2 = _level_top_k_means(u_sorted >> np.uint32(8), r_sorted, ord_desc, k2)
-    return (TREE_CREDIT_LEVEL_WEIGHT * (v0 + v1 + v2 + r)).tolist()
 
 
 class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
@@ -184,7 +71,7 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
 
     _qwen_tokenizer: Any
     _mapping_engine: ResidentMapping | None
-    _relevance_scorer: RelevanceScorer | None
+    _pair_scorer: PackedPairScorer | None
 
     def __init__(
         self,
@@ -196,6 +83,16 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
         raw_gr_config = getattr(config, "gr_config", None)
         if not isinstance(raw_gr_config, dict):
             raise ValueError("GRQwen3ForDocIDGeneration requires config.gr_config")
+
+        self.runtime_cfg = GRConfig.from_env()
+        bundle_reward_mode = raw_gr_config.get("reward_mode")
+        if bundle_reward_mode and bundle_reward_mode != self.runtime_cfg.reward_mode:
+            self.runtime_cfg = GRConfig(
+                **{
+                    **{k: getattr(self.runtime_cfg, k) for k in self.runtime_cfg.__dataclass_fields__},
+                    "reward_mode": cast(RewardModeLiteral, bundle_reward_mode),
+                }
+            )
 
         self.gr_config = T5Config.from_dict(raw_gr_config)
         self.docid_size = int(raw_gr_config["docid_size"])
@@ -213,47 +110,73 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
         self.relevance_model_path = str(
             raw_gr_config.get("relevance_model") or os.environ.get("GR_RELEVANCE_MODEL", "")
         )
-        self.reward_mode: RewardMode = cast(
-            RewardMode,
-            raw_gr_config.get("reward_mode") or os.environ.get("GR_REWARD_MODE", "discrete_relevance_unique"),
-        )
-        self.constraint = load_constraint(
-            self.id_mapping_path, self.docid_size, self.docid_dim,
+        self.constraint = load_constraint(self.id_mapping_path, self.docid_size, self.docid_dim)
+
+        decoder_config = self._configure_decoder_config(self.gr_config)
+        self._init_policy_and_baseline_heads(
+            config=config,
+            decoder_config=decoder_config,
+            slm_root=str(raw_gr_config["slm_root"]),
+            quant_config=quant_config,
+            prefix=prefix,
         )
 
-        decoder_config = self.gr_config
+        if self.relevance_model_path:
+            tokenizer = AutoTokenizer.from_pretrained(self.qwen_model_path, trust_remote_code=True)
+            mapping_engine = ResidentMapping(stage_local_mapping_dir(self.id_mapping_path), read_only=True)
+            object.__setattr__(self, "_qwen_tokenizer", tokenizer)
+            object.__setattr__(self, "_mapping_engine", mapping_engine)
+        else:
+            object.__setattr__(self, "_qwen_tokenizer", None)
+            object.__setattr__(self, "_mapping_engine", None)
+        object.__setattr__(self, "_pair_scorer", None)
+        self._baseline_kid_cache: LRUCache[str, BaselineKidSets] = LRUCache(32_768)
+        self._baseline_initialized = False
+        self._has_uncommitted_rollout = False
+        self._doc2k_sync_step = 0
+        self._local_gpu_id = resolve_physical_gpu_id()
+
+    def _configure_decoder_config(self, decoder_config: T5Config) -> T5Config:
         decoder_config.is_decoder = True
         decoder_config.is_encoder_decoder = True
         decoder_config.use_cache = False
         cast(Any, decoder_config).num_layers = decoder_config.num_decoder_layers
-        decoder_vocab_size = self.docid_size * self.docid_dim + 2
-        decoder_config.vocab_size = decoder_vocab_size
+        decoder_config.vocab_size = self.docid_size * self.docid_dim + 2
+        return decoder_config
 
-        self.docEnc2decoder = nn.Linear(
-            config.hidden_size,
-            decoder_config.d_model,
-            bias=False,
-        )
+    def _init_policy_and_baseline_heads(
+        self,
+        *,
+        config: Any,
+        decoder_config: T5Config,
+        slm_root: str,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> None:
+        vocab_size = decoder_config.vocab_size
+        self.docEnc2decoder = nn.Linear(config.hidden_size, decoder_config.d_model, bias=False)
         self.docid_embedding = nn.Embedding(
-            decoder_vocab_size,
+            vocab_size,
             decoder_config.d_model,
             padding_idx=decoder_config.pad_token_id,
         )
         self.decoder = T5Stack(decoder_config)
         self.decoder.embed_tokens = self.docid_embedding
-        self.lm_head = nn.Linear(
-            decoder_config.d_model,
-            decoder_vocab_size,
-            bias=False,
-        )
+        self.lm_head = nn.Linear(decoder_config.d_model, vocab_size, bias=False)
         generation_model = build_generation_model(
-            slm_root=raw_gr_config["slm_root"], config=decoder_config,
-            projection=self.docEnc2decoder, decoder=self.decoder, lm_head=self.lm_head,
+            slm_root=slm_root,
+            config=decoder_config,
+            projection=self.docEnc2decoder,
+            decoder=self.decoder,
+            lm_head=self.lm_head,
+            grouped_cross_attention=self.runtime_cfg.grouped_cross_attention,
         )
         object.__setattr__(self, "_generation_model", generation_model)
 
         self.baseline_model = Qwen3Model(
-            config, quant_config=quant_config, prefix=add_prefix("baseline_model", prefix)
+            config,
+            quant_config=quant_config,
+            prefix=add_prefix("baseline_model", prefix),
         )
         self.baseline_docEnc2decoder = copy.deepcopy(self.docEnc2decoder)
         self.baseline_docid_embedding = copy.deepcopy(self.docid_embedding)
@@ -269,44 +192,53 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
         ):
             mod.requires_grad_(False)
         baseline_generation_model = build_generation_model(
-            slm_root=raw_gr_config["slm_root"], config=decoder_config,
+            slm_root=slm_root,
+            config=decoder_config,
             projection=self.baseline_docEnc2decoder,
             decoder=self.baseline_decoder,
             lm_head=self.baseline_lm_head,
+            grouped_cross_attention=self.runtime_cfg.grouped_cross_attention,
         )
         object.__setattr__(self, "_baseline_generation_model", baseline_generation_model)
-        if self.relevance_model_path:
-            tokenizer = AutoTokenizer.from_pretrained(self.qwen_model_path, trust_remote_code=True)
-            staged_map_dir = stage_local_mapping_dir(self.id_mapping_path)
-            mapping_engine = ResidentMapping(staged_map_dir, read_only=True)
-            object.__setattr__(self, "_qwen_tokenizer", tokenizer)
-            object.__setattr__(self, "_mapping_engine", mapping_engine)
-        else:
-            object.__setattr__(self, "_qwen_tokenizer", None)
-            object.__setattr__(self, "_mapping_engine", None)
-        object.__setattr__(self, "_relevance_scorer", None)
-        self._baseline_sets_cache: LRUCache[str, BaselineSets] = LRUCache(32_768)
-        self._baseline_initialized = False
-        self._has_uncommitted_rollout = False
-        self._step_cand_last_q: dict[tuple[int, int], int] = {}
-        self._step_cand_votes: dict[tuple[int, int], int] = {}
-        self._step_docid_q_count: dict[int, int] = {}
-        self._step_docid_kids: dict[int, tuple[int, ...]] = {}
-        self._step_edge_passes: dict[tuple[int, int], int] = {}
-        self._query_seq_id = 0
-        self._doc2k_sync_step = 0
-        self._disable_doc2k = is_doc2k_disabled()
-        self._local_gpu_id = _resolve_physical_gpu_id()
 
     def _ensure_in_process_reward_engine(self, device: torch.device) -> None:
-        if self._relevance_scorer is not None:
+        if self._pair_scorer is not None:
             return
         if self._qwen_tokenizer is None or self._mapping_engine is None:
             tokenizer = AutoTokenizer.from_pretrained(self.qwen_model_path, trust_remote_code=True)
-            staged_map_dir = stage_local_mapping_dir(self.id_mapping_path)
-            mapping_engine = ResidentMapping(staged_map_dir, read_only=True)
+            mapping_engine = ResidentMapping(stage_local_mapping_dir(self.id_mapping_path), read_only=True)
             object.__setattr__(self, "_qwen_tokenizer", tokenizer)
             object.__setattr__(self, "_mapping_engine", mapping_engine)
+        assert self._mapping_engine is not None
+
+        pre_paths = resolve_precompiled_kw_paths(self._mapping_engine.path, self.id_mapping_path)
+        if pre_paths is not None:
+            kw_store = PrecompiledKeywordStore(pre_paths[0], pre_paths[1])
+            fast_scorer = FastPrecompileScorer(
+                self.relevance_model_path,
+                kw_store,
+                device,
+                gr_config=self.runtime_cfg,
+                kw_degrees=self._mapping_engine.keyword_degrees,
+            )
+            object.__setattr__(self, "_pair_scorer", fast_scorer)
+            hbm_gib = (
+                fast_scorer.hbm_cache.total_slots
+                * kw_store.num_tokens
+                * kw_store.feature_dim
+                * 2
+                / (1024**3)
+            )
+            logger.info(
+                "[GR precompiled kw] gpu=%d ready: rows=%d hbm_slots=%d (%.1f GiB) src=%s",
+                self._local_gpu_id,
+                kw_store.num_keywords,
+                fast_scorer.hbm_cache.total_slots,
+                hbm_gib,
+                kw_store.active_path,
+            )
+            return
+
         rel_src = stage_local_relevance_source(relevance_source_path(self.relevance_model_path))
         rel_model = stage_local_relevance_model(self.relevance_model_path)
         factory = load_relevance_pipeline_factory(rel_src)
@@ -320,14 +252,14 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
             cross_batch_size=16384,
             show_progress=False,
         )
-        scorer = RelevanceScorer(
+        live_scorer = RelevanceScorer(
             pipeline,
             feature_cache_size=32_768,
             score_cache_size=524_288,
             pair_batch_size=65_536,
             keyword_cache_size=33_554_432,
         )
-        object.__setattr__(self, "_relevance_scorer", scorer)
+        object.__setattr__(self, "_pair_scorer", LiveRelevancePairScorer(live_scorer, self._mapping_engine))
 
     def _extract_queries(self, input_ids: torch.Tensor, forward_batch: ForwardBatch) -> list[str | None] | None:
         tokenizer = self._qwen_tokenizer
@@ -382,14 +314,6 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
             attention_mask[index, : sequence.shape[0]] = 1
         return padded, attention_mask
 
-    @staticmethod
-    def _pack_u32_matrix(pos_docids_3d: np.ndarray) -> np.ndarray:
-        c0 = pos_docids_3d[:, :, 0].astype(np.uint32)
-        c1 = (pos_docids_3d[:, :, 1] - 256).astype(np.uint32)
-        c2 = (pos_docids_3d[:, :, 2] - 512).astype(np.uint32)
-        c3 = (pos_docids_3d[:, :, 3] - 768).astype(np.uint32)
-        return (c0 << np.uint32(24)) | (c1 << np.uint32(16)) | (c2 << np.uint32(8)) | c3
-
     def _score_batch_in_process(
         self,
         queries: list[str | None],
@@ -398,292 +322,80 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
         baseline_hidden_states: torch.Tensor | None,
         attention_mask: torch.Tensor,
     ) -> torch.Tensor:
-        started = time.perf_counter()
-        assert self._relevance_scorer is not None
-        assert self._mapping_engine is not None
-        scorer: RelevanceScorer = self._relevance_scorer
-        mapping_engine: ResidentMapping = self._mapping_engine
-        baseline_cache = self._baseline_sets_cache
+        assert self._pair_scorer is not None and self._mapping_engine is not None
+        device = token_ids.device
         batch_size = len(queries)
-        group_size = self.num_return_sequences
         valid_rows = [idx for idx, q in enumerate(queries) if q is not None]
-
-        pol_pos_np = token_ids.detach().cpu().numpy().astype(np.int32) - DOCID_TOKEN_OFFSET
-        pol_u32 = self._pack_u32_matrix(pol_pos_np)
+        if not valid_rows:
+            return torch.zeros(
+                (batch_size, expected_in_process_embedding_width(self.num_return_sequences)),
+                dtype=torch.float32,
+                device=device,
+            )
 
         missing_base_indices: list[int] = []
-        seen_missing_q: dict[str, int] = {}
+        seen_missing_q: set[str] = set()
         for idx in valid_rows:
             q = queries[idx]
             assert q is not None
-            if baseline_cache.get(q) is None and q not in seen_missing_q:
-                seen_missing_q[q] = len(missing_base_indices)
+            if self._baseline_kid_cache.get(q) is None and q not in seen_missing_q:
+                seen_missing_q.add(q)
                 missing_base_indices.append(idx)
         base_hits = len(valid_rows) - len(missing_base_indices)
         base_misses = len(missing_base_indices)
 
+        pol_u32 = pack_docids_u32_from_tokens(token_ids.detach().cpu().numpy())
         base_u32_by_q: dict[str, np.ndarray] = {}
-        u32_parts: list[np.ndarray] = [pol_u32[valid_rows].reshape(-1)]
         if missing_base_indices:
             assert baseline_hidden_states is not None
-            idx_t = torch.tensor(missing_base_indices, dtype=torch.long, device=attention_mask.device)
-            base_ids_t, _ = generate_beams(
+            miss_idx_t = torch.tensor(missing_base_indices, dtype=torch.long, device=device)
+            baseline_ids, _ = generate_beams(
                 self._baseline_generation_model,
-                baseline_hidden_states.index_select(0, idx_t),
-                attention_mask.index_select(0, idx_t),
+                baseline_hidden_states.index_select(0, miss_idx_t),
+                attention_mask.index_select(0, miss_idx_t),
                 self.constraint,
                 code_num=self.docid_size,
                 num_beams=self.num_beams,
-                num_return_sequences=group_size,
+                num_return_sequences=self.num_return_sequences,
                 do_sample=False,
                 temperature=1.0,
+                query_chunk_size=self.runtime_cfg.tree_query_chunk_size,
             )
-            base_pos_np = base_ids_t.detach().cpu().numpy().astype(np.int32) - DOCID_TOKEN_OFFSET
-            base_u32_mat = self._pack_u32_matrix(base_pos_np)
-            u32_parts.append(base_u32_mat.reshape(-1))
-            for pos, q_idx in enumerate(missing_base_indices):
-                q_key = queries[q_idx]
+            base_u32_mat = pack_docids_u32_from_tokens(baseline_ids.detach().cpu().numpy())
+            del baseline_ids
+            for pos, orig_idx in enumerate(missing_base_indices):
+                q_key = queries[orig_idx]
                 assert q_key is not None
                 base_u32_by_q[q_key] = base_u32_mat[pos]
 
-        pol_unique_u32 = np.unique(u32_parts[0])
-        u32_to_kws, u32_to_kids = mapping_engine.lookup_u32_with_kids(pol_unique_u32)
-        base_u32_to_kws = (
-            mapping_engine.lookup_u32(np.unique(u32_parts[1]), use_initial=True)
-            if len(u32_parts) > 1
-            else {}
+        base_mat, unit_ub_mat, metrics_mat, vote_delta = score_batch_gpu_vectorized(
+            scorer=self._pair_scorer,
+            mapping_engine=self._mapping_engine,
+            baseline_kid_cache=self._baseline_kid_cache,
+            queries=queries,
+            pol_u32=pol_u32,
+            token_logprobs=token_logprobs,
+            baseline_u32_by_q=base_u32_by_q,
+            base_hits=base_hits,
+            base_misses=base_misses,
+            gr_config=self.runtime_cfg,
         )
-
-        pairs_dict: dict[tuple[str, str], None] = {}
-        base_kws_by_q: dict[str, list[str]] = {}
-        for q_str, b_u32_row in base_u32_by_q.items():
-            kws = list(dict.fromkeys(kw for u32_val in b_u32_row.tolist() for kw in base_u32_to_kws[int(u32_val)]))
-            base_kws_by_q[q_str] = kws
-            for kw in kws:
-                pairs_dict[(q_str, kw)] = None
-
-        pol_kws_per_query: dict[int, list[list[str]]] = {}
-        for b in valid_rows:
-            q_str = queries[b]
-            assert q_str is not None
-            row_u32 = pol_u32[b].tolist()
-            q_sample_kws: list[list[str]] = []
-            for u32_val in row_u32:
-                kws = u32_to_kws[int(u32_val)]
-                q_sample_kws.append(kws)
-                for kw in kws:
-                    pairs_dict[(q_str, kw)] = None
-            pol_kws_per_query[b] = q_sample_kws
-
-        pair_scores, scoring_delta = scorer.score_with_deltas(list(pairs_dict))
-
-        for q_str, kws in base_kws_by_q.items():
-            baseline_cache.put(
-                q_str,
-                build_baseline_set({kw: pair_scores[(q_str, kw)] for kw in kws}),
-            )
-
-        credited_mat = np.zeros((batch_size, group_size), dtype=np.float32)
-        raw_mat = np.zeros((batch_size, group_size), dtype=np.float32)
-        metrics_mat = np.zeros((batch_size, len(IN_PROCESS_METRIC_KEYS)), dtype=np.float32)
-        metric_names = IN_PROCESS_METRIC_KEYS[:26]
-        inv_group = 1.0 / float(group_size)
-        head_cutoff = min(DOC2K_HEAD_RANK_CUTOFF, max(DOC2K_MIN_HEAD_RANKS, group_size // 2))
-
-        for b in valid_rows:
-            q_str = queries[b]
-            assert q_str is not None
-            self._query_seq_id += 1
-            q_seq = self._query_seq_id
-            b_set = baseline_cache.get(q_str)
-            assert b_set is not None
-            q_sample_kws = pol_kws_per_query[b]
-            row_u32_list = [int(x) for x in pol_u32[b].tolist()]
-            freq_map: dict[str, int] = {}
-            for kws in q_sample_kws:
-                for kw in kws:
-                    freq_map[kw] = freq_map.get(kw, 0) + 1
-            raw_rewards_b: list[float] = []
-            sample_unique_good: list[list[str]] = []
-            seen_fat_u32: set[int] = set()
-            acc = [0.0] * 26
-            for u32_val, kws in zip(row_u32_list, q_sample_kws, strict=True):
-                val, m_dict, passed_kws, uniq_good_kws = score_and_summarize_docid(
-                    kws,
-                    pair_scores,
-                    q_str,
-                    b_set,
-                    mode=self.reward_mode,
-                    keyword_frequencies=freq_map,
-                    k_floor=DOCID_REWARD_FLOOR,
-                )
-                raw_rewards_b.append(val)
-                sample_unique_good.append(uniq_good_kws)
-                if not self._disable_doc2k and len(kws) > DOC2K_PRUNE_FLOOR and u32_val not in seen_fat_u32:
-                    seen_fat_u32.add(u32_val)
-                    kids_tup = u32_to_kids[u32_val]
-                    self._step_docid_q_count[u32_val] = self._step_docid_q_count.get(u32_val, 0) + 1
-                    self._step_docid_kids[u32_val] = kids_tup
-                    if passed_kws:
-                        passed_set = set(passed_kws)
-                        for kw_s, kid_i in zip(kws, kids_tup, strict=True):
-                            if kw_s in passed_set:
-                                edge = (u32_val, kid_i)
-                                self._step_edge_passes[edge] = self._step_edge_passes.get(edge, 0) + 1
-                for m_idx, m_key in enumerate(metric_names):
-                    acc[m_idx] += float(m_dict[m_key])
-            raw_mat[b] = raw_rewards_b
-            credited_mat[b] = _compute_group_tree_credit_1d(pol_u32[b], raw_rewards_b)
-            for m_idx in range(26):
-                metrics_mat[b, m_idx] = acc[m_idx] * inv_group
-
-            if not self._disable_doc2k and group_size >= DOC2K_MIN_GROUP_SAMPLES and group_size > head_cutoff:
-                deep_consolidate = os.environ.get("GR_DOC2K_DEEP_CONSOLIDATE") == "1"
-                if deep_consolidate:
-                    lp_sums = token_logprobs[b].detach().cpu().numpy().sum(axis=-1)
-                    beam_order = np.argsort(-lp_sums, kind="mergesort").tolist()
-                    head_indices = beam_order[:head_cutoff]
-                    tail_indices = beam_order[head_cutoff:]
-                else:
-                    head_indices = list(range(head_cutoff))
-                    tail_indices = list(range(head_cutoff, group_size))
-
-                under_floor_heads: list[int] = []
-                under_prune_heads: list[int] = []
-                head_keywords: set[str] = set()
-                for hi in head_indices:
-                    hkws = q_sample_kws[hi]
-                    head_keywords.update(hkws)
-                    hlen = len(hkws)
-                    if hlen < DOCID_REWARD_FLOOR:
-                        under_floor_heads.append(hi)
-                    elif hlen < DOC2K_PRUNE_FLOOR:
-                        under_prune_heads.append(hi)
-                if not under_floor_heads and not under_prune_heads:
-                    continue
-                if deep_consolidate:
-                    under_floor_heads.sort(key=lambda hi: -len(q_sample_kws[hi]))
-                    under_prune_heads.sort(key=lambda hi: -len(q_sample_kws[hi]))
-                else:
-                    under_floor_heads.sort(key=lambda hi: len(q_sample_kws[hi]))
-                    under_prune_heads.sort(key=lambda hi: len(q_sample_kws[hi]))
-                candidate_tiers = (under_floor_heads, under_prune_heads)
-
-                added_for_query = 0
-                seen_tail: set[str] = set()
-                for ti in tail_indices:
-                    if added_for_query >= DOC2K_MAX_ADDS_PER_QUERY:
-                        break
-                    ug_kws = sample_unique_good[ti]
-                    if not ug_kws:
-                        continue
-                    tail_u32 = row_u32_list[ti]
-                    tail_p3 = tail_u32 >> 8
-                    tail_p2 = tail_u32 >> 16
-                    tail_p1 = tail_u32 >> 24
-                    target_u32: int | None = None
-                    for tier in candidate_tiers:
-                        if not tier:
-                            continue
-                        if deep_consolidate:
-                            for hi in tier:
-                                hu = row_u32_list[hi]
-                                if (hu >> 8) == tail_p3:
-                                    target_u32 = hu
-                                    break
-                            if target_u32 is not None:
-                                break
-                        for hi in tier:
-                            hu = row_u32_list[hi]
-                            if (hu >> 16) == tail_p2:
-                                target_u32 = hu
-                                break
-                        if target_u32 is not None:
-                            break
-                        if not deep_consolidate:
-                            for hi in tier:
-                                hu = row_u32_list[hi]
-                                if (hu >> 24) == tail_p1:
-                                    target_u32 = hu
-                                    break
-                            if target_u32 is not None:
-                                break
-                    if target_u32 is None:
-                        continue
-                    tail_kws_list = q_sample_kws[ti]
-                    tail_kids_tup = u32_to_kids[tail_u32]
-                    kw_to_kid_local = dict(zip(tail_kws_list, tail_kids_tup, strict=True))
-                    for kw in ug_kws:
-                        if kw not in head_keywords and kw not in seen_tail:
-                            seen_tail.add(kw)
-                            kid = kw_to_kid_local.get(kw)
-                            if kid is None:
-                                continue
-                            ckey = (target_u32, kid)
-                            if self._step_cand_last_q.get(ckey) != q_seq:
-                                self._step_cand_last_q[ckey] = q_seq
-                                self._step_cand_votes[ckey] = self._step_cand_votes.get(ckey, 0) + 1
-                            added_for_query += 1
-                            if added_for_query >= DOC2K_MAX_ADDS_PER_QUERY:
-                                break
-
-        elapsed = time.perf_counter() - started
-        q_stats = scorer.query_features.stats()
-        k_stats = scorer.keyword_features.stats()
-        s_stats = scorer.scores.stats()
-        b_stats = baseline_cache.stats()
-        q_delta = scoring_delta["query_features"]
-        k_delta = scoring_delta["keyword_features"]
-        r_delta = scoring_delta["reward"]
-        n_valid = float(max(1, len(valid_rows)))
-
-        tail = np.array(
-            [
-                elapsed / n_valid,
-                1.0,
-                float(b_stats.size),
-                float(s_stats.size),
-                float(q_stats.size),
-                float(k_stats.size),
-                float(base_hits) / n_valid,
-                float(base_misses) / n_valid,
-                float(r_delta["hits"]) / n_valid,
-                float(r_delta["misses"]) / n_valid,
-                float(q_delta["hits"]) / n_valid,
-                float(q_delta["misses"]) / n_valid,
-                float(k_delta["hits"]) / n_valid,
-                float(k_delta["misses"]) / n_valid,
-            ],
-            dtype=np.float32,
-        )
-        metrics_mat[valid_rows, 26:] = tail[None, :]
-
-        device = token_ids.device
-        credited_t = torch.from_numpy(credited_mat).to(device=device).unsqueeze(-1)
-        raw_t = torch.from_numpy(raw_mat).to(device=device).unsqueeze(-1)
-        core = torch.cat((token_ids.float(), token_logprobs.float(), credited_t, raw_t), dim=-1).flatten(1)
-        self._local_gpu_id = _resolve_physical_gpu_id(token_ids.device)
-        if not self._disable_doc2k:
-            self._stage_local_doc2k_votes()
+        self._local_gpu_id = resolve_physical_gpu_id(device)
+        if not self.runtime_cfg.doc2k_disabled:
+            append_local_doc2k_delta(self._local_gpu_id, vote_delta)
             self._has_uncommitted_rollout = True
-        metrics_t = torch.from_numpy(metrics_mat).to(device=device)
-        packed = torch.cat((core, metrics_t), dim=-1)
+        packed = pack_in_process_embedding(
+            token_ids=token_ids,
+            token_logprobs=token_logprobs,
+            base_docid_mat=base_mat,
+            unit_ub_docid_mat=unit_ub_mat,
+            metrics_mat=metrics_mat,
+        )
         if device.type == "cuda" and (
-            torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device) > 4 * 2**30
+            torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device) > 2 * 2**30
         ):
             torch.cuda.empty_cache()
         return packed
-
-    def _stage_local_doc2k_votes(self) -> None:
-        local_path = Path(tempfile.gettempdir()) / f"gr_doc2k_local_gpu{self._local_gpu_id}.pkl"
-        tmp_path = local_path.with_suffix(".tmp")
-        payload = {
-            "cand_votes": self._step_cand_votes,
-            "docid_q_count": self._step_docid_q_count,
-            "edge_passes": self._step_edge_passes,
-        }
-        tmp_path.write_bytes(pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL))
-        tmp_path.replace(local_path)
 
     def _generate_docids(
         self,
@@ -693,38 +405,55 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
         baseline_hidden_states: torch.Tensor | None = None,
         queries: list[str | None] | None = None,
     ) -> EmbeddingPoolerOutput:
+        is_beam_sample = self.decoding_mode == "beam_sample"
         if self.decoding_mode in {"beam", "beam_sample"}:
             token_ids, token_logprobs = generate_beams(
-                self._generation_model, hidden_states, attention_mask, self.constraint,
-                code_num=self.docid_size, num_beams=self.num_beams,
+                self._generation_model,
+                hidden_states,
+                attention_mask,
+                self.constraint,
+                code_num=self.docid_size,
+                num_beams=self.num_beams,
                 num_return_sequences=self.num_return_sequences,
-                do_sample=self.decoding_mode == "beam_sample",
+                do_sample=is_beam_sample,
                 temperature=self.temperature,
+                step_temperatures=self.runtime_cfg.step_temperatures if is_beam_sample else None,
+                query_chunk_size=self.runtime_cfg.tree_query_chunk_size,
             )
         else:
             token_ids, token_logprobs = generate_samples(
-                self._generation_model, hidden_states, attention_mask, self.constraint,
-                code_num=self.docid_size, num_return_sequences=self.num_return_sequences,
+                self._generation_model,
+                hidden_states,
+                attention_mask,
+                self.constraint,
+                code_num=self.docid_size,
+                num_return_sequences=self.num_return_sequences,
                 temperature=self.temperature,
             )
         if queries is not None and self.num_return_sequences == self.num_beams:
             packed = self._score_batch_in_process(
-                queries, token_ids, token_logprobs, baseline_hidden_states, attention_mask,
+                queries,
+                token_ids,
+                token_logprobs,
+                baseline_hidden_states,
+                attention_mask,
             )
             del token_ids, token_logprobs
             return self._dp_compatible_output(packed)
         base_hs = baseline_hidden_states if baseline_hidden_states is not None else hidden_states
         baseline_ids, _ = generate_beams(
-            self._baseline_generation_model, base_hs, attention_mask, self.constraint,
-            code_num=self.docid_size, num_beams=self.num_beams,
+            self._baseline_generation_model,
+            base_hs,
+            attention_mask,
+            self.constraint,
+            code_num=self.docid_size,
+            num_beams=self.num_beams,
             num_return_sequences=self.num_return_sequences,
             do_sample=False,
             temperature=1.0,
+            query_chunk_size=self.runtime_cfg.tree_query_chunk_size,
         )
-        packed = torch.cat(
-            (token_ids.float(), token_logprobs.float(), baseline_ids.float()),
-            dim=-1,
-        ).flatten(1)
+        packed = torch.cat((token_ids.float(), token_logprobs.float(), baseline_ids.float()), dim=-1).flatten(1)
         del token_ids, token_logprobs, baseline_ids
         return self._dp_compatible_output(packed)
 
@@ -746,23 +475,19 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
     ) -> EmbeddingPoolerOutput:
         if not get_embedding:
             raise ValueError("GRQwen3ForDocIDGeneration only supports embedding-mode rollout")
-        if not self._baseline_initialized and (
-            bool(self.relevance_model_path) and self.num_return_sequences == self.num_beams
-        ) and forward_batch.batch_size > 1:
+        use_in_process_reward = bool(self.relevance_model_path) and self.num_return_sequences == self.num_beams
+        if not self._baseline_initialized and use_in_process_reward and forward_batch.batch_size > 1:
             for b_param, p_param in zip(self.baseline_model.parameters(), self.model.parameters(), strict=True):
                 b_param.data.copy_(p_param.data)
             self._baseline_initialized = True
-        use_in_process_reward = bool(self.relevance_model_path) and self.num_return_sequences == self.num_beams
         packed_width = (
-            self.num_return_sequences * IN_PROCESS_BEAM_COLS + len(IN_PROCESS_METRIC_KEYS)
+            expected_in_process_embedding_width(self.num_return_sequences)
             if use_in_process_reward
             else self.num_return_sequences * self.docid_size * 3
         )
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         if hidden_states.shape[0] == 0:
-            return self._dp_compatible_output(
-                hidden_states.new_empty((0, packed_width)),
-            )
+            return self._dp_compatible_output(hidden_states.new_empty((0, packed_width)))
         queries: list[str | None] | None = None
         need_baseline_hs = not use_in_process_reward
         if use_in_process_reward:
@@ -770,12 +495,9 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
             queries = self._extract_queries(input_ids, forward_batch)
             if queries is None:
                 return self._dp_compatible_output(
-                    hidden_states.new_zeros((forward_batch.batch_size, packed_width), dtype=torch.float32),
+                    hidden_states.new_zeros((forward_batch.batch_size, packed_width), dtype=torch.float32)
                 )
-            need_baseline_hs = any(
-                q is not None and self._baseline_sets_cache.get(q) is None
-                for q in queries
-            )
+            need_baseline_hs = any(q is not None and self._baseline_kid_cache.get(q) is None for q in queries)
         baseline_hs_padded: torch.Tensor | None = None
         if need_baseline_hs:
             base_hs_raw = self.baseline_model(input_ids, positions, forward_batch, input_embeds)
@@ -794,29 +516,23 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
         qwen_weights: list[tuple[str, torch.Tensor]] = []
         for original_name, loaded_weight in weights:
             if original_name.startswith("encoder_list.0.model.encoder."):
-                qwen_name = original_name.removeprefix("encoder_list.0.model.encoder.")
-                qwen_weights.append((qwen_name, loaded_weight))
+                qwen_weights.append((original_name.removeprefix("encoder_list.0.model.encoder."), loaded_weight))
                 continue
-
-            name = original_name
-            if name in {"docid_embedding.weight", "decoder.embed_tokens.weight"}:
+            if original_name in {"docid_embedding.weight", "decoder.embed_tokens.weight"}:
                 target_name = "docid_embedding.weight"
-            elif name.startswith(("docEnc2decoder.", "decoder.", "lm_head.")):
-                target_name = name
+            elif original_name.startswith(("docEnc2decoder.", "decoder.", "lm_head.")):
+                target_name = original_name
             else:
                 continue
-
             parameter = params.get(target_name)
             if parameter is None:
                 raise KeyError(f"GR rollout parameter not found: {target_name}")
-            loader = getattr(parameter, "weight_loader", default_weight_loader)
-            loader(parameter, loaded_weight)
+            getattr(parameter, "weight_loader", default_weight_loader)(parameter, loaded_weight)
             if not self._baseline_initialized:
                 baseline_target = f"baseline_{target_name}"
                 baseline_param = params.get(baseline_target)
                 if baseline_param is not None:
-                    b_loader = getattr(baseline_param, "weight_loader", default_weight_loader)
-                    b_loader(baseline_param, loaded_weight)
+                    getattr(baseline_param, "weight_loader", default_weight_loader)(baseline_param, loaded_weight)
                     loaded_head_keys.append(baseline_target)
         had_qwen_weights = bool(qwen_weights)
         if had_qwen_weights:
@@ -831,17 +547,10 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
             self._commit_step_doc2k_updates()
 
     def _commit_step_doc2k_updates(self) -> None:
-        if self._disable_doc2k or self._mapping_engine is None:
+        if self.runtime_cfg.doc2k_disabled or self._mapping_engine is None:
             return
-        mapping_engine = self._mapping_engine
         self._doc2k_sync_step += 1
-        self._step_cand_last_q.clear()
-        self._step_cand_votes.clear()
-        self._step_docid_q_count.clear()
-        self._step_docid_kids.clear()
-        self._step_edge_passes.clear()
-
-        global_path = Path(tempfile.gettempdir()) / f"gr_doc2k_global_gpu{self._local_gpu_id}.pkl"
+        global_path = global_doc2k_delta_path(self._local_gpu_id)
         if global_path.is_file():
             payload = pickle.loads(global_path.read_bytes())
             global_path.unlink(missing_ok=True)
@@ -850,13 +559,15 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
         else:
             additions = {}
             removals = {}
-
-        stats = mapping_engine.apply_u32_kid_delta(additions, removals)
-        print(
-            f"[GR doc2k global] step={self._doc2k_sync_step} gpu={self._local_gpu_id} "
-            f"updated_docids={stats['updated_docids']} added_edges={stats['added_edges']} "
-            f"removed_edges={stats['removed_edges']} overlay_docids={stats['overlay_docids']}",
-            flush=True,
+        stats = self._mapping_engine.apply_u32_kid_delta(additions, removals)
+        logger.info(
+            "[GR doc2k global] step=%d gpu=%d updated_docids=%d added_edges=%d removed_edges=%d overlay_docids=%d",
+            self._doc2k_sync_step,
+            self._local_gpu_id,
+            stats["updated_docids"],
+            stats["added_edges"],
+            stats["removed_edges"],
+            stats["overlay_docids"],
         )
 
 

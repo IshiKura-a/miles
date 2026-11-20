@@ -9,9 +9,13 @@ import math
 from typing import Any
 
 import aiohttp
-import httpx
 import numpy as np
 
+from examples.experimental.generative_retriever.reward.in_process_protocol import (
+    IN_PROCESS_METRIC_KEYS,
+    expected_in_process_embedding_width,
+    unpack_in_process_embedding,
+)
 from examples.experimental.generative_retriever.reward.relevance_reward import (
     DEFAULT_REWARD_BATCH_SIZE,
     DOCID_TOKEN_OFFSET,
@@ -20,12 +24,11 @@ from examples.experimental.generative_retriever.reward.relevance_reward import (
     RQ_CODE_DIM,
     RQ_CODE_NUM,
 )
-from examples.experimental.generative_retriever.sglang_models.gr_policy import (
-    IN_PROCESS_BEAM_COLS,
-    IN_PROCESS_METRIC_KEYS,
+from examples.experimental.generative_retriever.reward.rollout_metrics import (
+    compute_scalar_tree_credit_2d,
 )
+from examples.experimental.generative_retriever.runtime.gr_config import GRConfig
 from miles.rollout.base_types import BaseGroupGenerateFn, GenerateFnInput, GenerateFnOutput
-from miles.utils.http_utils import GeneralHttpClientProvider
 from miles.utils.types import Sample
 
 _DOCID_SIZE = RQ_CODE_NUM
@@ -142,7 +145,6 @@ def resolve_engine_url(args: Any) -> str:
 _AIOHTTP_SESSIONS: dict[asyncio.AbstractEventLoop, aiohttp.ClientSession] = {}
 _WORKER_URLS_BY_ROUTER: dict[str, list[str]] = {}
 _WORKER_URL_LOCKS: dict[asyncio.AbstractEventLoop, asyncio.Lock] = {}
-_DEAD_WORKER_URLS: set[str] = set()
 _RR_COUNTER: int = 0
 
 
@@ -160,15 +162,11 @@ def _get_aiohttp_session() -> aiohttp.ClientSession:
 async def _resolve_target_url(router_url: str, session: aiohttp.ClientSession) -> str:
     global _RR_COUNTER
     urls = _WORKER_URLS_BY_ROUTER.get(router_url)
-    if urls:
-        urls = [u for u in urls if u not in _DEAD_WORKER_URLS]
     if not urls:
         loop = asyncio.get_running_loop()
         lock = _WORKER_URL_LOCKS.setdefault(loop, asyncio.Lock())
         async with lock:
             urls = _WORKER_URLS_BY_ROUTER.get(router_url)
-            if urls:
-                urls = [u for u in urls if u not in _DEAD_WORKER_URLS]
             if not urls:
                 try:
                     async with session.get(f"{router_url}/workers") as resp:
@@ -178,7 +176,7 @@ async def _resolve_target_url(router_url: str, session: aiohttp.ClientSession) -
                             extracted = [
                                 w["url"].rstrip("/")
                                 for w in workers
-                                if isinstance(w, dict) and w.get("url") and w["url"].rstrip("/") not in _DEAD_WORKER_URLS
+                                if isinstance(w, dict) and w.get("url")
                             ]
                             if extracted:
                                 urls = extracted
@@ -211,15 +209,15 @@ async def request_embedding(args: Any, router_url: str, prompt_ids: list[int]) -
                 payload = await response.json()
             break
         except (aiohttp.ClientError, asyncio.TimeoutError) as error:
-            if target_base != router_url and isinstance(error, (aiohttp.ClientConnectorError, asyncio.TimeoutError)):
-                _DEAD_WORKER_URLS.add(target_base)
-                logger.warning("Marking SGLang worker %s as dead after %s", target_base, type(error).__name__)
             _WORKER_URLS_BY_ROUTER.pop(router_url, None)
             if attempt == _TRANSPORT_ATTEMPTS:
                 raise
             logger.warning(
-                "Embedding connection %s (attempt %d/%d); retrying before generation",
-                type(error).__name__, attempt, _TRANSPORT_ATTEMPTS,
+                "Embedding connection %s on %s (attempt %d/%d); retrying",
+                type(error).__name__,
+                target_base,
+                attempt,
+                _TRANSPORT_ATTEMPTS,
             )
             await asyncio.sleep(_RETRY_DELAY_SECONDS * 2 ** (attempt - 1))
             attempt += 1
@@ -247,7 +245,7 @@ def encode_training_prompt(state: Any, query: str) -> list[int]:
             add_generation_prompt=True,
         )
         pair = tuple(tmpl.split(sentinel))
-        setattr(state, "_gr_chat_template_pair", pair)
+        state._gr_chat_template_pair = pair
     query_ids = state.tokenizer.encode(query, add_special_tokens=False)[:QUERY_MAX_TOKENS]
     truncated_query = state.tokenizer.decode(query_ids)
     prompt = f"{pair[0]}{truncated_query}{pair[1]}"
@@ -315,34 +313,43 @@ async def generate_group_samples(
     prompt_ids = encode_training_prompt(state, query)
     output = await request_embedding(args, resolve_engine_url(args), prompt_ids)
     raw_np = output.get("embedding_np")
-    expected_in_process = group_size * IN_PROCESS_BEAM_COLS + len(IN_PROCESS_METRIC_KEYS)
+    expected_in_process = expected_in_process_embedding_width(group_size)
     if not evaluation and raw_np is not None and raw_np.size == expected_in_process:
-        core = raw_np[: group_size * IN_PROCESS_BEAM_COLS].reshape(group_size, IN_PROCESS_BEAM_COLS)
-        tok_mat = core[:, :4].astype(np.int64)
-        tok_list = tok_mat.tolist()
-        lp_list = core[:, 4:8].astype(np.float64).tolist()
-        rewards_list = core[:, 8].astype(np.float64).tolist()
-        raw_rewards_list = core[:, 9].astype(np.float64).tolist()
-        pos_mat = tok_mat - DOCID_TOKEN_OFFSET
-        u32_arr = (
-            (pos_mat[:, 0].astype(np.uint32) << np.uint32(24))
-            | ((pos_mat[:, 1] - 256).astype(np.uint32) << np.uint32(16))
-            | ((pos_mat[:, 2] - 512).astype(np.uint32) << np.uint32(8))
-            | (pos_mat[:, 3] - 768).astype(np.uint32)
+        gr_cfg = getattr(state, "_gr_config", None)
+        if gr_cfg is None:
+            gr_cfg = GRConfig.from_env()
+            state._gr_config = gr_cfg
+        rollout_id = int(first.group_index or 0) // max(1, int(args.rollout_batch_size))
+        unique_weight = gr_cfg.resolve_unique_weight(rollout_id, int(args.num_rollout or 1))
+        tok_i32, lp_f32, u32_arr, raw_f64, metrics_f64 = unpack_in_process_embedding(
+            raw_np,
+            group_size,
+            unique_weight,
         )
+        tok_list = tok_i32.astype(np.int64).tolist()
+        lp_list = lp_f32.astype(np.float64).tolist()
+        credited_list = compute_scalar_tree_credit_2d(u32_arr[None, :], raw_f64[None, :])[0].tolist()
+        raw_rewards_list = raw_f64.tolist()
+        pad_tok_id = int(state.tokenizer.pad_token_id) if gr_cfg.compact_train_ipc else 0
         for beam_rank, sample in enumerate(group):
-            sample.tokens = prompt_ids + tok_list[beam_rank]
+            sample.tokens = (
+                prompt_ids + tok_list[beam_rank]
+                if (not gr_cfg.compact_train_ipc or beam_rank == 0)
+                else [pad_tok_id, *tok_list[beam_rank]]
+            )
             sample.response_length = _DOCID_SIZE
             sample.rollout_log_probs = lp_list[beam_rank]
-            sample.reward = rewards_list[beam_rank]
+            sample.reward = credited_list[beam_rank]
             sample.status = Sample.Status.COMPLETED
-        p0, p1, p2, p3 = (int(v) for v in pos_mat[0].tolist())
-        first.response = f"{p0},{p1},{p2},{p3}"
+        pos0 = tok_i32[0].astype(np.int64) - DOCID_TOKEN_OFFSET
+        first.response = f"{int(pos0[0])},{int(pos0[1])},{int(pos0[2])},{int(pos0[3])}"
         meta0 = first.metadata.setdefault("generative_retriever", {})
         meta0["group_u32"] = u32_arr
         meta0["group_raw_rewards"] = raw_rewards_list
-        metrics_vals = raw_np[group_size * IN_PROCESS_BEAM_COLS :].astype(np.float64).tolist()
-        meta0["reward_metrics"] = dict(zip(IN_PROCESS_METRIC_KEYS, metrics_vals, strict=True))
+        meta0["reward_metrics"] = {
+            **dict(zip(IN_PROCESS_METRIC_KEYS, metrics_f64.tolist(), strict=True)),
+            "unique_weight": unique_weight,
+        }
         return group
 
     expected_2 = group_size * _DOCID_SIZE * 2

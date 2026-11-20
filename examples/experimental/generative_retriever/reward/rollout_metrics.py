@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections import defaultdict
 import logging
 import math
-import os
 from typing import Any
 
 import httpx
@@ -17,6 +16,7 @@ from examples.experimental.generative_retriever.reward.relevance_reward import (
     TREE_CREDIT_LEVEL_WEIGHT,
     TREE_CREDIT_TOP_K,
 )
+from examples.experimental.generative_retriever.runtime.gr_config import GRConfig
 from miles.utils.metric_utils import compute_rollout_step
 from miles.utils.tracking_utils import tracking
 
@@ -32,7 +32,7 @@ def mean_top_k(values: list[float], k: int) -> float:
     return math.fsum(top_values) / len(top_values)
 
 
-def _topk_mean_from_sorted_rewards(
+def topk_mean_from_sorted_rewards(
     s_keys: np.ndarray,
     s_rewards: np.ndarray,
     ord1: np.ndarray,
@@ -78,6 +78,66 @@ def _topk_mean_from_sorted_rewards(
     return out
 
 
+def compute_tree_level_values(
+    u32_mat: np.ndarray,
+    raw_mat_f64: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    num_groups = raw_mat_f64.shape[0]
+    rows = np.arange(num_groups)[:, None]
+    ord1 = np.argsort(-raw_mat_f64, axis=1, kind="mergesort")
+    u_sorted = u32_mat[rows, ord1]
+    r_sorted = raw_mat_f64[rows, ord1]
+    k0, k1, k2 = TREE_CREDIT_TOP_K
+    v0 = topk_mean_from_sorted_rewards(u_sorted >> np.uint32(24), r_sorted, ord1, k0)
+    v1 = topk_mean_from_sorted_rewards(u_sorted >> np.uint32(16), r_sorted, ord1, k1)
+    v2 = topk_mean_from_sorted_rewards(u_sorted >> np.uint32(8), r_sorted, ord1, k2)
+    return v0, v1, v2
+
+
+def compute_scalar_tree_credit_2d(u32_mat: np.ndarray, raw_mat: np.ndarray) -> np.ndarray:
+    """Compute scalar-broadcast 4-level tree credit ``0.25 * (v0 + v1 + v2 + raw)`` in float64."""
+    num_groups, group_size = raw_mat.shape
+    r64 = raw_mat.astype(np.float64, copy=False)
+    if num_groups == 0 or group_size <= 1:
+        return r64.copy()
+    v0, v1, v2 = compute_tree_level_values(u32_mat, r64)
+    return TREE_CREDIT_LEVEL_WEIGHT * (v0 + v1 + v2 + r64)
+
+
+def compute_causal_tree_credit_3d(u32_mat: np.ndarray, raw_mat: np.ndarray) -> np.ndarray:
+    """Compute per-depth causal tree credit ``[B, G, 4]`` where leaf ``t=3`` uses ``raw`` only."""
+    num_groups, group_size = raw_mat.shape
+    r64 = raw_mat.astype(np.float64, copy=False)
+    if num_groups == 0 or group_size <= 1:
+        return np.repeat(r64[:, :, None], RQ_CODE_NUM, axis=-1).astype(np.float32)
+    v0, v1, v2 = compute_tree_level_values(u32_mat, r64)
+    return np.stack(
+        (
+            0.25 * (v0 + v1 + v2 + r64),
+            (v1 + v2 + r64) / 3.0,
+            0.5 * (v2 + r64),
+            r64,
+        ),
+        axis=-1,
+    ).astype(np.float32)
+
+
+def normalize_group_advantages_tensor(
+    returns_t: torch.Tensor,
+    *,
+    rewards_norm: bool,
+    grpo_std_norm: bool,
+) -> torch.Tensor:
+    """Normalize ``[B, G]`` or ``[B, G, C]`` returns across the group dimension ``dim=1``."""
+    if not rewards_norm:
+        return returns_t
+    centered = returns_t - returns_t.mean(dim=1, keepdim=True)
+    if grpo_std_norm and returns_t.shape[1] > 1:
+        std = returns_t.std(dim=1, keepdim=True)
+        centered = torch.where(std > 0, centered / (std + 1e-6), centered)
+    return centered
+
+
 def _is_regular_group_layout(samples: list[Any], g_size: int) -> bool:
     return (
         bool(samples)
@@ -104,27 +164,15 @@ def apply_hierarchical_tree_credit(args: Any, samples: list[Any]) -> None:
             g_meta = samples[g * g_size].metadata["generative_retriever"]
             raw_1d.extend(g_meta.pop("group_raw_rewards"))
         first_meta["batch_raw_rewards_1d"] = raw_1d
-        if os.environ.get("GR_CAUSAL_TREE_CREDIT") == "1" and "group_u32" in first_meta:
+        if GRConfig.from_env().causal_tree_credit and "group_u32" in first_meta:
             u32_mat = np.stack(
                 [samples[g * g_size].metadata["generative_retriever"]["group_u32"] for g in range(num_groups)],
                 axis=0,
             )
             r_mat = np.asarray(raw_1d, dtype=np.float64).reshape(num_groups, g_size)
-            rows = np.arange(num_groups)[:, None]
-            ord1 = np.argsort(-r_mat, axis=1, kind="mergesort")
-            u_sorted = u32_mat[rows, ord1]
-            r_sorted = r_mat[rows, ord1]
-            k0, k1, k2 = TREE_CREDIT_TOP_K
-            v0 = _topk_mean_from_sorted_rewards(u_sorted >> np.uint32(24), r_sorted, ord1, k0)
-            v1 = _topk_mean_from_sorted_rewards(u_sorted >> np.uint32(16), r_sorted, ord1, k1)
-            v2 = _topk_mean_from_sorted_rewards(u_sorted >> np.uint32(8), r_sorted, ord1, k2)
-            c0_ret = 0.25 * (v0 + v1 + v2 + r_mat)
-            c1_ret = (v1 + v2 + r_mat) / 3.0
-            c2_ret = 0.5 * (v2 + r_mat)
-            c3_ret = r_mat
-            first_meta["batch_causal_returns_2d"] = np.stack(
-                (c0_ret, c1_ret, c2_ret, c3_ret), axis=-1
-            ).reshape(-1, RQ_CODE_NUM).astype(np.float32)
+            first_meta["batch_causal_returns_2d"] = compute_causal_tree_credit_3d(u32_mat, r_mat).reshape(
+                -1, RQ_CODE_NUM
+            )
         return
 
     if _is_regular_group_layout(samples, g_size) and "group_u32" in first_meta:
@@ -140,15 +188,7 @@ def apply_hierarchical_tree_credit(args: Any, samples: list[Any]) -> None:
         )
         first_meta["batch_raw_rewards_1d"] = raw_flat.tolist()
         r_mat = raw_flat.reshape(num_groups, g_size)
-        rows = np.arange(num_groups)[:, None]
-        ord1 = np.argsort(-r_mat, axis=1, kind="mergesort")
-        u_sorted = u32_mat[rows, ord1]
-        r_sorted = r_mat[rows, ord1]
-        k0, k1, k2 = TREE_CREDIT_TOP_K
-        v0 = _topk_mean_from_sorted_rewards(u_sorted >> np.uint32(24), r_sorted, ord1, k0)
-        v1 = _topk_mean_from_sorted_rewards(u_sorted >> np.uint32(16), r_sorted, ord1, k1)
-        v2 = _topk_mean_from_sorted_rewards(u_sorted >> np.uint32(8), r_sorted, ord1, k2)
-        credited_flat = (TREE_CREDIT_LEVEL_WEIGHT * (v0 + v1 + v2 + r_mat)).reshape(-1).tolist()
+        credited_flat = compute_scalar_tree_credit_2d(u32_mat, r_mat).reshape(-1).tolist()
         for sample, val in zip(samples, credited_flat, strict=True):
             sample.reward = val
         return
@@ -338,34 +378,33 @@ def convert_gr_samples_to_train_data(args: Any, samples: list[Any]) -> dict[str,
             float(s.metadata["raw_reward"]) if (s.metadata and "raw_reward" in s.metadata) else float(s.get_reward_value(args))
             for s in samples
         ]
+    grpo_std = args.advantage_estimator in ["grpo", "gspo"] and bool(args.grpo_std_normalization)
     causal_2d = first_meta.pop("batch_causal_returns_2d", None)
-    if causal_2d is not None and n % g_size == 0:
+    if causal_2d is not None and n > 0 and n % g_size == 0:
         r_3d = torch.from_numpy(causal_2d).view(-1, g_size, RQ_CODE_NUM)
-        if args.rewards_normalization:
-            centered = r_3d - r_3d.mean(dim=1, keepdim=True)
-            if args.advantage_estimator in ["grpo", "gspo"] and args.grpo_std_normalization:
-                std = r_3d.std(dim=1, keepdim=True)
-                centered = torch.where(std > 0, centered / (std + 1e-6), centered)
-            norm_rewards: list[Any] = centered.reshape(-1, RQ_CODE_NUM).tolist()
-        else:
-            norm_rewards = r_3d.reshape(-1, RQ_CODE_NUM).tolist()
+        norm_3d = normalize_group_advantages_tensor(
+            r_3d,
+            rewards_norm=bool(args.rewards_normalization),
+            grpo_std_norm=grpo_std,
+        )
+        norm_rewards: list[Any] = norm_3d.reshape(-1, RQ_CODE_NUM).tolist()
     else:
         rewards_t = torch.tensor(
             [float(s.reward if isinstance(s.reward, (int, float)) else s.get_reward_value(args)) for s in samples],
             dtype=torch.float32,
         )
-        if args.rewards_normalization and n % g_size == 0:
-            r_mat = rewards_t.view(-1, g_size)
-            centered = r_mat - r_mat.mean(dim=1, keepdim=True)
-            if args.advantage_estimator in ["grpo", "gspo"] and args.grpo_std_normalization:
-                std = r_mat.std(dim=1, keepdim=True)
-                centered = torch.where(std > 0, centered / (std + 1e-6), centered)
-            norm_rewards = centered.reshape(-1).tolist()
+        if n > 0 and n % g_size == 0:
+            norm_2d = normalize_group_advantages_tensor(
+                rewards_t.view(-1, g_size),
+                rewards_norm=bool(args.rewards_normalization),
+                grpo_std_norm=grpo_std,
+            )
+            norm_rewards = norm_2d.reshape(-1).tolist()
         else:
             norm_rewards = rewards_t.tolist()
 
     tokens = [s.tokens for s in samples]
-    if n > 0 and n % g_size == 0:
+    if n > 0 and n % g_size == 0 and g_size > 1 and len(samples[0].tokens) == len(samples[1].tokens):
         total_lengths = [len(samples[g].tokens) for g in range(0, n, g_size) for _ in range(g_size)]
     else:
         total_lengths = [len(t) for t in tokens]
@@ -397,6 +436,13 @@ def log_rollout(
     stage_coupled_doc2k_updates(args, rollout_id)
     if rollout_extra_metrics is None:
         return False
+    if not samples:
+        log_dict = {**(rollout_extra_metrics or {})}
+        logger.info(f"perf {rollout_id}: {log_dict}")
+        step = compute_rollout_step(args, rollout_id)
+        log_dict["rollout/step"] = step
+        tracking.log(args, log_dict, step_key="rollout/step")
+        return True
     g_size = getattr(args, "n_samples_per_prompt", 0)
     is_regular = _is_regular_group_layout(samples, g_size)
     first_meta = (

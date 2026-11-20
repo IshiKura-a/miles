@@ -17,6 +17,14 @@ from examples.experimental.generative_retriever.reward.relevance_reward import (
     PROMPT_DATASET_ROWS,
     RewardMode,
 )
+from examples.experimental.generative_retriever.runtime.gr_config import (
+    DEFAULT_SGLANG_WATCHDOG_TIMEOUT_SECONDS,
+    Doc2kMode,
+    DocidDenomMode,
+    GRConfig,
+    UniqueAnnealMode,
+    parse_step_temperatures,
+)
 
 _QUERIES_PER_STEP = 4000
 _GLOBAL_BATCH_SIZE = _QUERIES_PER_STEP * DEFAULT_TRAIN_GROUP_SIZE
@@ -85,10 +93,51 @@ class ScriptArgs(U.ExecuteTrainConfig):
     num_rollout: int = _MAX_STEPS
     one_step_async: bool = True
     temperature: float = 0.4
+    step_temperatures: str = "0.2,0.25,0.6,0.8"
+    docid_denom_mode: DocidDenomMode = "sqrt_floor"
+    docid_reward_floor: int = 10
+    causal_tree_credit: bool = True
+    doc2k_mode: Doc2kMode = "relevance_guided"
+    unique_anneal_mode: UniqueAnnealMode = "none"
+    unique_weight_start: float = 2.0
+    unique_weight_end: float = 0.0
+    unique_anneal_warmup_ratio: float = 0.0
+    local_coloc_rollout: bool = True
+    local_rollout_batch_size: int = 125
+    compact_train_ipc: bool = True
+    grouped_cross_attention: bool = True
+    tree_query_chunk_size: int = 128
+    hbm_kw_cache_enabled: bool = True
+    hbm_kw_reserve_gib: float = 82.0
+    hbm_kw_max_gib: float = 60.0
+    hbm_kw_explicit_gib: float | None = None
     lr: float = 2e-6
     save_interval: int = 5
     resume: bool = False
     extra_args: str = ""
+
+    def build_gr_config(self) -> GRConfig:
+        return GRConfig(
+            reward_mode=self.reward_mode,
+            step_temperatures=parse_step_temperatures(self.step_temperatures),
+            docid_denom_mode=self.docid_denom_mode,
+            docid_reward_floor=self.docid_reward_floor,
+            causal_tree_credit=self.causal_tree_credit,
+            doc2k_mode=self.doc2k_mode,
+            unique_anneal_mode=self.unique_anneal_mode,
+            unique_weight_start=self.unique_weight_start,
+            unique_weight_end=self.unique_weight_end,
+            unique_anneal_warmup_ratio=self.unique_anneal_warmup_ratio,
+            local_coloc_rollout=self.local_coloc_rollout,
+            local_rollout_batch_size=self.local_rollout_batch_size,
+            compact_train_ipc=self.compact_train_ipc,
+            grouped_cross_attention=self.grouped_cross_attention,
+            tree_query_chunk_size=self.tree_query_chunk_size,
+            hbm_kw_cache_enabled=self.hbm_kw_cache_enabled,
+            hbm_kw_reserve_gib=self.hbm_kw_reserve_gib,
+            hbm_kw_max_gib=self.hbm_kw_max_gib,
+            hbm_kw_explicit_gib=self.hbm_kw_explicit_gib,
+        )
 
 
 def expanded_path(value: str, name: str, *, directory: bool = True) -> Path:
@@ -184,9 +233,14 @@ def build_algorithm_args() -> list[str]:
     ]
 
 
-def build_sglang_args(args: ScriptArgs, mem_fraction: float) -> list[str]:
+def build_sglang_args(
+    args: ScriptArgs,
+    mem_fraction: float,
+    *,
+    colocate: bool = False,
+) -> list[str]:
     return [
-        "--rollout-num-gpus", str(args.rollout_num_gpus),
+        *([] if colocate else ["--rollout-num-gpus", str(args.rollout_num_gpus)]),
         "--rollout-num-gpus-per-engine", str(args.rollout_num_gpus_per_engine),
         "--sglang-dp-size", str(args.sglang_dp_size),
         *(["--sglang-enable-dp-attention"] if args.sglang_dp_size > 1 else []),
@@ -194,5 +248,5 @@ def build_sglang_args(args: ScriptArgs, mem_fraction: float) -> list[str]:
         "--sglang-attention-backend", "triton", "--sglang-disable-cuda-graph",
         "--sglang-server-concurrency", str(args.sglang_server_concurrency),
         "--sglang-mem-fraction-static", str(mem_fraction),
-        "--sglang-watchdog-timeout", "3600",
+        "--sglang-watchdog-timeout", str(DEFAULT_SGLANG_WATCHDOG_TIMEOUT_SECONDS),
     ]

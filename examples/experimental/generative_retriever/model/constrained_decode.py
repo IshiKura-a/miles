@@ -6,7 +6,6 @@ from examples.experimental.generative_retriever.utils.paths import absolute_path
 
 from collections.abc import Callable
 from functools import lru_cache
-import os
 from pathlib import Path
 import shutil
 import tempfile
@@ -227,6 +226,84 @@ def load_constraint(mapping_path: str, code_num: int, code_dim: int) -> PrefixCo
     return constraint
 
 
+def _make_grouped_xattn_forward(mod: Any, orig_forward: Any):
+    def _forward(
+        hidden_states: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        key_value_states: torch.Tensor | None = None,
+        position_bias: torch.Tensor | None = None,
+        past_key_values: Any = None,
+        output_attentions: bool = False,
+        **kwargs: Any,
+    ):
+        if (
+            key_value_states is None
+            or past_key_values is not None
+            or output_attentions
+            or key_value_states.shape[0] == hidden_states.shape[0]
+        ):
+            return orig_forward(
+                hidden_states,
+                mask=mask,
+                key_value_states=key_value_states,
+                position_bias=position_bias,
+                past_key_values=past_key_values,
+                output_attentions=output_attentions,
+                **kwargs,
+            )
+        bsz_total, q_len, _ = hidden_states.shape
+        g_cnt, k_len, _ = key_value_states.shape
+        if g_cnt <= 0 or bsz_total % g_cnt != 0:
+            return orig_forward(
+                hidden_states,
+                mask=mask,
+                key_value_states=key_value_states,
+                position_bias=position_bias,
+                past_key_values=past_key_values,
+                output_attentions=output_attentions,
+                **kwargs,
+            )
+        grp = bsz_total // g_cnt
+        n_heads = int(mod.n_heads)
+        d_kv = int(mod.key_value_proj_dim)
+        q = mod.q(hidden_states).view(g_cnt, grp * q_len, n_heads, d_kv).transpose(1, 2)
+        k = mod.k(key_value_states).view(g_cnt, k_len, n_heads, d_kv).transpose(1, 2)
+        v = mod.v(key_value_states).view(g_cnt, k_len, n_heads, d_kv).transpose(1, 2)
+        scores = torch.matmul(q, k.transpose(3, 2))
+        if position_bias is None:
+            position_bias = torch.zeros((1, n_heads, 1, k_len), device=scores.device, dtype=scores.dtype)
+            if mask is not None:
+                position_bias = position_bias + mask[:, :, :1, :k_len]
+        scores = scores + position_bias
+        probs = F.softmax(scores.float(), dim=-1).type_as(scores)
+        probs = F.dropout(probs, p=mod.dropout, training=mod.training)
+        out = torch.matmul(probs, v).transpose(1, 2).contiguous().view(bsz_total, q_len, n_heads * d_kv)
+        return (mod.o(out), position_bias)
+
+    return _forward
+
+
+def install_grouped_cross_attention(decoder: nn.Module) -> None:
+    """Patch T5 decoder blocks so ``[B*G, q_len, d]`` queries attend to unexpanded ``[B, k_len, d]`` encoder states."""
+    for block in getattr(decoder, "block", ()):
+        layers = getattr(block, "layer", ())
+        if len(layers) < 2:
+            continue
+        attn = getattr(layers[1], "EncDecAttention", None)
+        if attn is None or getattr(attn, "_gr_grouped_xattn", False):
+            continue
+        attn.forward = _make_grouped_xattn_forward(attn, attn.forward)
+        attn._gr_grouped_xattn = True
+
+
+def has_grouped_cross_attention(decoder: nn.Module) -> bool:
+    return any(
+        getattr(getattr(block.layer[1], "EncDecAttention", None), "_gr_grouped_xattn", False)
+        for block in getattr(decoder, "block", ())
+        if len(getattr(block, "layer", ())) >= 2
+    )
+
+
 def build_generation_model(
     *,
     slm_root: str,
@@ -234,10 +311,13 @@ def build_generation_model(
     projection: nn.Module,
     decoder: nn.Module,
     lm_head: nn.Module,
+    grouped_cross_attention: bool = True,
 ) -> nn.Module:
     """Attach existing policy tensors to the official generation class."""
     slmv3 = import_slmv3(require_directory(slm_root, "SLMv3 source"))
     source_class = slmv3["T5MultiWithGivenQueryDocEncoderDSI"]
+    if grouped_cross_attention:
+        install_grouped_cross_attention(decoder)
 
     class GenerationHead(source_class):
         def __init__(self) -> None:
@@ -249,6 +329,76 @@ def build_generation_model(
             self.margin = self.running_args.margin
 
     return GenerationHead().eval()
+
+
+def build_step_constraint_mask(
+    constraint: PrefixConstraint,
+    flat_seq: torch.Tensor,
+    vocab_size: int,
+    prefix_cache: dict[tuple[int, ...], list[int]],
+    device: torch.device,
+) -> torch.Tensor:
+    if isinstance(constraint, SortedU32Constraint):
+        return constraint.build_step_mask(flat_seq, vocab_size)
+    mask_cpu = torch.zeros((flat_seq.shape[0], vocab_size), dtype=torch.bool)
+    for row_idx, seq_row in enumerate(flat_seq.detach().cpu().tolist()):
+        key = tuple(seq_row)
+        allowed = prefix_cache.get(key)
+        if allowed is None:
+            allowed = constraint(0, torch.tensor(seq_row, dtype=torch.long))
+            if len(prefix_cache) < 262_144:
+                prefix_cache[key] = allowed
+        if allowed:
+            mask_cpu[row_idx, allowed] = True
+    return mask_cpu.to(device=device, non_blocking=True)
+
+
+def sample_kool_sbs_beams(
+    *,
+    step: int,
+    mask_3d: torch.Tensor,
+    cum_scores: torch.Tensor,
+    step_log_probs: torch.Tensor,
+    cand_cum_3d: torch.Tensor,
+    beam_gumbels: torch.Tensor,
+    next_k: int,
+    temperature: float,
+    step_temps: tuple[float, ...] | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if step_temps is not None:
+        t_cur = step_temps[step]
+        scaled_3d = (
+            cum_scores.unsqueeze(-1) / step_temps[step - 1] + step_log_probs / t_cur
+            if step > 0
+            else cand_cum_3d / t_cur
+        )
+    else:
+        scaled_3d = cand_cum_3d / temperature if temperature != 1.0 else cand_cum_3d
+    gumbel_3d = -torch.empty_like(scaled_3d).exponential_().clamp_min_(1e-38).log()
+    raw_g = torch.where(mask_3d, scaled_3d + gumbel_3d, float("-inf"))
+    if step > 0:
+        max_g = raw_g.max(dim=-1, keepdim=True).values
+        delta = torch.where(mask_3d, raw_g - max_g, float("-inf"))
+        shifted = torch.where(mask_3d, -raw_g + torch.log(-torch.expm1(delta)), float("inf"))
+        cond_g = -torch.logaddexp(-beam_gumbels.unsqueeze(-1).expand_as(raw_g), shifted)
+        cond_g = torch.where(mask_3d & torch.isfinite(max_g), cond_g, float("-inf"))
+    else:
+        cond_g = raw_g
+    flat_g = cond_g.reshape(mask_3d.shape[0], -1)
+    return torch.topk(flat_g, k=next_k, dim=-1)
+
+
+def assert_unique_beam_tokens(tokens: torch.Tensor, num_return_sequences: int, code_num: int) -> None:
+    if num_return_sequences <= 1:
+        return
+    if code_num == 4:
+        packed = (tokens[:, :, 0] << 33) | (tokens[:, :, 1] << 22) | (tokens[:, :, 2] << 11) | tokens[:, :, 3]
+        sorted_packed = torch.sort(packed, dim=1).values
+        if bool((sorted_packed[:, 1:] == sorted_packed[:, :-1]).any().item()):
+            raise RuntimeError("SLMGR constrained beam tree returned duplicate IDs")
+        return
+    if any(len(set(map(tuple, rows.tolist()))) != num_return_sequences for rows in tokens):
+        raise RuntimeError("SLMGR constrained beam tree returned duplicate IDs")
 
 
 @torch.no_grad()
@@ -263,20 +413,17 @@ def generate_beams_tree(
     num_return_sequences: int,
     do_sample: bool = False,
     temperature: float = 1.0,
-    query_chunk_size: int = 64,
+    step_temperatures: tuple[float, ...] | None = None,
+    query_chunk_size: int = 128,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if step_temperatures is not None and (len(step_temperatures) != code_num or any(t <= 0 for t in step_temperatures)):
+        raise ValueError(f"step_temperatures must contain {code_num} positive floats, got {step_temperatures!r}")
     total_queries = hidden_states.shape[0]
     device = hidden_states.device
     all_tokens: list[torch.Tensor] = []
     all_scores: list[torch.Tensor] = []
     prefix_cache: dict[tuple[int, ...], list[int]] = {}
-    raw_step_temps = os.environ.get("GR_STEP_TEMPERATURES", "").strip()
-    step_temps: tuple[float, ...] | None = None
-    if raw_step_temps:
-        parsed_temps = tuple(float(x) for x in raw_step_temps.split(",") if x.strip())
-        if len(parsed_temps) != code_num or any(t <= 0 for t in parsed_temps):
-            raise ValueError(f"GR_STEP_TEMPERATURES must contain {code_num} positive floats, got {raw_step_temps!r}")
-        step_temps = parsed_temps
+    grouped_xattn = has_grouped_cross_attention(model.decoder)
 
     for q_start in range(0, total_queries, query_chunk_size):
         q_end = min(q_start + query_chunk_size, total_queries)
@@ -293,8 +440,8 @@ def generate_beams_tree(
         for step in range(code_num):
             cur_beams = sequences.shape[1]
             flat_seq = sequences.reshape(batch_size * cur_beams, step + 1)
-            rep_proj = projected.repeat_interleave(cur_beams, dim=0)
-            rep_mask = mask_chunk.repeat_interleave(cur_beams, dim=0)
+            rep_proj = projected if (grouped_xattn or cur_beams == 1) else projected.repeat_interleave(cur_beams, dim=0)
+            rep_mask = mask_chunk if (grouped_xattn or cur_beams == 1) else mask_chunk.repeat_interleave(cur_beams, dim=0)
             dec_out = model.decoder(
                 input_ids=flat_seq,
                 encoder_hidden_states=rep_proj,
@@ -303,26 +450,12 @@ def generate_beams_tree(
                 return_dict=True,
             )
             logits = model.lm_head(dec_out.last_hidden_state[:, -1, :]).float()
-
             vocab_size = logits.shape[-1]
-            if isinstance(constraint, SortedU32Constraint):
-                mask_gpu = constraint.build_step_mask(flat_seq, vocab_size)
-            else:
-                mask_cpu = torch.zeros((flat_seq.shape[0], vocab_size), dtype=torch.bool)
-                flat_seq_list: list[list[int]] = flat_seq.detach().cpu().tolist()
-                for row_idx, seq_row in enumerate(flat_seq_list):
-                    key = tuple(seq_row)
-                    allowed = prefix_cache.get(key)
-                    if allowed is None:
-                        allowed = constraint(0, torch.tensor(seq_row, dtype=torch.long))
-                        if len(prefix_cache) < 262_144:
-                            prefix_cache[key] = allowed
-                    if allowed:
-                        mask_cpu[row_idx, allowed] = True
-                mask_gpu = mask_cpu.to(device=device, non_blocking=True)
-            masked_logits = logits.masked_fill(~mask_gpu, float("-inf"))
+            mask_gpu = build_step_constraint_mask(constraint, flat_seq, vocab_size, prefix_cache, device)
             mask_3d = mask_gpu.reshape(batch_size, cur_beams, vocab_size)
-            step_log_probs = F.log_softmax(masked_logits, dim=-1).reshape(batch_size, cur_beams, vocab_size)
+            step_log_probs = F.log_softmax(logits.masked_fill(~mask_gpu, float("-inf")), dim=-1).reshape(
+                batch_size, cur_beams, vocab_size
+            )
             step_log_probs = step_log_probs.masked_fill(~mask_3d, float("-inf"))
             cand_cum_3d = cum_scores.unsqueeze(-1) + step_log_probs
             cand_cum = cand_cum_3d.reshape(batch_size, cur_beams * vocab_size)
@@ -332,39 +465,27 @@ def generate_beams_tree(
             if next_k <= 0:
                 raise RuntimeError(f"Constrained beam tree has no valid continuations at step {step}")
             if do_sample:
-                if step_temps is not None:
-                    t_cur = step_temps[step]
-                    if step > 0:
-                        t_prev = step_temps[step - 1]
-                        scaled_3d = cum_scores.unsqueeze(-1) / t_prev + step_log_probs / t_cur
-                    else:
-                        scaled_3d = cand_cum_3d / t_cur
-                else:
-                    scaled_3d = cand_cum_3d / temperature if temperature != 1.0 else cand_cum_3d
-                gumbel_3d = -torch.empty_like(scaled_3d).exponential_().clamp_min_(1e-38).log()
-                raw_g = torch.where(mask_3d, scaled_3d + gumbel_3d, float("-inf"))
-                if step > 0:
-                    max_g = raw_g.max(dim=-1, keepdim=True).values
-                    delta = torch.where(mask_3d, raw_g - max_g, float("-inf"))
-                    shifted = torch.where(mask_3d, -raw_g + torch.log(-torch.expm1(delta)), float("inf"))
-                    cond_g = -torch.logaddexp(-beam_gumbels.unsqueeze(-1).expand_as(raw_g), shifted)
-                    cond_g = torch.where(mask_3d & torch.isfinite(max_g), cond_g, float("-inf"))
-                else:
-                    cond_g = raw_g
-                flat_g = cond_g.reshape(batch_size, cur_beams * vocab_size)
-                top_g, top_idx = torch.topk(flat_g, k=next_k, dim=-1)
-                beam_gumbels = top_g
+                beam_gumbels, top_idx = sample_kool_sbs_beams(
+                    step=step,
+                    mask_3d=mask_3d,
+                    cum_scores=cum_scores,
+                    step_log_probs=step_log_probs,
+                    cand_cum_3d=cand_cum_3d,
+                    beam_gumbels=beam_gumbels,
+                    next_k=next_k,
+                    temperature=temperature,
+                    step_temps=step_temperatures,
+                )
             else:
                 _, top_idx = torch.topk(cand_cum, k=next_k, dim=-1)
             beam_idx = top_idx // vocab_size
             tok_idx = top_idx % vocab_size
-            chosen_cum = cand_cum.gather(1, top_idx)
+            cum_scores = cand_cum.gather(1, top_idx)
             chosen_step_lp = step_log_probs.reshape(batch_size, -1).gather(1, top_idx)
             prev_seq = sequences.gather(1, beam_idx.unsqueeze(-1).expand(batch_size, next_k, step + 1))
             sequences = torch.cat([prev_seq, tok_idx.unsqueeze(-1)], dim=-1)
             prev_scores = token_scores.gather(1, beam_idx.unsqueeze(-1).expand(batch_size, next_k, step))
             token_scores = torch.cat([prev_scores, chosen_step_lp.unsqueeze(-1)], dim=-1)
-            cum_scores = chosen_cum
 
         if sequences.shape[1] < num_return_sequences:
             raise RuntimeError(
@@ -377,8 +498,7 @@ def generate_beams_tree(
     scores = torch.cat(all_scores, dim=0)
     if not torch.isfinite(scores).all():
         raise RuntimeError("SLMGR constrained beam tree output has non-finite token logprobs")
-    if any(len(set(map(tuple, rows.tolist()))) != num_return_sequences for rows in tokens):
-        raise RuntimeError("SLMGR constrained beam tree returned duplicate IDs")
+    assert_unique_beam_tokens(tokens, num_return_sequences, code_num)
     return tokens, scores
 
 
@@ -394,6 +514,8 @@ def generate_beams(
     num_return_sequences: int,
     do_sample: bool = False,
     temperature: float = 1.0,
+    step_temperatures: tuple[float, ...] | None = None,
+    query_chunk_size: int = 128,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if not 1 <= num_return_sequences <= num_beams:
         raise ValueError("Require 1 <= num_return_sequences <= num_beams")
@@ -410,6 +532,8 @@ def generate_beams(
             num_return_sequences=num_return_sequences,
             do_sample=do_sample,
             temperature=temperature,
+            step_temperatures=step_temperatures if do_sample else None,
+            query_chunk_size=query_chunk_size,
         )
     sample_kwargs: dict[str, Any] = (
         {"do_sample": True, "temperature": temperature, "top_p": 1.0, "top_k": 0}

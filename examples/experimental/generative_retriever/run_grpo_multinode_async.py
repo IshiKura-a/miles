@@ -18,6 +18,7 @@ from examples.experimental.generative_retriever.utils.paths import absolute_path
 
 import argparse
 import asyncio
+from dataclasses import replace
 import hashlib
 import json
 import os
@@ -28,17 +29,6 @@ import sys
 import tempfile
 import time
 from typing import cast
-
-for _ray_env_k, _ray_env_v in (
-    ("RAY_grpc_client_idle_timeout_ms", "36000000"),
-    ("RAY_grpc_client_keepalive_time_ms", "30000"),
-    ("RAY_grpc_client_keepalive_timeout_ms", "600000"),
-    ("RAY_grpc_keepalive_time_ms", "30000"),
-    ("RAY_grpc_keepalive_timeout_ms", "600000"),
-    ("RAY_timeout_ms_task_wait_for_death_info", "600000"),
-    ("RAY_core_worker_rpc_server_reconnect_timeout_max_s", "600"),
-):
-    os.environ.setdefault(_ray_env_k, _ray_env_v)
 
 import ray
 from ray._private import ray_constants
@@ -56,6 +46,12 @@ from examples.experimental.generative_retriever.reward.relevance_model import (
 )
 from examples.experimental.generative_retriever.reward.relevance_reward import (
     PROMPT_DATASET_ROWS,
+)
+from examples.experimental.generative_retriever.runtime.gr_config import (
+    DOC2K_MODES,
+    DOCID_DENOM_MODES,
+    UNIQUE_ANNEAL_MODES,
+    apply_ray_keepalive_env,
 )
 from examples.experimental.generative_retriever.runtime.multinode_recipe import (
     MAX_STEPS_PER_PAIR,
@@ -83,7 +79,7 @@ from examples.experimental.generative_retriever.runtime.service_processes import
 from examples.experimental.generative_retriever.runtime.training_common import (
     ScriptArgs, count_records, expanded_path, prepare_prompt_data, required_directory,
 )
-from examples.experimental.generative_retriever.services.mapping_service import (
+from examples.experimental.generative_retriever.services.mapping_staging import (
     stage_local_doc2k_state,
     stage_local_mapping_dir,
 )
@@ -139,14 +135,9 @@ def build_manifest(
     if validate_checkpoints:
         if resume:
             tracker = checkpoint_dir / "latest_checkpointed_iteration.txt"
-            raw_tracker = tracker.read_text().strip() if tracker.is_file() else ""
-            iteration = int(raw_tracker) if raw_tracker.isdigit() else -1
-            if checkpoint_dir.is_dir():
-                for entry in checkpoint_dir.iterdir():
-                    if entry.name.startswith("iter_") and entry.name[5:].isdigit():
-                        cand = int(entry.name[5:])
-                        if cand > iteration and (entry / "meta.json").is_file():
-                            iteration = cand
+            if not tracker.is_file():
+                raise FileNotFoundError(f"Resume checkpoint missing: {tracker}")
+            iteration = int(tracker.read_text().strip())
             if iteration <= 0 or not (checkpoint_dir / f"iter_{iteration:07d}" / "meta.json").is_file():
                 raise ValueError(f"Incomplete checkpoint at iteration {iteration}")
             if not (
@@ -155,6 +146,7 @@ def build_manifest(
                 raise FileNotFoundError("Resume requires the matching rollout dataset state")
         elif (checkpoint_dir / "latest_checkpointed_iteration.txt").is_file():
             raise FileExistsError(f"Run directory already contains checkpoints; pass --resume: {run_dir}")
+    gr_cfg = args.build_gr_config()
     return {
         "run_id": args.run_id,
         "hosts": hosts,
@@ -179,6 +171,7 @@ def build_manifest(
             checkpoint=checkpoint, qwen=qwen, slm_root=slm_root,
             mapping=str(mapping), relevance_model=relevance,
             reward_mode=args.reward_mode, addresses=addresses,
+            gr_config=gr_cfg,
         ),
     }
 
@@ -304,10 +297,12 @@ def run_worker(manifest: Manifest, index: int) -> None:
 
 
 def run_training(manifest: Manifest) -> None:
-    from train import train
     from miles.utils.arguments import parse_args
     from miles.utils.tracking_utils.tracking import finish_tracking
+    from train import train
 
+    apply_ray_keepalive_env()
+    os.environ.update(manifest["runtime_env"])
     key = os.environ.get("WANDB_API_KEY")
     if not key:
         raise RuntimeError("WANDB_API_KEY must be set in the training driver")
@@ -392,13 +387,7 @@ def run_cluster(manifest: Manifest) -> None:
         if training.returncode:
             raise RuntimeError(f"train.py exited {training.returncode}: {run_dir / 'training.log'}")
         tracker = run_dir / "checkpoints/latest_checkpointed_iteration.txt"
-        raw_completed = tracker.read_text().strip() if tracker.is_file() else ""
-        completed = int(raw_completed) if raw_completed.isdigit() else -1
-        for entry in (run_dir / "checkpoints").iterdir():
-            if entry.name.startswith("iter_") and entry.name[5:].isdigit():
-                cand = int(entry.name[5:])
-                if cand > completed and (entry / "meta.json").is_file():
-                    completed = cand
+        completed = int(tracker.read_text().strip()) if tracker.is_file() else -1
         if completed != manifest["num_rollout"]:
             raise RuntimeError(f"Expected {manifest['num_rollout']} checkpointed steps, got {completed}")
         print(f"Completed {completed} GRPO optimizer steps: {run_dir}", flush=True)
@@ -414,11 +403,21 @@ def run_cluster(manifest: Manifest) -> None:
 
 
 def main() -> None:
+    apply_ray_keepalive_env()
     disable_uv_runtime_env()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--hosts", default="node-0,node-1")
     parser.add_argument("--run-id", default=create_run_id())
     parser.add_argument("--num-rollout", type=int)
+    parser.add_argument("--save-interval", type=int, default=ScriptArgs.save_interval)
+    parser.add_argument("--step-temperatures", default=ScriptArgs.step_temperatures)
+    parser.add_argument("--docid-denom-mode", choices=DOCID_DENOM_MODES, default=ScriptArgs.docid_denom_mode)
+    parser.add_argument("--doc2k-mode", choices=DOC2K_MODES, default=ScriptArgs.doc2k_mode)
+    parser.add_argument("--unique-anneal-mode", choices=UNIQUE_ANNEAL_MODES, default=ScriptArgs.unique_anneal_mode)
+    parser.add_argument("--unique-weight-start", type=float, default=ScriptArgs.unique_weight_start)
+    parser.add_argument("--unique-weight-end", type=float, default=ScriptArgs.unique_weight_end)
+    parser.add_argument("--unique-anneal-warmup-ratio", type=float, default=ScriptArgs.unique_anneal_warmup_ratio)
+    parser.add_argument("--no-causal-tree-credit", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
@@ -446,9 +445,23 @@ def main() -> None:
         parser.error("Manifest path and index are only accepted with an internal role")
     hosts, addresses = resolve_hosts(cli.hosts)
     pairs = len(hosts) // 2
+    base_args = replace(
+        ScriptArgs(),
+        save_interval=cli.save_interval,
+        step_temperatures=cli.step_temperatures,
+        docid_denom_mode=cli.docid_denom_mode,
+        doc2k_mode=cli.doc2k_mode,
+        unique_anneal_mode=cli.unique_anneal_mode,
+        unique_weight_start=cli.unique_weight_start,
+        unique_weight_end=cli.unique_weight_end,
+        unique_anneal_warmup_ratio=cli.unique_anneal_warmup_ratio,
+        causal_tree_credit=not cli.no_causal_tree_credit,
+    )
     args = build_multinode_recipe(
-        cli.run_id, pairs,
+        cli.run_id,
+        pairs,
         cli.num_rollout if cli.num_rollout is not None else MAX_STEPS_PER_PAIR // pairs,
+        base_args=base_args,
     )
     manifest = build_manifest(
         args, hosts=hosts, addresses=addresses,

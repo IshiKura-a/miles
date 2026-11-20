@@ -28,6 +28,7 @@ _DIR = Path(__file__).absolute().parent
 _FREEZE = _DIR / "requirements-rocm.freeze.txt"
 _SLMV3_PATCH = _DIR / "patches/slmv3-transformers-cache.patch"
 _SGLANG_PATCH = _DIR / "patches/sglang-embedding-abort.patch"
+_SGLANG_WATCHDOG_PATCH = _DIR / "patches/sglang-watchdog-idle.patch"
 
 _ROCM_INDEX_URL = "https://stable.repo.amd.com/rocm/whl-next/"
 _ROCM_PACKAGES = (
@@ -332,6 +333,15 @@ def _fetch_aiter_repo(aiter: Path) -> None:
         core_so.chmod(0o775)
 
 
+def ensure_rocm_openblas_link(site_packages: Path) -> None:
+    torch_lib = site_packages / "torch/lib"
+    rocm_blas = site_packages / "_rocm_sdk_core/lib/host-math/lib/librocm-openblas.so.0"
+    target_blas = torch_lib / "librocm-openblas.so.0"
+    if torch_lib.is_dir() and rocm_blas.is_file() and not target_blas.exists() and not target_blas.is_symlink():
+        rel_target = os.path.relpath(rocm_blas, start=torch_lib)
+        target_blas.symlink_to(rel_target)
+
+
 def _deduplicate_rocm_sdk_libs(site_packages: Path) -> None:
     devel_lib_dir = site_packages / "_rocm_sdk_devel/lib"
     if not devel_lib_dir.is_dir():
@@ -368,6 +378,7 @@ def _prepare_sources(venv: Path, env: dict[str, str]) -> None:
             future.result()
 
     _apply_patch_idempotent(sglang, _SGLANG_PATCH)
+    _apply_patch_idempotent(sglang, _SGLANG_WATCHDOG_PATCH)
 
     _run(
         [
@@ -472,6 +483,7 @@ def prepare(*, hosts: list[str], slm_root: Path) -> None:
     if core_libs and devel_lib.exists() and not devel_lib.is_symlink():
         devel_lib.unlink()
         devel_lib.symlink_to(core_libs[0])
+    ensure_rocm_openblas_link(site_packages)
     _deduplicate_rocm_sdk_libs(site_packages)
 
     rocm_devel = site_packages / "_rocm_sdk_devel"

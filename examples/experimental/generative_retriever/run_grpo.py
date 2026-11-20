@@ -28,6 +28,7 @@ from examples.experimental.generative_retriever.reward.relevance_model import (
     stage_local_relevance_source,
 )
 from examples.experimental.generative_retriever.reward.relevance_reward import REWARD_MODES
+from examples.experimental.generative_retriever.runtime.gr_config import RAY_GRPC_KEEPALIVE_ENV
 from examples.experimental.generative_retriever.runtime.prepare_rocm_env import (
     derive_sglang_mem_fraction,
     is_rocm,
@@ -35,6 +36,7 @@ from examples.experimental.generative_retriever.runtime.prepare_rocm_env import 
 )
 from examples.experimental.generative_retriever.runtime.prepare_sglang_bundle import require_sglang_abort_patch
 from examples.experimental.generative_retriever.runtime.training_common import (
+    PromptData,
     ScriptArgs,
     build_algorithm_args,
     build_optimizer_args,
@@ -43,7 +45,7 @@ from examples.experimental.generative_retriever.runtime.training_common import (
     prepare_prompt_data,
     required_directory,
 )
-from examples.experimental.generative_retriever.services.mapping_service import (
+from examples.experimental.generative_retriever.services.mapping_staging import (
     stage_local_doc2k_state,
     stage_local_mapping_dir,
 )
@@ -66,19 +68,7 @@ def _validate_gpu_topology(args: ScriptArgs) -> None:
         raise ValueError("Colocated single-node training requires all 8 GPUs for both rollout and learner")
 
 
-def execute(args: ScriptArgs) -> None:
-    if not os.environ.get("WANDB_API_KEY"):
-        raise RuntimeError(
-            "WANDB_API_KEY must be provided through the process environment "
-            "for generative retriever training"
-        )
-    require_sglang_abort_patch()
-    wandb_args = (
-        "--use-wandb "
-        "--wandb-project miles-run_grpo "
-        f"--wandb-group {shlex.quote(args.run_id)} "
-        "--disable-wandb-random-suffix "
-    )
+def _validate_single_node_args(args: ScriptArgs) -> tuple[str, str, str, str, Path, Path]:
     if args.reward_mode not in REWARD_MODES:
         raise ValueError(f"Unknown reward mode: {args.reward_mode!r}")
     _validate_gpu_topology(args)
@@ -99,9 +89,7 @@ def execute(args: ScriptArgs) -> None:
         raise ValueError("SGLang concurrency must fit at least one complete query group")
     total_rollout_samples = args.rollout_batch_size * args.n_samples_per_prompt
     if args.global_batch_size <= 0 or total_rollout_samples % args.global_batch_size != 0:
-        raise ValueError(
-            "rollout_batch_size * n_samples_per_prompt must be a positive multiple of global_batch_size"
-        )
+        raise ValueError("rollout_batch_size * n_samples_per_prompt must be a positive multiple of global_batch_size")
     if args.save_interval <= 0:
         raise ValueError("save_interval must be positive")
     prompt_source = absolute_path(os.path.expandvars(args.prompt_data))
@@ -109,6 +97,169 @@ def execute(args: ScriptArgs) -> None:
         raise FileNotFoundError(f"prompt data does not exist: {prompt_source}")
     if args.rollout_num_gpus % args.rollout_num_gpus_per_engine:
         raise ValueError("rollout_num_gpus must be divisible by rollout_num_gpus_per_engine")
+    return checkpoint, qwen_model, slm_root, relevance_model, mapping, prompt_source
+
+
+def _build_single_node_train_args(
+    args: ScriptArgs,
+    *,
+    bundle: Path,
+    prompt_data: PromptData,
+    checkpoint_dir: Path,
+) -> str:
+    quote = shlex.quote
+    effective_mbs = (
+        50 * args.n_samples_per_prompt
+        if (args.compact_train_ipc and args.micro_batch_size == 10 * args.n_samples_per_prompt)
+        else args.micro_batch_size
+    )
+    mem_fraction = (
+        args.sglang_mem_fraction_static
+        if args.sglang_mem_fraction_static > 0
+        else (
+            0.105
+            if args.compact_train_ipc
+            else derive_sglang_mem_fraction(
+                args.sglang_server_concurrency,
+                args.n_samples_per_prompt,
+                args.rollout_num_gpus,
+            )
+        )
+    )
+    rollout_fn_flag = (
+        "--rollout-function-path "
+        "examples.experimental.generative_retriever.model.local_coloc_rollout.GRLocalColocatedRolloutFn "
+        if args.local_coloc_rollout
+        else ""
+    )
+    sglang_args = shlex.join(build_sglang_args(args, mem_fraction, colocate=True)) + " "
+    optimizer_args = shlex.join(build_optimizer_args(args.lr)) + " "
+    grpo_args = shlex.join(build_algorithm_args()) + " "
+    wandb_args = (
+        f"--use-wandb --wandb-project miles-run_grpo --wandb-group {quote(args.run_id)} --disable-wandb-random-suffix "
+    )
+    learner_args = (
+        "--train-backend fsdp "
+        "--data-source-path examples.experimental.generative_retriever.index.data_source.GRRolloutDataSource "
+        "--custom-weight-sync-function-path "
+        "examples.experimental.generative_retriever.index.data_source.sync_mapping_on_weight_update "
+        "--custom-fsdp-model-factory-path "
+        "examples.experimental.generative_retriever.model.fsdp_policy.build_gr_stage5_policy "
+        "--weight-sync-include-prefixes encoder_list.0.model.encoder.model. docEnc2decoder. decoder. lm_head. "
+        "--update-weight-buffer-size 2147483648 "
+        f"--micro-batch-size {effective_mbs} "
+    )
+    checkpoint_args = (
+        f"--save {quote(os.fspath(checkpoint_dir))} "
+        f"{f'--load {quote(os.fspath(checkpoint_dir))} ' if args.resume else ''}"
+        f"--save-interval {args.save_interval} "
+    )
+    misc_args = (
+        "--colocate --no-offload-train --no-offload-rollout "
+        f"--actor-num-nodes 1 --actor-num-gpus-per-node {args.actor_num_gpus_per_node} "
+    )
+    rollout_args = (
+        f"--prompt-data {quote(os.fspath(prompt_data.path))} "
+        f"--input-key {quote(prompt_data.input_key)} "
+        f"{f'--label-key {quote(prompt_data.label_key)} ' if prompt_data.label_key else ''}"
+        f"{f'--metadata-key {quote(prompt_data.metadata_key)} ' if prompt_data.metadata_key else ''}"
+        f"--rollout-shuffle {rollout_fn_flag}"
+        "--custom-generate-function-path examples.experimental.generative_retriever.model.sglang_encode_generate.generate "
+        "--custom-rm-path examples.experimental.generative_retriever.reward.reward.reward "
+        "--custom-rollout-log-function-path examples.experimental.generative_retriever.reward.rollout_metrics.log_rollout "
+        "--custom-convert-samples-to-train-data-path "
+        "examples.experimental.generative_retriever.reward.rollout_metrics.convert_gr_samples_to_train_data "
+        f"--generative-retriever-reward-mode {args.reward_mode} "
+        f"--num-rollout {args.num_rollout} "
+        f"--rollout-batch-size {args.rollout_batch_size} "
+        f"--rollout-max-in-flight-groups {args.rollout_max_in_flight_groups} "
+        f"--n-samples-per-prompt {args.n_samples_per_prompt} "
+        "--rollout-max-response-len 4 --rollout-temperature 1.0 --rollout-top-p 1 "
+        f"--global-batch-size {args.global_batch_size} "
+    )
+    return (
+        f"--hf-checkpoint {quote(os.fspath(bundle))} "
+        f"{rollout_args}{optimizer_args}{grpo_args}{sglang_args}"
+        f"{learner_args}{checkpoint_args}{misc_args}{wandb_args}{args.extra_args}"
+    )
+
+
+def _run_rocm_single_node(args: ScriptArgs, node_ip: str, train_args: str, extra_env: dict[str, str]) -> None:
+    os.environ["RAY_ENABLE_UV_RUN_RUNTIME_ENV"] = "0"
+    ray_constants.RAY_ENABLE_UV_RUN_RUNTIME_ENV = False
+    os.environ.update(extra_env)
+    ray_port = 16389
+    ray_temp = f"/tmp/gr_1node_{hashlib.sha256(args.run_id.encode()).hexdigest()[:10]}"
+    head = Node(
+        RayParams(
+            node_ip_address=node_ip,
+            gcs_server_port=ray_port,
+            num_cpus=64,
+            num_gpus=args.num_gpus_per_node,
+            object_store_memory=128 * 2**30,
+            temp_dir=ray_temp,
+            include_dashboard=False,
+        ),
+        head=True,
+        shutdown_at_exit=True,
+        spawn_reaper=True,
+    )
+    try:
+        driver_code = "\n".join((
+            "import asyncio, json, os, sys, ray",
+            "from miles.utils.arguments import parse_args",
+            "from miles.utils.tracking_utils.tracking import finish_tracking",
+            "from train import train",
+            "ray.init(address=os.environ['RAY_ADDRESS'], "
+            "runtime_env={'env_vars': json.loads(os.environ['GR_RAY_RUNTIME_ENV_JSON'])})",
+            "args = parse_args()",
+            "try:",
+            "    asyncio.run(train(args))",
+            "finally:",
+            "    finish_tracking()",
+            "    ray.shutdown()",
+        ))
+        train_argv = [
+            sys.executable,
+            "-u",
+            "-c",
+            driver_code,
+            "--num-gpus-per-node",
+            str(args.num_gpus_per_node),
+            *shlex.split(train_args),
+        ]
+        child_env = {
+            **os.environ,
+            **extra_env,
+            "RAY_ADDRESS": f"{node_ip}:{ray_port}",
+            "GR_RAY_RUNTIME_ENV_JSON": json.dumps(extra_env),
+        }
+        log_dir = Path(f"/tmp/gr_logs_{args.run_id}")
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / "training.log"
+        with log_file.open("a", encoding="utf-8") as log_stream:
+            proc = subprocess.Popen(
+                train_argv,
+                cwd=_MILES_REPO_ROOT,
+                env=child_env,
+                stdout=log_stream,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            print(f"Started 8-GPU GRPO training pid={proc.pid}, log={log_file}", flush=True)
+            ret = proc.wait()
+            if ret != 0:
+                raise RuntimeError(f"train.py exited with code {ret}; see {log_file}")
+    finally:
+        head.kill_all_processes(check_alive=False, allow_graceful=True, wait=True)
+
+
+def execute(args: ScriptArgs) -> None:
+    if not os.environ.get("WANDB_API_KEY"):
+        raise RuntimeError("WANDB_API_KEY must be provided through the process environment for GR training")
+    require_sglang_abort_patch()
+    gr_cfg = args.build_gr_config()
+    checkpoint, qwen_model, slm_root, relevance_model, mapping, prompt_source = _validate_single_node_args(args)
 
     output_dir = expanded_path(args.output_dir, "output_dir", directory=False)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -118,25 +269,18 @@ def execute(args: ScriptArgs) -> None:
         if not tracker.is_file():
             raise FileNotFoundError(f"GR resume checkpoint tracker is missing: {tracker}")
         iteration = int(tracker.read_text().strip())
-        if iteration <= 0 or not (
-            checkpoint_dir / f"iter_{iteration:07d}" / "meta.json"
-        ).is_file():
+        if iteration <= 0 or not (checkpoint_dir / f"iter_{iteration:07d}" / "meta.json").is_file():
             raise ValueError(f"GR resume checkpoint is incomplete at iteration {iteration}")
-        if not (
-            checkpoint_dir / "rollout" / f"global_dataset_state_dict_{iteration - 1}.pt"
-        ).is_file():
+        if not (checkpoint_dir / "rollout" / f"global_dataset_state_dict_{iteration - 1}.pt").is_file():
             raise FileNotFoundError("GR resume requires the matching rollout dataset state")
-    prompt_data = prepare_prompt_data(
-        prompt_source,
-        output_dir / args.run_id / "prompt_data.jsonl",
-    )
+
+    prompt_data = prepare_prompt_data(prompt_source, output_dir / args.run_id / "prompt_data.jsonl")
     required_queries = args.num_rollout * args.rollout_batch_size
     if required_queries > prompt_data.sample_count:
         raise ValueError(
             "Fixed-step training must not reuse dataset rows implicitly: "
             f"num_rollout * rollout_batch_size requires {required_queries} queries, "
-            f"but the dataset contains {prompt_data.sample_count}. "
-            "Use an explicit epoch-based recipe to repeat the dataset."
+            f"but the dataset contains {prompt_data.sample_count}."
         )
     local_ckpt = str(stage_local_model_dir(checkpoint, "checkpoint"))
     local_qwen = str(stage_local_model_dir(qwen_model, "Qwen model"))
@@ -147,95 +291,27 @@ def execute(args: ScriptArgs) -> None:
     bundle = Path(f"/tmp/gr_sglang_bundle_{args.run_id}")
     quote = shlex.quote
     U.exec_command_cpu(
-        " ".join(
-            (
-                f"{quote(sys.executable)} -m examples.experimental.generative_retriever.runtime.prepare_sglang_bundle",
-                f"--checkpoint {quote(local_ckpt)}",
-                f"--qwen-model {quote(local_qwen)}",
-                f"--slm-root {quote(slm_root)}",
-                f"--id-mapping {quote(local_mapping)}",
-                f"--relevance-model {quote(local_relevance)}",
-                f"--reward-mode {quote(args.reward_mode)}",
-                f"--num-beams {args.n_samples_per_prompt}",
-                f"--num-return-sequences {args.n_samples_per_prompt}",
-                f"--output {quote(os.fspath(bundle))}",
-                f"--temperature {args.temperature}",
-                "--decoding-mode beam_sample",
-            )
-        )
+        " ".join((
+            f"{quote(sys.executable)} -m examples.experimental.generative_retriever.runtime.prepare_sglang_bundle",
+            f"--checkpoint {quote(local_ckpt)}",
+            f"--qwen-model {quote(local_qwen)}",
+            f"--slm-root {quote(slm_root)}",
+            f"--id-mapping {quote(local_mapping)}",
+            f"--relevance-model {quote(local_relevance)}",
+            f"--reward-mode {quote(args.reward_mode)}",
+            f"--num-beams {args.n_samples_per_prompt}",
+            f"--num-return-sequences {args.n_samples_per_prompt}",
+            f"--output {quote(os.fspath(bundle))}",
+            f"--temperature {args.temperature}",
+            "--decoding-mode beam_sample",
+        ))
     )
 
-    optimizer_args = shlex.join(build_optimizer_args(args.lr)) + " "
-    grpo_args = shlex.join(build_algorithm_args()) + " "
-    mem_fraction = (
-        args.sglang_mem_fraction_static
-        if args.sglang_mem_fraction_static > 0
-        else derive_sglang_mem_fraction(
-            args.sglang_server_concurrency,
-            args.n_samples_per_prompt,
-            args.rollout_num_gpus,
-        )
-    )
-    sglang_args = shlex.join(build_sglang_args(args, mem_fraction)) + " "
-    learner_args = (
-        "--train-backend fsdp "
-        "--data-source-path "
-        "examples.experimental.generative_retriever.index.data_source.GRRolloutDataSource "
-        "--custom-weight-sync-function-path "
-        "examples.experimental.generative_retriever.index.data_source.sync_mapping_on_weight_update "
-        "--custom-fsdp-model-factory-path "
-        "examples.experimental.generative_retriever.model.fsdp_policy.build_gr_stage5_policy "
-        "--weight-sync-include-prefixes "
-        "encoder_list.0.model.encoder.model. docEnc2decoder. decoder. lm_head. "
-        "--update-weight-buffer-size 2147483648 "
-        f"--micro-batch-size {args.micro_batch_size} "
-    )
-    checkpoint_args = (
-        f"--save {quote(os.fspath(checkpoint_dir))} "
-        f"{f'--load {quote(os.fspath(checkpoint_dir))} ' if args.resume else ''}"
-        f"--save-interval {args.save_interval} "
-    )
-    misc_args = (
-        "--colocate "
-        "--no-offload-train "
-        "--no-offload-rollout "
-        "--actor-num-nodes 1 "
-        f"--actor-num-gpus-per-node {args.actor_num_gpus_per_node} "
-    )
-    rollout_args = (
-        f"--prompt-data {quote(os.fspath(prompt_data.path))} "
-        f"--input-key {quote(prompt_data.input_key)} "
-        f"{f'--label-key {quote(prompt_data.label_key)} ' if prompt_data.label_key else ''}"
-        f"{f'--metadata-key {quote(prompt_data.metadata_key)} ' if prompt_data.metadata_key else ''}"
-        "--rollout-shuffle "
-        "--custom-generate-function-path "
-        "examples.experimental.generative_retriever.model.sglang_encode_generate.generate "
-        "--custom-rm-path examples.experimental.generative_retriever.reward.reward.reward "
-        "--custom-rollout-log-function-path "
-        "examples.experimental.generative_retriever.reward.rollout_metrics.log_rollout "
-        "--custom-convert-samples-to-train-data-path "
-        "examples.experimental.generative_retriever.reward.rollout_metrics.convert_gr_samples_to_train_data "
-        f"--generative-retriever-reward-mode {args.reward_mode} "
-        f"--num-rollout {args.num_rollout} "
-        f"--rollout-batch-size {args.rollout_batch_size} "
-        f"--rollout-max-in-flight-groups {args.rollout_max_in_flight_groups} "
-        f"--n-samples-per-prompt {args.n_samples_per_prompt} "
-        "--rollout-max-response-len 4 "
-        "--rollout-temperature 1.0 "
-        "--rollout-top-p 1 "
-        f"--global-batch-size {args.global_batch_size} "
-    )
-    train_args = (
-        f"--hf-checkpoint {quote(os.fspath(bundle))} "
-        f"{rollout_args}"
-        f"{optimizer_args}"
-        f"{grpo_args}"
-        f"{sglang_args}"
-        f"{learner_args}"
-        f"{checkpoint_args}"
-        f"{misc_args}"
-        f"{wandb_args}"
-        f"{args.extra_args}"
+    train_args = _build_single_node_train_args(
+        args,
+        bundle=bundle,
+        prompt_data=prompt_data,
+        checkpoint_dir=checkpoint_dir,
     )
     original_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     original_host_ip = os.environ.get("MILES_HOST_IP")
@@ -250,26 +326,14 @@ def execute(args: ScriptArgs) -> None:
         "GR_ID_MAPPING": local_mapping,
         "GR_RELEVANCE_MODEL": local_relevance,
         "GR_REWARD_MODE": args.reward_mode,
-        **{
-            k: os.environ[k]
-            for k in (
-                "GR_STEP_TEMPERATURES",
-                "GR_DOC2K_DEEP_CONSOLIDATE",
-                "GR_CAUSAL_TREE_CREDIT",
-                "GR_PM_PRIMARY_REWARD",
-                "GR_DISABLE_DOC2K",
-            )
-            if k in os.environ
-        },
-        "SGLANG_EXTERNAL_MODEL_PACKAGE": (
-            "examples.experimental.generative_retriever.sglang_models"
-        ),
+        **gr_cfg.to_env_dict(),
+        **RAY_GRPC_KEEPALIVE_ENV,
+        "SGLANG_EXTERNAL_MODEL_PACKAGE": "examples.experimental.generative_retriever.sglang_models",
         "SGLANG_USE_AITER": "0",
         "MILES_HOST_IP": node_ip,
         "MASTER_ADDR": node_ip,
         "PYTHONPATH": f"{_MILES_REPO_ROOT}:" + ":".join(
-            p for p in os.environ.get("PYTHONPATH", "").split(":")
-            if p and "/opt/venv" not in p
+            p for p in os.environ.get("PYTHONPATH", "").split(":") if p and "/opt/venv" not in p
         ),
         "no_proxy": no_proxy_hosts,
         "NO_PROXY": no_proxy_hosts,
@@ -277,76 +341,7 @@ def execute(args: ScriptArgs) -> None:
     }
     try:
         if is_rocm():
-            os.environ["RAY_ENABLE_UV_RUN_RUNTIME_ENV"] = "0"
-            ray_constants.RAY_ENABLE_UV_RUN_RUNTIME_ENV = False
-            os.environ.update(extra_env)
-            ray_port = 16389
-            ray_temp = f"/tmp/gr_1node_{hashlib.sha256(args.run_id.encode()).hexdigest()[:10]}"
-            head = Node(
-                RayParams(
-                    node_ip_address=node_ip,
-                    gcs_server_port=ray_port,
-                    num_cpus=64,
-                    num_gpus=args.num_gpus_per_node,
-                    object_store_memory=128 * 2**30,
-                    temp_dir=ray_temp,
-                    include_dashboard=False,
-                ),
-                head=True,
-                shutdown_at_exit=True,
-                spawn_reaper=True,
-            )
-            try:
-                driver_code = "\n".join((
-                    "import asyncio, json, os, sys, ray",
-                    "from miles.utils.arguments import parse_args",
-                    "from miles.utils.tracking_utils.tracking import finish_tracking",
-                    "from train import train",
-                    "ray.init(address=os.environ['RAY_ADDRESS'], "
-                    "runtime_env={'env_vars': json.loads(os.environ['GR_RAY_RUNTIME_ENV_JSON'])})",
-                    "args = parse_args()",
-                    "try:",
-                    "    asyncio.run(train(args))",
-                    "finally:",
-                    "    finish_tracking()",
-                    "    ray.shutdown()",
-                ))
-                train_argv = [
-                    sys.executable,
-                    "-u",
-                    "-c",
-                    driver_code,
-                    "--num-gpus-per-node",
-                    str(args.num_gpus_per_node),
-                    *shlex.split(train_args),
-                ]
-                child_env = {
-                    **os.environ,
-                    **extra_env,
-                    "RAY_ADDRESS": f"{node_ip}:{ray_port}",
-                    "GR_RAY_RUNTIME_ENV_JSON": json.dumps(extra_env),
-                }
-                log_dir = Path(f"/tmp/gr_logs_{args.run_id}")
-                log_dir.mkdir(parents=True, exist_ok=True)
-                log_file = log_dir / "training.log"
-                with log_file.open("a", encoding="utf-8") as log_stream:
-                    proc = subprocess.Popen(
-                        train_argv,
-                        cwd=_MILES_REPO_ROOT,
-                        env=child_env,
-                        stdout=log_stream,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                    )
-                    print(
-                        f"Started 8-GPU GRPO training pid={proc.pid}, log={log_file}",
-                        flush=True,
-                    )
-                    ret = proc.wait()
-                    if ret != 0:
-                        raise RuntimeError(f"train.py exited with code {ret}; see {log_file}")
-            finally:
-                head.kill_all_processes(check_alive=False, allow_graceful=True, wait=True)
+            _run_rocm_single_node(args, node_ip, train_args, extra_env)
         else:
             U.execute_train(
                 train_args=train_args,

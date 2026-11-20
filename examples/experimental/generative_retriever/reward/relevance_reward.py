@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from dataclasses import dataclass
 import math
 import os
-from dataclasses import dataclass
-from collections.abc import Mapping
 from typing import Literal
+
+from examples.experimental.generative_retriever.runtime.gr_config import DocidDenomMode, GRConfig
 
 RewardMode = Literal["continuous_relevance_unique", "discrete_relevance_unique"]
 REWARD_MODES: tuple[RewardMode, ...] = ("continuous_relevance_unique", "discrete_relevance_unique")
@@ -41,7 +43,27 @@ TREE_CREDIT_LEVEL_WEIGHT = 0.25
 
 
 def is_doc2k_disabled() -> bool:
-    return os.environ.get("GR_DISABLE_DOC2K") == "1"
+    if os.environ.get("GR_DISABLE_DOC2K") == "1":
+        return True
+    return GRConfig.from_env().doc2k_disabled
+
+
+def docid_denominator(
+    bucket_len: int,
+    *,
+    denom_mode: DocidDenomMode = "sqrt_floor",
+    k_floor: int = DOCID_REWARD_FLOOR,
+) -> float:
+    """Compute bucket reward denominator under the configured mode."""
+    if k_floor <= 0:
+        raise ValueError("k_floor must be positive")
+    if denom_mode == "linear_floor":
+        return float(max(bucket_len, k_floor))
+    if denom_mode == "sqrt_floor":
+        return math.sqrt(float(k_floor) * float(max(bucket_len, k_floor)))
+    if denom_mode == "unit":
+        return 1.0
+    raise ValueError(f"Unknown docid_denom_mode: {denom_mode!r}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +119,7 @@ def calculate_reward(
     is_sm_unique: bool,
     mode: RewardMode = "discrete_relevance_unique",
     keyword_frequency: int = 1,
+    unique_weight: float = UNIQUE_WEIGHT,
 ) -> RewardBreakdown:
     """Combine PM/SM with per-head keyword novelty against the baseline sets."""
     if not isinstance(is_pm_unique, bool) or not isinstance(is_sm_unique, bool):
@@ -117,8 +140,8 @@ def calculate_reward(
     sm_unique_eligible = is_sm_unique and bool(sm_pass)
     unique_eligible = pm_unique_eligible or sm_unique_eligible
     combined_unique = is_pm_unique and is_sm_unique
-    pm_unique_bonus = 0.5 * UNIQUE_WEIGHT * relevance_quality if pm_unique_eligible else 0.0
-    sm_unique_bonus = 0.5 * UNIQUE_WEIGHT * relevance_quality if sm_unique_eligible else 0.0
+    pm_unique_bonus = 0.5 * unique_weight * relevance_quality if pm_unique_eligible else 0.0
+    sm_unique_bonus = 0.5 * unique_weight * relevance_quality if sm_unique_eligible else 0.0
     unique_bonus = pm_unique_bonus + sm_unique_bonus
     discrete_total = discrete_base + unique_bonus
     continuous_total = continuous_base + unique_bonus
@@ -189,6 +212,9 @@ def score_and_summarize_docid(
     mode: RewardMode = "discrete_relevance_unique",
     keyword_frequencies: Mapping[str, int] | None = None,
     k_floor: int = DOCID_REWARD_FLOOR,
+    denom_mode: DocidDenomMode = "sqrt_floor",
+    unique_weight: float = UNIQUE_WEIGHT,
+    pm_prune_only: bool = True,
 ) -> tuple[float, dict[str, float], list[str], list[str]]:
     """Compute docID reward, summary metrics, and doc2k edge sets without per-keyword object allocation."""
     if mode not in REWARD_MODES:
@@ -199,11 +225,6 @@ def score_and_summarize_docid(
     base_pm = baseline.pm
     base_sm = baseline.sm
     is_cont = mode == "continuous_relevance_unique"
-    pm_primary = os.environ.get("GR_PM_PRIMARY_REWARD") == "1"
-    w_pm_base = 1.5 if pm_primary else 1.0
-    w_sm_base = 0.5 if pm_primary else 1.0
-    w_pm_uniq = 0.75 if pm_primary else 0.5
-    w_sm_uniq = 0.25 if pm_primary else 0.5
 
     sum_pm = 0.0
     sum_sm = 0.0
@@ -243,8 +264,8 @@ def score_and_summarize_docid(
         s_ok = sm_f >= SM_THRESHOLD
         pm_p = 1.0 if p_ok else 0.0
         sm_p = 1.0 if s_ok else 0.0
-        disc_b = w_pm_base * pm_p + w_sm_base * sm_p
-        cont_b = w_pm_base * norm_pm + w_sm_base * norm_sm
+        disc_b = pm_p + sm_p
+        cont_b = norm_pm + norm_sm
         rel_q = (norm_pm + norm_sm) * 0.5
 
         u_pm = kw not in base_pm
@@ -254,8 +275,8 @@ def score_and_summarize_docid(
         u_el = pm_u_el or sm_u_el
         rel_el = p_ok or s_ok
 
-        pm_ub = (w_pm_uniq * UNIQUE_WEIGHT * rel_q) if pm_u_el else 0.0
-        sm_ub = (w_sm_uniq * UNIQUE_WEIGHT * rel_q) if sm_u_el else 0.0
+        pm_ub = (0.5 * unique_weight * rel_q) if pm_u_el else 0.0
+        sm_ub = (0.5 * unique_weight * rel_q) if sm_u_el else 0.0
         ub = pm_ub + sm_ub
         disc_t = disc_b + ub
         cont_t = cont_b + ub
@@ -290,7 +311,7 @@ def score_and_summarize_docid(
             cnt_any_uniq += 1
         if rel_el:
             cnt_rel_elig += 1
-            if not pm_primary or p_ok:
+            if not pm_prune_only or p_ok:
                 passed_keywords.append(kw)
         if p_ok and s_ok and u_pm and u_sm:
             unique_good_keywords.append(kw)
@@ -330,7 +351,7 @@ def score_and_summarize_docid(
         "unique_quality": (sum_uniq_qual / float(cnt_any_uniq)) if cnt_any_uniq else 0.0,
         "train_total": mean_reward,
     }
-    docid_value = sum_reward / float(max(len(keywords), k_floor))
+    docid_value = sum_reward / docid_denominator(len(keywords), denom_mode=denom_mode, k_floor=k_floor)
     return docid_value, metrics, passed_keywords, unique_good_keywords
 
 
@@ -340,6 +361,7 @@ def calculate_keyword_rewards(
     *,
     mode: RewardMode = "discrete_relevance_unique",
     keyword_frequencies: Mapping[str, int] | None = None,
+    unique_weight: float = UNIQUE_WEIGHT,
 ) -> dict[str, RewardBreakdown]:
     if mode not in REWARD_MODES:
         raise ValueError(f"Unknown reward mode: {mode!r}")
@@ -355,6 +377,7 @@ def calculate_keyword_rewards(
             is_sm_unique=keyword not in baseline.sm,
             mode=mode,
             keyword_frequency=freq,
+            unique_weight=unique_weight,
         )
     return results
 
@@ -366,8 +389,10 @@ def calculate_docid_reward(
     mode: RewardMode = "discrete_relevance_unique",
     keyword_frequencies: Mapping[str, int] | None = None,
     k_floor: int = DOCID_REWARD_FLOOR,
+    denom_mode: DocidDenomMode = "sqrt_floor",
+    unique_weight: float = UNIQUE_WEIGHT,
 ) -> float:
-    """Aggregate rewards over distinct keyword texts belonging to one doc ID with floor denominator."""
+    """Aggregate rewards over distinct keyword texts belonging to one doc ID."""
     if not keyword_scores:
         raise ValueError("Doc ID reward requires at least one keyword")
     if k_floor <= 0:
@@ -377,6 +402,7 @@ def calculate_docid_reward(
         baseline,
         mode=mode,
         keyword_frequencies=keyword_frequencies,
+        unique_weight=unique_weight,
     )
-    denominator = max(len(rewards), k_floor)
-    return math.fsum(result.reward for result in rewards.values()) / float(denominator)
+    denom = docid_denominator(len(rewards), denom_mode=denom_mode, k_floor=k_floor)
+    return math.fsum(result.reward for result in rewards.values()) / denom

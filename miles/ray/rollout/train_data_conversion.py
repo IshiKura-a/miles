@@ -493,6 +493,11 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
 def process_rollout_data_shard(args, rollout_data):
     """Train-side completion of the DP split: drop the ``partition`` key and
     reorder the batch-global ``total_lengths`` into this shard's row order."""
+    if rollout_data.get("compact_token_shard"):
+        total_lengths = rollout_data["token_lengths_i32"].tolist()
+        rollout_data["total_lengths"] = total_lengths
+        cast(Any, Timer()).seq_lens = total_lengths
+        return rollout_data
     partition = rollout_data.pop("partition", None)
     total_lengths = rollout_data["total_lengths"]
 
