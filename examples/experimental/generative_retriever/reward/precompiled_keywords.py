@@ -196,8 +196,7 @@ class FastPrecompileScorer:
             kw_degrees=kw_degrees,
             tag=kw_store.tag,
             enabled=gr_config.hbm_kw_cache_enabled,
-            reserve_gib=gr_config.hbm_kw_reserve_gib,
-            max_gib=gr_config.hbm_kw_max_gib,
+            memory_fraction=gr_config.hbm_kw_memory_fraction,
             explicit_gib=gr_config.hbm_kw_explicit_gib,
         )
         self._query_cache: LRUCache[str, torch.Tensor] = LRUCache(65_536)

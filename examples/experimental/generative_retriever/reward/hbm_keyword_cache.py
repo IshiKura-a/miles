@@ -10,8 +10,7 @@ import numpy as np
 import torch
 
 from examples.experimental.generative_retriever.runtime.gr_config import (
-    DEFAULT_HBM_KW_MAX_GIB,
-    DEFAULT_HBM_KW_RESERVE_GIB,
+    DEFAULT_HBM_KW_MEMORY_FRACTION,
 )
 
 _BYTES_PER_GIB = 1024**3
@@ -50,21 +49,30 @@ def resolve_hbm_budget_bytes(
     *,
     num_keywords: int,
     enabled: bool = True,
-    reserve_gib: float = DEFAULT_HBM_KW_RESERVE_GIB,
-    max_gib: float = DEFAULT_HBM_KW_MAX_GIB,
+    memory_fraction: float = DEFAULT_HBM_KW_MEMORY_FRACTION,
     explicit_gib: float | None = None,
 ) -> int:
     if not enabled or device.type != "cuda":
         return 0
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
     index_bytes = num_keywords * 4
-    if explicit_gib is not None:
-        return max(0, int(explicit_gib * _BYTES_PER_GIB) - index_bytes)
-    free_bytes, _ = torch.cuda.mem_get_info(device)
-    usable = min(int(max_gib * _BYTES_PER_GIB), int(free_bytes - reserve_gib * _BYTES_PER_GIB)) - index_bytes
+    raw_target_bytes = (
+        int(explicit_gib * _BYTES_PER_GIB)
+        if explicit_gib is not None
+        else int(total_bytes * memory_fraction)
+    )
+    usable = raw_target_bytes - index_bytes
     granularity = 2 * _BYTES_PER_GIB
     if usable < granularity:
         return 0
-    return (usable // granularity) * granularity
+    budget_bytes = (usable // granularity) * granularity
+    required_bytes = budget_bytes + index_bytes
+    if free_bytes < required_bytes:
+        raise RuntimeError(
+            f"Insufficient GPU HBM on {device} for deterministic keyword cache: "
+            f"required {required_bytes / _BYTES_PER_GIB:.2f} GiB, free {free_bytes / _BYTES_PER_GIB:.2f} GiB"
+        )
+    return budget_bytes
 
 
 class HbmKeywordCache:
@@ -82,8 +90,7 @@ class HbmKeywordCache:
         kw_degrees: np.ndarray | None = None,
         tag: str = "part25",
         enabled: bool = True,
-        reserve_gib: float = DEFAULT_HBM_KW_RESERVE_GIB,
-        max_gib: float = DEFAULT_HBM_KW_MAX_GIB,
+        memory_fraction: float = DEFAULT_HBM_KW_MEMORY_FRACTION,
         explicit_gib: float | None = None,
     ) -> None:
         self._mmap = mmap_u16
@@ -97,8 +104,7 @@ class HbmKeywordCache:
             device,
             num_keywords=num_keywords,
             enabled=enabled,
-            reserve_gib=reserve_gib,
-            max_gib=max_gib,
+            memory_fraction=memory_fraction,
             explicit_gib=explicit_gib,
         )
         total_slots = min(num_keywords, budget_bytes // row_bytes) if budget_bytes > 0 else 0

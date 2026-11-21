@@ -21,8 +21,7 @@ UNIQUE_ANNEAL_MODES: tuple[UniqueAnnealMode, ...] = ("none", "off", "linear", "c
 GR_CONFIG_ENV_VAR = "GR_CONFIG_JSON"
 DEFAULT_STEP_TEMPERATURES: tuple[float, float, float, float] = (0.2, 0.25, 0.6, 0.8)
 DEFAULT_SGLANG_WATCHDOG_TIMEOUT_SECONDS = 600
-DEFAULT_HBM_KW_RESERVE_GIB = 96.0
-DEFAULT_HBM_KW_MAX_GIB = 42.0
+DEFAULT_HBM_KW_MEMORY_FRACTION = 0.20
 
 RAY_GRPC_KEEPALIVE_ENV: dict[str, str] = {
     "RAY_grpc_client_idle_timeout_ms": "36000000",
@@ -75,8 +74,7 @@ class GRConfig:
     grouped_cross_attention: bool = True
     tree_query_chunk_size: int = 128
     hbm_kw_cache_enabled: bool = True
-    hbm_kw_reserve_gib: float = DEFAULT_HBM_KW_RESERVE_GIB
-    hbm_kw_max_gib: float = DEFAULT_HBM_KW_MAX_GIB
+    hbm_kw_memory_fraction: float = DEFAULT_HBM_KW_MEMORY_FRACTION
     hbm_kw_explicit_gib: float | None = None
 
     def __post_init__(self) -> None:
@@ -92,6 +90,8 @@ class GRConfig:
             raise ValueError("unique_weight_start and unique_weight_end must be non-negative")
         if not (0.0 <= self.unique_anneal_warmup_ratio < 1.0):
             raise ValueError("unique_anneal_warmup_ratio must be in [0.0, 1.0)")
+        if not (0.0 <= self.hbm_kw_memory_fraction < 1.0):
+            raise ValueError("hbm_kw_memory_fraction must be in [0.0, 1.0)")
 
     @property
     def doc2k_disabled(self) -> bool:

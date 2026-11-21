@@ -18,8 +18,7 @@ from examples.experimental.generative_retriever.reward.relevance_reward import (
     RewardMode,
 )
 from examples.experimental.generative_retriever.runtime.gr_config import (
-    DEFAULT_HBM_KW_MAX_GIB,
-    DEFAULT_HBM_KW_RESERVE_GIB,
+    DEFAULT_HBM_KW_MEMORY_FRACTION,
     DEFAULT_SGLANG_WATCHDOG_TIMEOUT_SECONDS,
     Doc2kMode,
     DocidDenomMode,
@@ -110,8 +109,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     grouped_cross_attention: bool = True
     tree_query_chunk_size: int = 128
     hbm_kw_cache_enabled: bool = True
-    hbm_kw_reserve_gib: float = DEFAULT_HBM_KW_RESERVE_GIB
-    hbm_kw_max_gib: float = DEFAULT_HBM_KW_MAX_GIB
+    hbm_kw_memory_fraction: float = DEFAULT_HBM_KW_MEMORY_FRACTION
     hbm_kw_explicit_gib: float | None = None
     lr: float = 2e-6
     save_interval: int = 5
@@ -136,8 +134,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
             grouped_cross_attention=self.grouped_cross_attention,
             tree_query_chunk_size=self.tree_query_chunk_size,
             hbm_kw_cache_enabled=self.hbm_kw_cache_enabled,
-            hbm_kw_reserve_gib=self.hbm_kw_reserve_gib,
-            hbm_kw_max_gib=self.hbm_kw_max_gib,
+            hbm_kw_memory_fraction=self.hbm_kw_memory_fraction,
             hbm_kw_explicit_gib=self.hbm_kw_explicit_gib,
         )
 

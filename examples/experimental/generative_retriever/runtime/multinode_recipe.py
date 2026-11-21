@@ -70,7 +70,7 @@ def build_multinode_recipe(
         if template.sglang_mem_fraction_static > 0
         else (min(derived_mem, 0.18) if template.compact_train_ipc else derived_mem)
     )
-    default_mbs = (100 if template.compact_train_ipc else 10) * SAMPLES_PER_PROMPT
+    default_mbs = (50 if template.compact_train_ipc else 10) * SAMPLES_PER_PROMPT
     mbs = (
         template.micro_batch_size
         if base_args is not None and template.micro_batch_size != ScriptArgs.micro_batch_size
