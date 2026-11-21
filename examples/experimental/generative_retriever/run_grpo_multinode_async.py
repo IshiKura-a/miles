@@ -14,8 +14,6 @@ Only processes started for this run are stopped on exit.
 
 from __future__ import annotations
 
-from examples.experimental.generative_retriever.utils.paths import absolute_path, symlink_target
-
 import argparse
 import asyncio
 from dataclasses import replace
@@ -52,7 +50,6 @@ from examples.experimental.generative_retriever.reward.relevance_reward import (
 )
 from examples.experimental.generative_retriever.runtime.gr_config import (
     DOC2K_MODES,
-    DOCID_DENOM_MODES,
     UNIQUE_ANNEAL_MODES,
     apply_ray_keepalive_env,
 )
@@ -86,6 +83,7 @@ from examples.experimental.generative_retriever.services.mapping_staging import 
     stage_local_doc2k_state,
     stage_local_mapping_dir,
 )
+from examples.experimental.generative_retriever.utils.paths import absolute_path, symlink_target
 from miles.utils.external_utils.command_utils import create_run_id
 
 _REPO = Path(__file__).absolute().parents[3]
@@ -301,6 +299,7 @@ def run_worker(manifest: Manifest, index: int) -> None:
 
 
 def run_training(manifest: Manifest) -> None:
+    # Deferred import avoids Megatron/FSDP startup cost in supervisor, _worker, and _prepare_assets processes.
     from miles.utils.arguments import parse_args
     from miles.utils.tracking_utils.tracking import finish_tracking
     from train import train
@@ -415,13 +414,13 @@ def main() -> None:
     parser.add_argument("--num-rollout", type=int)
     parser.add_argument("--save-interval", type=int, default=ScriptArgs.save_interval)
     parser.add_argument("--step-temperatures", default=ScriptArgs.step_temperatures)
-    parser.add_argument("--docid-denom-mode", choices=DOCID_DENOM_MODES, default=ScriptArgs.docid_denom_mode)
     parser.add_argument("--doc2k-mode", choices=DOC2K_MODES, default=ScriptArgs.doc2k_mode)
     parser.add_argument("--unique-anneal-mode", choices=UNIQUE_ANNEAL_MODES, default=ScriptArgs.unique_anneal_mode)
     parser.add_argument("--unique-weight-start", type=float, default=ScriptArgs.unique_weight_start)
     parser.add_argument("--unique-weight-end", type=float, default=ScriptArgs.unique_weight_end)
     parser.add_argument("--unique-anneal-warmup-ratio", type=float, default=ScriptArgs.unique_anneal_warmup_ratio)
-    parser.add_argument("--no-causal-tree-credit", action="store_true")
+    parser.add_argument("--micro-batch-size", type=int, default=ScriptArgs.micro_batch_size)
+    parser.add_argument("--hbm-kw-memory-fraction", type=float, default=ScriptArgs.hbm_kw_memory_fraction)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
@@ -453,13 +452,13 @@ def main() -> None:
         ScriptArgs(),
         save_interval=cli.save_interval,
         step_temperatures=cli.step_temperatures,
-        docid_denom_mode=cli.docid_denom_mode,
         doc2k_mode=cli.doc2k_mode,
         unique_anneal_mode=cli.unique_anneal_mode,
         unique_weight_start=cli.unique_weight_start,
         unique_weight_end=cli.unique_weight_end,
         unique_anneal_warmup_ratio=cli.unique_anneal_warmup_ratio,
-        causal_tree_credit=not cli.no_causal_tree_credit,
+        micro_batch_size=cli.micro_batch_size,
+        hbm_kw_memory_fraction=cli.hbm_kw_memory_fraction,
     )
     args = build_multinode_recipe(
         cli.run_id,

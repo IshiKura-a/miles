@@ -26,7 +26,7 @@ from examples.experimental.generative_retriever.reward.relevance_reward import (
     PM_THRESHOLD,
     SM_THRESHOLD,
 )
-from examples.experimental.generative_retriever.runtime.gr_config import DocidDenomMode, GRConfig
+from examples.experimental.generative_retriever.runtime.gr_config import GRConfig
 from examples.experimental.generative_retriever.services.lru_cache import LRUCache
 from examples.experimental.generative_retriever.services.mapping_service import ResidentMapping
 
@@ -42,20 +42,8 @@ def gpu_not_in_sorted(keys_i64: torch.Tensor, sorted_set_i64: torch.Tensor) -> t
     return (pos >= n_set) | (sorted_set_i64[clamped] != keys_i64)
 
 
-def docid_denominator_gpu(
-    lens_f64: torch.Tensor,
-    *,
-    denom_mode: DocidDenomMode,
-    k_floor: int,
-) -> torch.Tensor:
-    floor_f = float(k_floor)
-    if denom_mode == "linear_floor":
-        return lens_f64.clamp_min(floor_f)
-    if denom_mode == "sqrt_floor":
-        return torch.sqrt(floor_f * lens_f64.clamp_min(floor_f))
-    if denom_mode == "unit":
-        return torch.ones_like(lens_f64)
-    raise ValueError(f"Unknown docid_denom_mode: {denom_mode!r}")
+def docid_denominator_gpu(lens_f64: torch.Tensor) -> torch.Tensor:
+    return torch.sqrt(lens_f64.clamp_min(1.0))
 
 
 def pack_vk_sorted(sets_per_v: list[frozenset[int]], device: torch.device) -> torch.Tensor:
@@ -90,7 +78,30 @@ def _populate_missing_baselines(
         kids_sl = base_edge_kid_np[st:ed]
         full_pm = frozenset(int(x) for x in kids_sl[base_pm_ok_np[st:ed]].tolist())
         full_sm = frozenset(int(x) for x in kids_sl[base_sm_ok_np[st:ed]].tolist())
-        baseline_kid_cache.put(q_str, BaselineKidSets(pm=full_pm, sm=full_sm))
+        total_u = int(np.unique(kids_sl).size)
+        baseline_kid_cache.put(q_str, BaselineKidSets(pm=full_pm, sm=full_sm, total_unique_kids=total_u))
+
+
+def compute_dinkelbach_watermarks_gpu(
+    *,
+    num_queries: int,
+    edge_query_idx: torch.Tensor,
+    inv_freq: torch.Tensor,
+    pm_pass: torch.Tensor,
+    sm_pass: torch.Tensor,
+    base_p_pm: torch.Tensor,
+    base_p_sm: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute per-query ``(p_ref_pm, p_ref_sm)`` self-ratcheting Dinkelbach watermarks."""
+    if edge_query_idx.numel() == 0:
+        return base_p_pm, base_p_sm
+    grp_u_cols = torch.stack((inv_freq, pm_pass * inv_freq, sm_pass * inv_freq), dim=1)
+    grp_u_sums = torch.zeros((num_queries, 3), dtype=torch.float64, device=inv_freq.device)
+    grp_u_sums.index_add_(0, edge_query_idx, grp_u_cols)
+    denom_u = grp_u_sums[:, 0].clamp_min(1.0)
+    p_ref_pm = torch.maximum(base_p_pm, grp_u_sums[:, 1] / denom_u)
+    p_ref_sm = torch.maximum(base_p_sm, grp_u_sums[:, 2] / denom_u)
+    return p_ref_pm, p_ref_sm
 
 
 def _reduce_edge_metrics_gpu(
@@ -104,8 +115,10 @@ def _reduce_edge_metrics_gpu(
     pm_sm_pol: torch.Tensor,
     sorted_bpm_gpu: torch.Tensor,
     sorted_bsm_gpu: torch.Tensor,
+    base_p_pm_gpu: torch.Tensor,
+    base_p_sm_gpu: torch.Tensor,
     gr_config: GRConfig,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, torch.Tensor, torch.Tensor, torch.Tensor]:
     device = pol_lens_gpu.device
     n_samples = n_valid * group_size
     e_pol = int(pol_edge_kid_gpu.numel())
@@ -143,6 +156,17 @@ def _reduce_edge_metrics_gpu(
 
     is_cont = gr_config.reward_mode == "continuous_relevance_unique"
     base_raw = cont_b if is_cont else disc_b
+    if e_pol > 0:
+        p_ref_pm, p_ref_sm = compute_dinkelbach_watermarks_gpu(
+            num_queries=n_valid,
+            edge_query_idx=pol_edge_v_gpu,
+            inv_freq=inv_freq,
+            pm_pass=pm_p,
+            sm_pass=sm_p,
+            base_p_pm=base_p_pm_gpu,
+            base_p_sm=base_p_sm_gpu,
+        )
+        base_raw = base_raw - (p_ref_pm + p_ref_sm)[pol_edge_v_gpu]
     base_rew = base_raw * inv_freq
     unit_ub_rew = unit_ub * inv_freq
 
@@ -182,11 +206,7 @@ def _reduce_edge_metrics_gpu(
     if e_pol > 0:
         sample_sums.index_add_(0, pol_edge_s_gpu, edge_cols)
 
-    denom_f64 = docid_denominator_gpu(
-        pol_lens_gpu.to(torch.float64),
-        denom_mode=gr_config.docid_denom_mode,
-        k_floor=gr_config.docid_reward_floor,
-    )
+    denom_f64 = docid_denominator_gpu(pol_lens_gpu.to(torch.float64))
     base_docid_np = (sample_sums[:, 16] / denom_f64).view(n_valid, group_size).detach().cpu().numpy().astype(np.float32)
     unit_ub_docid_np = (sample_sums[:, 26] / denom_f64).view(n_valid, group_size).detach().cpu().numpy().astype(np.float32)
     sample_has_pm_np = (sample_sums[:, 2] > 0.0).view(n_valid, group_size).detach().cpu().numpy()
@@ -205,7 +225,7 @@ def _reduce_edge_metrics_gpu(
         .astype(np.float32)
     )
     ug_mask = p_ok & s_ok & u_pm & u_sm
-    return base_docid_np, unit_ub_docid_np, group_acc_np, sample_has_pm_np, p_ok, rel_el, ug_mask, pol_edge_kid_gpu
+    return base_docid_np, unit_ub_docid_np, group_acc_np, sample_has_pm_np, p_ok, ug_mask, pol_edge_kid_gpu
 
 
 def accumulate_batch_doc2k_votes(
@@ -215,13 +235,11 @@ def accumulate_batch_doc2k_votes(
     pol_edge_s_gpu: torch.Tensor,
     pol_edge_kid_gpu: torch.Tensor,
     p_ok: torch.Tensor,
-    rel_el: torch.Tensor,
     ug_mask: torch.Tensor,
     sample_has_pm_np: np.ndarray,
     token_logprobs: torch.Tensor,
     valid_rows: list[int],
     group_size: int,
-    gr_config: GRConfig,
 ) -> Doc2kVoteDelta:
     """Extract fat-bucket survival edges and head-enrichment votes into a compact ``Doc2kVoteDelta``."""
     delta = Doc2kVoteDelta()
@@ -231,10 +249,9 @@ def accumulate_batch_doc2k_votes(
     r_offs[0] = 0
     np.cumsum(pol_lens_np, out=r_offs[1:])
 
-    pass_mask = p_ok if gr_config.pm_prune_only else rel_el
     fat_sample_mask_gpu = torch.from_numpy(pol_lens_np > DOC2K_PRUNE_FLOOR).to(device=p_ok.device)
     if pol_edge_s_gpu.numel() > 0:
-        fp_idx = torch.nonzero(pass_mask & fat_sample_mask_gpu[pol_edge_s_gpu], as_tuple=False).squeeze(-1)
+        fp_idx = torch.nonzero(p_ok & fat_sample_mask_gpu[pol_edge_s_gpu], as_tuple=False).squeeze(-1)
         fp_s_np = pol_edge_s_gpu[fp_idx].detach().cpu().numpy()
         fp_kid_np = pol_edge_kid_gpu[fp_idx].detach().cpu().numpy()
         ug_idx = torch.nonzero(ug_mask, as_tuple=False).squeeze(-1)
@@ -246,8 +263,7 @@ def accumulate_batch_doc2k_votes(
 
     fp_bounds = np.searchsorted(fp_s_np, np.arange(n_valid * group_size + 1))
     ug_bounds = np.searchsorted(ug_s_np, np.arange(n_valid * group_size + 1))
-    rel_guided = gr_config.doc2k_relevance_guided
-    lp_np_all = token_logprobs[valid_rows].detach().cpu().numpy().sum(axis=-1) if rel_guided else None
+    lp_np_all = token_logprobs[valid_rows].detach().cpu().numpy().sum(axis=-1)
     head_cutoff = compute_head_cutoff(group_size)
     can_enrich = group_size >= DOC2K_MIN_GROUP_SAMPLES and group_size > head_cutoff
 
@@ -273,11 +289,7 @@ def accumulate_batch_doc2k_votes(
 
         if not can_enrich or int(ug_bounds[s_base + group_size]) == int(ug_bounds[s_base]):
             continue
-        head_indices, tail_indices = partition_head_and_tail_indices(
-            group_size,
-            lp_np_all[v] if lp_np_all is not None else None,
-            relevance_guided=rel_guided,
-        )
+        head_indices, tail_indices = partition_head_and_tail_indices(group_size, lp_np_all[v])
         head_chunks = [all_kids_cpu[r_offs[s_base + hi] : r_offs[s_base + hi + 1]] for hi in head_indices]
         head_kids_set = set(np.concatenate(head_chunks).tolist()) if head_chunks else set()
         tail_ug_slices = [ug_kid_np[int(ug_bounds[s_base + ti]) : int(ug_bounds[s_base + ti + 1])] for ti in tail_indices]
@@ -289,9 +301,7 @@ def accumulate_batch_doc2k_votes(
             tail_indices=tail_indices,
             head_kids_set=head_kids_set,
             tail_unique_good_kids=tail_ug_slices,
-            relevance_guided=rel_guided,
             delta=delta,
-            k_floor=gr_config.docid_reward_floor,
         )
     return delta
 
@@ -418,11 +428,16 @@ def score_batch_gpu_vectorized(
 
     base_pm_list: list[frozenset[int]] = []
     base_sm_list: list[frozenset[int]] = []
+    base_p_pm_vals: list[float] = []
+    base_p_sm_vals: list[float] = []
     for q_str in valid_queries:
         bset = baseline_kid_cache.get(q_str)
         assert bset is not None
         base_pm_list.append(bset.pm)
         base_sm_list.append(bset.sm)
+        denom_b = float(bset.total_unique_kids)
+        base_p_pm_vals.append(len(bset.pm) / denom_b if denom_b > 0.0 else 0.0)
+        base_p_sm_vals.append(len(bset.sm) / denom_b if denom_b > 0.0 else 0.0)
 
     (
         base_valid_np,
@@ -430,7 +445,6 @@ def score_batch_gpu_vectorized(
         group_acc_np,
         sample_has_pm_np,
         p_ok,
-        rel_el,
         ug_mask,
         pol_edge_kid_gpu,
     ) = _reduce_edge_metrics_gpu(
@@ -443,6 +457,8 @@ def score_batch_gpu_vectorized(
         pm_sm_pol=pm_sm_gpu[inv_all_gpu[:e_pol]],
         sorted_bpm_gpu=pack_vk_sorted(base_pm_list, device),
         sorted_bsm_gpu=pack_vk_sorted(base_sm_list, device),
+        base_p_pm_gpu=torch.as_tensor(base_p_pm_vals, dtype=torch.float64, device=device),
+        base_p_sm_gpu=torch.as_tensor(base_p_sm_vals, dtype=torch.float64, device=device),
         gr_config=gr_config,
     )
 
@@ -453,13 +469,11 @@ def score_batch_gpu_vectorized(
             pol_edge_s_gpu=pol_edge_s_gpu,
             pol_edge_kid_gpu=pol_edge_kid_gpu,
             p_ok=p_ok,
-            rel_el=rel_el,
             ug_mask=ug_mask,
             sample_has_pm_np=sample_has_pm_np,
             token_logprobs=token_logprobs,
             valid_rows=valid_rows,
             group_size=group_size,
-            gr_config=gr_config,
         )
         if not gr_config.doc2k_disabled
         else Doc2kVoteDelta()

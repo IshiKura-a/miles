@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from examples.experimental.generative_retriever.utils.paths import absolute_path
-
 from collections.abc import Callable
 from functools import lru_cache
 from pathlib import Path
@@ -21,6 +19,7 @@ from transformers import T5Config, T5PreTrainedModel
 from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
 
 from examples.experimental.generative_retriever.model.model_loading import import_slmv3, require_directory
+from examples.experimental.generative_retriever.utils.paths import absolute_path
 
 PrefixConstraint = Callable[[int, torch.Tensor], list[int]]
 
@@ -311,13 +310,11 @@ def build_generation_model(
     projection: nn.Module,
     decoder: nn.Module,
     lm_head: nn.Module,
-    grouped_cross_attention: bool = True,
 ) -> nn.Module:
     """Attach existing policy tensors to the official generation class."""
     slmv3 = import_slmv3(require_directory(slm_root, "SLMv3 source"))
     source_class = slmv3["T5MultiWithGivenQueryDocEncoderDSI"]
-    if grouped_cross_attention:
-        install_grouped_cross_attention(decoder)
+    install_grouped_cross_attention(decoder)
 
     class GenerationHead(source_class):
         def __init__(self) -> None:

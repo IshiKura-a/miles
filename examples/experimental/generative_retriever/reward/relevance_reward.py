@@ -5,10 +5,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 import math
-import os
 from typing import Literal
 
-from examples.experimental.generative_retriever.runtime.gr_config import DocidDenomMode, GRConfig
+from examples.experimental.generative_retriever.runtime.gr_config import GRConfig
 
 RewardMode = Literal["continuous_relevance_unique", "discrete_relevance_unique"]
 REWARD_MODES: tuple[RewardMode, ...] = ("continuous_relevance_unique", "discrete_relevance_unique")
@@ -39,37 +38,22 @@ DOC2K_MAX_ADDS_PER_QUERY = 8
 DOC2K_ADD_MIN_QUERIES = 10
 DOC2K_PRUNE_MIN_QUERIES = 32
 TREE_CREDIT_TOP_K = (8, 4, 2)
-TREE_CREDIT_LEVEL_WEIGHT = 0.25
 
 
 def is_doc2k_disabled() -> bool:
-    if os.environ.get("GR_DISABLE_DOC2K") == "1":
-        return True
     return GRConfig.from_env().doc2k_disabled
 
 
-def docid_denominator(
-    bucket_len: int,
-    *,
-    denom_mode: DocidDenomMode = "sqrt_floor",
-    k_floor: int = DOCID_REWARD_FLOOR,
-) -> float:
-    """Compute bucket reward denominator under the configured mode."""
-    if k_floor <= 0:
-        raise ValueError("k_floor must be positive")
-    if denom_mode == "linear_floor":
-        return float(max(bucket_len, k_floor))
-    if denom_mode == "sqrt_floor":
-        return math.sqrt(float(k_floor) * float(max(bucket_len, k_floor)))
-    if denom_mode == "unit":
-        return 1.0
-    raise ValueError(f"Unknown docid_denom_mode: {denom_mode!r}")
+def docid_denominator(bucket_len: int) -> float:
+    """Compute geometric-mean bucket reward denominator ``sqrt(max(|d|, 1))``."""
+    return math.sqrt(float(max(bucket_len, 1)))
 
 
 @dataclass(frozen=True, slots=True)
 class BaselineSets:
     pm: frozenset[str] = frozenset()
     sm: frozenset[str] = frozenset()
+    total_unique_keywords: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,7 +184,11 @@ def build_baseline_set(keyword_scores: Mapping[str, tuple[float, float]]) -> Bas
             pm_qualified.add(keyword)
         if sm_score >= SM_THRESHOLD:
             sm_qualified.add(keyword)
-    return BaselineSets(pm=frozenset(pm_qualified), sm=frozenset(sm_qualified))
+    return BaselineSets(
+        pm=frozenset(pm_qualified),
+        sm=frozenset(sm_qualified),
+        total_unique_keywords=len(keyword_scores),
+    )
 
 
 def score_and_summarize_docid(
@@ -211,10 +199,9 @@ def score_and_summarize_docid(
     *,
     mode: RewardMode = "discrete_relevance_unique",
     keyword_frequencies: Mapping[str, int] | None = None,
-    k_floor: int = DOCID_REWARD_FLOOR,
-    denom_mode: DocidDenomMode = "sqrt_floor",
     unique_weight: float = UNIQUE_WEIGHT,
-    pm_prune_only: bool = True,
+    p_ref_pm: float | None = None,
+    p_ref_sm: float | None = None,
 ) -> tuple[float, dict[str, float], list[str], list[str]]:
     """Compute docID reward, summary metrics, and doc2k edge sets without per-keyword object allocation."""
     if mode not in REWARD_MODES:
@@ -224,6 +211,10 @@ def score_and_summarize_docid(
     n = float(len(keywords))
     base_pm = baseline.pm
     base_sm = baseline.sm
+    denom_b = float(baseline.total_unique_keywords)
+    ref_pm = float(p_ref_pm) if p_ref_pm is not None else (len(base_pm) / denom_b if denom_b > 0.0 else 0.0)
+    ref_sm = float(p_ref_sm) if p_ref_sm is not None else (len(base_sm) / denom_b if denom_b > 0.0 else 0.0)
+    watermark = ref_pm + ref_sm
     is_cont = mode == "continuous_relevance_unique"
 
     sum_pm = 0.0
@@ -280,7 +271,7 @@ def score_and_summarize_docid(
         ub = pm_ub + sm_ub
         disc_t = disc_b + ub
         cont_t = cont_b + ub
-        raw_r = cont_t if is_cont else disc_t
+        raw_r = (cont_t if is_cont else disc_t) - watermark
         freq = max(1, int(keyword_frequencies.get(kw, 1))) if keyword_frequencies is not None else 1
         rew = raw_r / float(freq)
 
@@ -311,7 +302,7 @@ def score_and_summarize_docid(
             cnt_any_uniq += 1
         if rel_el:
             cnt_rel_elig += 1
-            if not pm_prune_only or p_ok:
+            if p_ok:
                 passed_keywords.append(kw)
         if p_ok and s_ok and u_pm and u_sm:
             unique_good_keywords.append(kw)
@@ -351,7 +342,7 @@ def score_and_summarize_docid(
         "unique_quality": (sum_uniq_qual / float(cnt_any_uniq)) if cnt_any_uniq else 0.0,
         "train_total": mean_reward,
     }
-    docid_value = sum_reward / docid_denominator(len(keywords), denom_mode=denom_mode, k_floor=k_floor)
+    docid_value = sum_reward / docid_denominator(len(keywords))
     return docid_value, metrics, passed_keywords, unique_good_keywords
 
 
@@ -388,15 +379,11 @@ def calculate_docid_reward(
     *,
     mode: RewardMode = "discrete_relevance_unique",
     keyword_frequencies: Mapping[str, int] | None = None,
-    k_floor: int = DOCID_REWARD_FLOOR,
-    denom_mode: DocidDenomMode = "sqrt_floor",
     unique_weight: float = UNIQUE_WEIGHT,
 ) -> float:
     """Aggregate rewards over distinct keyword texts belonging to one doc ID."""
     if not keyword_scores:
         raise ValueError("Doc ID reward requires at least one keyword")
-    if k_floor <= 0:
-        raise ValueError("k_floor must be positive")
     rewards = calculate_keyword_rewards(
         keyword_scores,
         baseline,
@@ -404,5 +391,4 @@ def calculate_docid_reward(
         keyword_frequencies=keyword_frequencies,
         unique_weight=unique_weight,
     )
-    denom = docid_denominator(len(rewards), denom_mode=denom_mode, k_floor=k_floor)
-    return math.fsum(result.reward for result in rewards.values()) / denom
+    return math.fsum(result.reward for result in rewards.values()) / docid_denominator(len(rewards))

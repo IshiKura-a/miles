@@ -15,7 +15,6 @@ from examples.experimental.generative_retriever.runtime.gr_config import (
     RAY_GRPC_KEEPALIVE_ENV,
 )
 from examples.experimental.generative_retriever.runtime.prepare_rocm_env import (
-    derive_reward_cache_sizes,
     derive_sglang_mem_fraction,
 )
 from examples.experimental.generative_retriever.runtime.training_common import (
@@ -55,11 +54,6 @@ def build_multinode_recipe(
         raise ValueError(f"num-rollout must be between 1 and {max_rollouts}")
 
     template = ScriptArgs() if base_args is None else base_args
-    query_cache, kw_cache, score_cache = derive_reward_cache_sizes(
-        QUERIES_PER_STEP_PER_PAIR * pairs,
-        SAMPLES_PER_PROMPT,
-        REWARD_NODES_PER_PAIR * pairs,
-    )
     derived_mem = derive_sglang_mem_fraction(
         _SGLANG_CONCURRENCY_PER_PAIR * pairs,
         SAMPLES_PER_PROMPT,
@@ -68,14 +62,9 @@ def build_multinode_recipe(
     mem_fraction = (
         template.sglang_mem_fraction_static
         if template.sglang_mem_fraction_static > 0
-        else (min(derived_mem, 0.18) if template.compact_train_ipc else derived_mem)
+        else min(derived_mem, 0.18)
     )
-    default_mbs = (50 if template.compact_train_ipc else 10) * SAMPLES_PER_PROMPT
-    mbs = (
-        template.micro_batch_size
-        if base_args is not None and template.micro_batch_size != ScriptArgs.micro_batch_size
-        else default_mbs
-    )
+    mbs = template.micro_batch_size
     return replace(
         template,
         run_id=run_id,
@@ -92,12 +81,6 @@ def build_multinode_recipe(
         max_tokens_per_gpu=max(262144, 6 * mbs),
         sglang_mem_fraction_static=mem_fraction,
         sglang_server_concurrency=_SGLANG_CONCURRENCY_PER_PAIR * pairs,
-        reward_timeout=1800,
-        reward_request_concurrency=2 * REWARD_NODES_PER_PAIR * pairs,
-        prepare_concurrency=2 * REWARD_NODES_PER_PAIR * pairs,
-        reward_query_cache_size=query_cache,
-        reward_keyword_cache_size=kw_cache,
-        reward_score_cache_size=score_cache,
     )
 
 
@@ -118,8 +101,6 @@ def build_multinode_train_args(
             "examples.experimental.generative_retriever.model.fsdp_policy.build_gr_stage5_policy",
             "--data-source-path",
             "examples.experimental.generative_retriever.index.data_source.GRRolloutDataSource",
-            "--custom-weight-sync-function-path",
-            "examples.experimental.generative_retriever.index.data_source.sync_mapping_on_weight_update",
             "--weight-sync-include-prefixes",
             "encoder_list.0.model.encoder.model.", "docEnc2decoder.", "decoder.", "lm_head.",
             "--update-weight-buffer-size", "2147483648",
@@ -129,14 +110,8 @@ def build_multinode_train_args(
             "--prompt-data", str(prompt),
             "--input-key", "query",
             "--rollout-shuffle",
-            *(
-                [
-                    "--rollout-function-path",
-                    "examples.experimental.generative_retriever.model.local_coloc_rollout.GRLocalColocatedRolloutFn",
-                ]
-                if args.local_coloc_rollout
-                else []
-            ),
+            "--rollout-function-path",
+            "examples.experimental.generative_retriever.model.local_coloc_rollout.GRLocalColocatedRolloutFn",
             "--custom-generate-function-path",
             "examples.experimental.generative_retriever.model.sglang_encode_generate.generate",
             "--custom-rm-path", "examples.experimental.generative_retriever.reward.reward.reward",

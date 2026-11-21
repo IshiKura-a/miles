@@ -25,7 +25,7 @@ from examples.experimental.generative_retriever.reward.relevance_reward import (
     RQ_CODE_NUM,
 )
 from examples.experimental.generative_retriever.reward.rollout_metrics import (
-    compute_scalar_tree_credit_2d,
+    compute_causal_tree_credit_3d,
 )
 from examples.experimental.generative_retriever.runtime.gr_config import GRConfig
 from miles.rollout.base_types import BaseGroupGenerateFn, GenerateFnInput, GenerateFnOutput
@@ -168,27 +168,23 @@ async def _resolve_target_url(router_url: str, session: aiohttp.ClientSession) -
         async with lock:
             urls = _WORKER_URLS_BY_ROUTER.get(router_url)
             if not urls:
-                try:
-                    async with session.get(f"{router_url}/workers") as resp:
-                        if resp.status == 200:
-                            info = await resp.json()
-                            workers = info.get("workers", [])
-                            extracted = [
-                                w["url"].rstrip("/")
-                                for w in workers
-                                if isinstance(w, dict) and w.get("url")
-                            ]
-                            if extracted:
-                                urls = extracted
-                                _WORKER_URLS_BY_ROUTER[router_url] = urls
-                                logger.info("[GR Rollout] Discovered %d direct SGLang worker URLs from router %s", len(urls), router_url)
-                except Exception:
-                    pass
-    if urls:
-        target = urls[_RR_COUNTER % len(urls)]
-        _RR_COUNTER += 1
-        return target
-    return router_url
+                async with session.get(f"{router_url}/workers") as resp:
+                    resp.raise_for_status()
+                    info = await resp.json()
+                workers = info.get("workers", [])
+                extracted = [
+                    w["url"].rstrip("/")
+                    for w in workers
+                    if isinstance(w, dict) and w.get("url")
+                ]
+                if not extracted:
+                    raise RuntimeError(f"No active SGLang workers registered on router {router_url}")
+                urls = extracted
+                _WORKER_URLS_BY_ROUTER[router_url] = urls
+                logger.info("[GR Rollout] Discovered %d direct SGLang worker URLs from router %s", len(urls), router_url)
+    target = urls[_RR_COUNTER % len(urls)]
+    _RR_COUNTER += 1
+    return target
 
 
 async def request_embedding(args: Any, router_url: str, prompt_ids: list[int]) -> dict[str, Any]:
@@ -328,13 +324,14 @@ async def generate_group_samples(
         )
         tok_list = tok_i32.astype(np.int64).tolist()
         lp_list = lp_f32.astype(np.float64).tolist()
-        credited_list = compute_scalar_tree_credit_2d(u32_arr[None, :], raw_f64[None, :])[0].tolist()
+        causal_3d = compute_causal_tree_credit_3d(u32_arr[None, :], raw_f64[None, :])
+        credited_list = causal_3d[0, :, 0].astype(np.float64).tolist()
         raw_rewards_list = raw_f64.tolist()
-        pad_tok_id = int(state.tokenizer.pad_token_id) if gr_cfg.compact_train_ipc else 0
+        pad_tok_id = int(state.tokenizer.pad_token_id)
         for beam_rank, sample in enumerate(group):
             sample.tokens = (
                 prompt_ids + tok_list[beam_rank]
-                if (not gr_cfg.compact_train_ipc or beam_rank == 0)
+                if beam_rank == 0
                 else [pad_tok_id, *tok_list[beam_rank]]
             )
             sample.response_length = _DOCID_SIZE

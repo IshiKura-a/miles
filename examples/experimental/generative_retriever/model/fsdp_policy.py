@@ -75,14 +75,13 @@ class GRStage5Policy(nn.Module):
         self.gr_config = GRConfig.from_env()
         self._prefix_allowed_cache: dict[tuple[int, ...], tuple[torch.Tensor, set[int]]] = {}
         self._fast_doc2k_state = FastDoc2kSyncState()
-        object.__setattr__(self, "_doc2k_sync_mapping", None)
+        self._doc2k_sync_mapping: ResidentMapping | None = None
 
         self.encoder_list: Any = source.encoder_list
         self.docEnc2decoder: Any = source.docEnc2decoder
         self.decoder: Any = source.decoder
         self.lm_head: Any = source.lm_head
-        if self.gr_config.grouped_cross_attention:
-            install_grouped_cross_attention(self.decoder)
+        install_grouped_cross_attention(self.decoder)
 
         causal_lm = self.encoder_list[0].model.encoder
         if hasattr(causal_lm, "lm_head"):
@@ -101,11 +100,7 @@ class GRStage5Policy(nn.Module):
             module.requires_grad_(True)
 
     def _encoder_backbone(self) -> Any:
-        causal_lm = self.encoder_list[0].model.encoder
-        backbone = getattr(causal_lm, "model", None)
-        if backbone is None:
-            raise TypeError("GR Qwen encoder must expose its backbone as .model")
-        return backbone
+        return self.encoder_list[0].model.encoder.model
 
     def _sync_global_doc2k_votes(self) -> None:
         if self.gr_config.doc2k_disabled or not dist.is_initialized():
@@ -113,7 +108,7 @@ class GRStage5Policy(nn.Module):
         rank = dist.get_rank()
         world_size = dist.get_world_size()
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        local_gpu = resolve_physical_gpu_id(device, fallback_rank=rank)
+        local_gpu = resolve_physical_gpu_id(device)
         if rank == 0:
             self._ensure_doc2k_sync_mapping()
         self._fast_doc2k_state.sync_distributed(
@@ -124,17 +119,19 @@ class GRStage5Policy(nn.Module):
             ensure_sync_map_fn=self._ensure_doc2k_sync_mapping,
         )
 
-    def _ensure_doc2k_sync_mapping(self) -> ResidentMapping | None:
-        sync_map: ResidentMapping | None = getattr(self, "_doc2k_sync_mapping", None)
-        if sync_map is not None:
-            return sync_map
+    @staticmethod
+    def _require_mapping_env() -> str:
         raw_mapping = os.environ.get("GR_ID_MAPPING")
         if not raw_mapping:
-            return None
-        staged_dir = stage_local_mapping_dir(raw_mapping)
-        sync_map = ResidentMapping(staged_dir, read_only=True)
-        object.__setattr__(self, "_doc2k_sync_mapping", sync_map)
-        return sync_map
+            raise ValueError("GR_ID_MAPPING must be set for GR mapping persistence")
+        return raw_mapping
+
+    def _ensure_doc2k_sync_mapping(self) -> ResidentMapping:
+        if self._doc2k_sync_mapping is not None:
+            return self._doc2k_sync_mapping
+        staged_dir = stage_local_mapping_dir(self._require_mapping_env())
+        self._doc2k_sync_mapping = ResidentMapping(staged_dir, read_only=True)
+        return self._doc2k_sync_mapping
 
     def save_doc2k_mapping(
         self,
@@ -145,26 +142,23 @@ class GRStage5Policy(nn.Module):
     ) -> None:
         if self.gr_config.doc2k_disabled:
             if not dist.is_initialized() or dist.get_rank() == 0:
-                raw_mapping = os.environ.get("GR_ID_MAPPING")
-                if raw_mapping:
-                    save_static_mapping_snapshot(
-                        output_dir,
-                        base_mapping=raw_mapping,
-                        stage_dir=stage_dir,
-                        async_transfer=async_transfer,
-                    )
+                save_static_mapping_snapshot(
+                    output_dir,
+                    base_mapping=self._require_mapping_env(),
+                    stage_dir=stage_dir,
+                    async_transfer=async_transfer,
+                )
             if dist.is_initialized():
                 dist.barrier(group=cast(Any, get_gloo_group()))
             return
         self._sync_global_doc2k_votes()
         if not dist.is_initialized() or dist.get_rank() == 0:
             sync_map = self._ensure_doc2k_sync_mapping()
-            if sync_map is not None:
-                sync_map.save_docid_mappings(
-                    output_dir,
-                    stage_dir=stage_dir,
-                    async_transfer=async_transfer,
-                )
+            sync_map.save_docid_mappings(
+                output_dir,
+                stage_dir=stage_dir,
+                async_transfer=async_transfer,
+            )
         if dist.is_initialized():
             dist.barrier(group=cast(Any, get_gloo_group()))
 
@@ -174,8 +168,6 @@ class GRStage5Policy(nn.Module):
 
     def gradient_checkpointing_enable(self, **kwargs: Any) -> None:
         del kwargs
-        if not self.gr_config.compact_train_ipc:
-            self.decoder.gradient_checkpointing = True
 
     def _encode_prompts(
         self,
@@ -388,7 +380,7 @@ class GRStage5Policy(nn.Module):
             is_compact_grouped,
         ) = self._encode_prompts(sample_tokens, response_lengths)
         unique_projected = self.docEnc2decoder(unique_hidden_states.to(self.docEnc2decoder.weight.dtype))
-        if self.gr_config.grouped_cross_attention and group_inverse is not None:
+        if group_inverse is not None:
             projected_hidden_states = unique_projected.index_select(0, group_inverse)
             attention_mask = unique_mask.index_select(0, group_inverse)
         else:

@@ -580,7 +580,6 @@ class KeywordRewardEngine:
                     baseline,
                     mode=request.reward_mode,
                     keyword_frequencies=freq_map,
-                    k_floor=DOCID_REWARD_FLOOR,
                 )
                 inline_kws = None
             sample_unique_good.append(uniq_good_kws)

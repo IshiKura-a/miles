@@ -43,6 +43,7 @@ _SHM_HEADROOM_BYTES = 32 * 1024**3
 class BaselineKidSets:
     pm: frozenset[int]
     sm: frozenset[int]
+    total_unique_kids: int = 0
 
 
 class PackedPairScorer(Protocol):
@@ -195,9 +196,7 @@ class FastPrecompileScorer:
             dtype=self.dtype,
             kw_degrees=kw_degrees,
             tag=kw_store.tag,
-            enabled=gr_config.hbm_kw_cache_enabled,
             memory_fraction=gr_config.hbm_kw_memory_fraction,
-            explicit_gib=gr_config.hbm_kw_explicit_gib,
         )
         self._query_cache: LRUCache[str, torch.Tensor] = LRUCache(65_536)
 

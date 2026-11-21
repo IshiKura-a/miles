@@ -33,7 +33,6 @@ from examples.experimental.generative_retriever.reward.relevance_reward import (
 from examples.experimental.generative_retriever.reward.rollout_metrics import (
     add_distribution_metrics,
     compute_causal_tree_credit_3d,
-    compute_scalar_tree_credit_2d,
     normalize_group_advantages_tensor,
 )
 from examples.experimental.generative_retriever.runtime.gr_config import GRConfig
@@ -45,8 +44,6 @@ from miles.rollout.base_types import (
     RolloutFnOutput,
     RolloutFnTrainOutput,
 )
-from miles.rollout.inference_rollout.compatibility import call_rollout_function
-from miles.rollout.inference_rollout.inference_rollout_common import InferenceRolloutFn
 from miles.utils.ray_utils import Box
 from miles.utils.types import COMPACT_TOKEN_SHARD_KEY
 
@@ -90,8 +87,6 @@ def build_local_gpu_shard(
     group_size: int,
     pad_tok_id: int,
     unique_weight: float,
-    compact_ipc: bool,
-    causal_tree_credit: bool,
     rewards_norm: bool,
     grpo_std_norm: bool,
 ) -> tuple[Box, dict[str, Any]]:
@@ -107,23 +102,14 @@ def build_local_gpu_shard(
     s_u32 = np.sort(u32_mat, axis=1)
     distinct_sum = float(np.sum(1.0 + np.sum(s_u32[:, 1:] != s_u32[:, :-1], axis=1).astype(np.float64)))
 
-    if causal_tree_credit:
-        causal_3d = compute_causal_tree_credit_3d(u32_mat, raw_f64)
-        cred_f64 = causal_3d[:, :, 0].astype(np.float64)
-        norm_3d = normalize_group_advantages_tensor(
-            torch.from_numpy(causal_3d),
-            rewards_norm=rewards_norm,
-            grpo_std_norm=grpo_std_norm,
-        )
-        rewards_tensor = norm_3d.reshape(n_samples, RQ_CODE_NUM).contiguous()
-    else:
-        cred_f64 = compute_scalar_tree_credit_2d(u32_mat, raw_f64)
-        norm_2d = normalize_group_advantages_tensor(
-            torch.from_numpy(cred_f64.astype(np.float32)),
-            rewards_norm=rewards_norm,
-            grpo_std_norm=grpo_std_norm,
-        )
-        rewards_tensor = norm_2d.reshape(n_samples).contiguous()
+    causal_3d = compute_causal_tree_credit_3d(u32_mat, raw_f64)
+    cred_f64 = causal_3d[:, :, 0].astype(np.float64)
+    norm_3d = normalize_group_advantages_tensor(
+        torch.from_numpy(causal_3d),
+        rewards_norm=rewards_norm,
+        grpo_std_norm=grpo_std_norm,
+    )
+    rewards_tensor = norm_3d.reshape(n_samples, RQ_CODE_NUM).contiguous()
 
     stds_arr = np.std(cred_f64, axis=1, ddof=1) if group_size > 1 else np.zeros(num_q, dtype=np.float64)
     ordered_cred = np.sort(cred_f64, axis=1)
@@ -144,7 +130,6 @@ def build_local_gpu_shard(
         prompt_ids_list,
         tok_i32,
         pad_tok_id=pad_tok_id,
-        compact_ipc=compact_ipc,
     )
     raw_zero_mask = np.all(raw_f64 == raw_f64[:, :1], axis=1)
 
@@ -285,8 +270,6 @@ class _NodeColocRolloutWorker:
         local_urls: list[str],
         hf_checkpoint: str,
         group_size: int,
-        compact_ipc: bool,
-        causal_tree_credit: bool,
         rewards_norm: bool,
         grpo_std_norm: bool,
     ) -> None:
@@ -294,8 +277,6 @@ class _NodeColocRolloutWorker:
         self.gpus_per_node = len(self.local_urls)
         self.hf_checkpoint = hf_checkpoint
         self.group_size = group_size
-        self.compact_ipc = compact_ipc
-        self.causal_tree_credit = causal_tree_credit
         self.rewards_norm = rewards_norm
         self.grpo_std_norm = grpo_std_norm
         self.tokenizer = AutoTokenizer.from_pretrained(hf_checkpoint, trust_remote_code=True)
@@ -336,8 +317,8 @@ class _NodeColocRolloutWorker:
         if not isinstance(items, list) or len(items) != len(batch_inputs):
             raise RuntimeError(f"Expected {len(batch_inputs)} embeddings, got {type(items)}")
         out = np.empty((len(batch_inputs), expected_width), dtype=np.float32)
-        for fallback_i, item in enumerate(items):
-            idx = int(item.get("index", fallback_i))
+        for item in items:
+            idx = int(item["index"])
             arr = np.frombuffer(base64.b64decode(item["embedding"]), dtype="<f4")
             if arr.size != expected_width:
                 raise RuntimeError(f"Unexpected GR embedding width {arr.size} != {expected_width}")
@@ -373,8 +354,6 @@ class _NodeColocRolloutWorker:
                 group_size=self.group_size,
                 pad_tok_id=self.pad_tok_id,
                 unique_weight=unique_weight,
-                compact_ipc=self.compact_ipc,
-                causal_tree_credit=self.causal_tree_credit,
                 rewards_norm=self.rewards_norm,
                 grpo_std_norm=self.grpo_std_norm,
             ),
@@ -428,7 +407,6 @@ class GRLocalColocatedRolloutFn(BaseRolloutFn):
         self.data_source = cast(GRRolloutDataSource, input.data_source)
         self.gr_config = GRConfig.from_env()
         self._workers: list[Any] = []
-        self._eval_fallback: InferenceRolloutFn | None = None
 
     def _ensure_workers(self) -> list[Any]:
         if self._workers:
@@ -457,8 +435,6 @@ class GRLocalColocatedRolloutFn(BaseRolloutFn):
                 local_urls=urls,
                 hf_checkpoint=str(self.args.hf_checkpoint),
                 group_size=int(self.args.n_samples_per_prompt),
-                compact_ipc=self.gr_config.compact_train_ipc,
-                causal_tree_credit=self.gr_config.causal_tree_credit,
                 rewards_norm=bool(self.args.rewards_normalization),
                 grpo_std_norm=grpo_std,
             )
@@ -468,9 +444,7 @@ class GRLocalColocatedRolloutFn(BaseRolloutFn):
 
     def __call__(self, input: RolloutFnInput) -> RolloutFnOutput:
         if isinstance(input, RolloutFnEvalInput):
-            if self._eval_fallback is None:
-                self._eval_fallback = InferenceRolloutFn(self.constructor_input)
-            return call_rollout_function(self._eval_fallback, input)
+            raise NotImplementedError("GR offline evaluation uses run_eval.py rather than inline RolloutFnEvalInput")
 
         started = time.perf_counter()
         workers = self._ensure_workers()

@@ -9,14 +9,12 @@ import math
 import os
 from typing import Literal, cast
 
-DocidDenomMode = Literal["sqrt_floor", "unit", "linear_floor"]
-Doc2kMode = Literal["relevance_guided", "legacy", "disabled"]
-UniqueAnnealMode = Literal["none", "off", "linear", "cosine"]
+Doc2kMode = Literal["relevance_guided", "disabled"]
+UniqueAnnealMode = Literal["cosine", "linear", "none", "off"]
 RewardModeLiteral = Literal["discrete_relevance_unique", "continuous_relevance_unique"]
 
-DOCID_DENOM_MODES: tuple[DocidDenomMode, ...] = ("sqrt_floor", "unit", "linear_floor")
-DOC2K_MODES: tuple[Doc2kMode, ...] = ("relevance_guided", "legacy", "disabled")
-UNIQUE_ANNEAL_MODES: tuple[UniqueAnnealMode, ...] = ("none", "off", "linear", "cosine")
+DOC2K_MODES: tuple[Doc2kMode, ...] = ("relevance_guided", "disabled")
+UNIQUE_ANNEAL_MODES: tuple[UniqueAnnealMode, ...] = ("cosine", "linear", "none", "off")
 
 GR_CONFIG_ENV_VAR = "GR_CONFIG_JSON"
 DEFAULT_STEP_TEMPERATURES: tuple[float, float, float, float] = (0.2, 0.25, 0.6, 0.8)
@@ -56,32 +54,22 @@ def parse_step_temperatures(raw: str | Sequence[float], *, code_num: int = 4) ->
 
 @dataclass(frozen=True, slots=True)
 class GRConfig:
-    """Single source of truth for Generative Retriever algorithm and systems settings."""
+    """Single source of truth for Generative Retriever algorithm and runtime settings."""
 
     reward_mode: RewardModeLiteral = "discrete_relevance_unique"
     step_temperatures: tuple[float, ...] = DEFAULT_STEP_TEMPERATURES
-    docid_denom_mode: DocidDenomMode = "sqrt_floor"
-    docid_reward_floor: int = 10
-    causal_tree_credit: bool = True
     doc2k_mode: Doc2kMode = "relevance_guided"
-    unique_anneal_mode: UniqueAnnealMode = "none"
+    unique_anneal_mode: UniqueAnnealMode = "cosine"
     unique_weight_start: float = 2.0
     unique_weight_end: float = 0.0
     unique_anneal_warmup_ratio: float = 0.0
-    local_coloc_rollout: bool = True
     local_rollout_batch_size: int = 125
-    compact_train_ipc: bool = True
-    grouped_cross_attention: bool = True
     tree_query_chunk_size: int = 128
-    hbm_kw_cache_enabled: bool = True
     hbm_kw_memory_fraction: float = DEFAULT_HBM_KW_MEMORY_FRACTION
-    hbm_kw_explicit_gib: float | None = None
 
     def __post_init__(self) -> None:
         normalized_temps = parse_step_temperatures(self.step_temperatures)
         object.__setattr__(self, "step_temperatures", normalized_temps)
-        if self.docid_denom_mode not in DOCID_DENOM_MODES:
-            raise ValueError(f"Unsupported docid_denom_mode: {self.docid_denom_mode!r}")
         if self.doc2k_mode not in DOC2K_MODES:
             raise ValueError(f"Unsupported doc2k_mode: {self.doc2k_mode!r}")
         if self.unique_anneal_mode not in UNIQUE_ANNEAL_MODES:
@@ -96,14 +84,6 @@ class GRConfig:
     @property
     def doc2k_disabled(self) -> bool:
         return self.doc2k_mode == "disabled"
-
-    @property
-    def doc2k_relevance_guided(self) -> bool:
-        return self.doc2k_mode == "relevance_guided"
-
-    @property
-    def pm_prune_only(self) -> bool:
-        return self.doc2k_mode == "relevance_guided"
 
     def resolve_unique_weight(self, rollout_id: int, num_rollout: int) -> float:
         """Compute exact step ``unique_bonus`` weight from ``rollout_id`` (resume-invariant)."""
@@ -147,9 +127,6 @@ class GRConfig:
         payload = env.get(GR_CONFIG_ENV_VAR, "").strip()
         if payload:
             return cls.from_json(payload)
-        reward_mode = cast(
-            RewardModeLiteral,
-            env.get("GR_REWARD_MODE", "discrete_relevance_unique"),
-        )
-        doc2k_mode: Doc2kMode = "disabled" if env.get("GR_DISABLE_DOC2K") == "1" else "relevance_guided"
-        return cls(reward_mode=reward_mode, doc2k_mode=doc2k_mode)
+        if "GR_REWARD_MODE" in env:
+            return cls(reward_mode=cast(RewardModeLiteral, env["GR_REWARD_MODE"]))
+        return cls()

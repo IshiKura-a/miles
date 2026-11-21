@@ -65,31 +65,18 @@ def expected_in_process_embedding_width(group_size: int) -> int:
     return group_size * IN_PROCESS_BEAM_COLS + len(IN_PROCESS_METRIC_KEYS)
 
 
-def resolve_physical_gpu_id(
-    device: torch.device | None = None,
-    *,
-    fallback_rank: int | None = None,
-) -> int:
+def resolve_physical_gpu_id(device: torch.device | None = None) -> int:
     """Resolve the node-local physical GPU index for per-GPU /tmp staging files."""
     argv = sys.argv
     for idx, arg in enumerate(argv[:-1]):
         if arg == "--base-gpu-id":
-            try:
-                return int(argv[idx + 1])
-            except ValueError:
-                pass
+            return int(argv[idx + 1])
         if arg.startswith("--base-gpu-id="):
-            try:
-                return int(arg.split("=", 1)[1])
-            except ValueError:
-                pass
+            return int(arg.split("=", 1)[1])
     for env_key in ("ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
         val = os.environ.get(env_key, "").strip()
         if val and "," not in val:
-            try:
-                return int(val)
-            except ValueError:
-                pass
+            return int(val)
     local_rank = os.environ.get("LOCAL_RANK", "").strip()
     if local_rank.isdigit():
         return int(local_rank)
@@ -97,9 +84,7 @@ def resolve_physical_gpu_id(
         return int(device.index)
     if torch.cuda.is_available():
         return int(torch.cuda.current_device())
-    if fallback_rank is not None:
-        return int(fallback_rank)
-    return 0
+    raise RuntimeError("Cannot resolve node-local physical GPU ID")
 
 
 def pack_docids_u32_from_tokens(tok_ids: np.ndarray) -> np.ndarray:
@@ -173,16 +158,15 @@ def pack_group_tokens_flat(
     tok_i32: np.ndarray,
     *,
     pad_tok_id: int,
-    compact_ipc: bool,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Pack ``[B, G, 4]`` beam tokens with prompts into flat ``int32`` buffers."""
+    """Pack ``[B, G, 4]`` beam tokens with deduplicated group prompts into flat ``int32`` buffers."""
     num_q = len(prompt_ids_list)
     if num_q == 0:
         return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32)
     group_size = int(tok_i32.shape[1])
     n_samples = num_q * group_size
     tok_chunks: list[np.ndarray] = []
-    if compact_ipc and group_size > 1:
+    if group_size > 1:
         tail_5 = np.empty((num_q, group_size - 1, RQ_CODE_NUM + 1), dtype=np.int32)
         tail_5[:, :, 0] = pad_tok_id
         tail_5[:, :, 1:] = tok_i32[:, 1:, :]
@@ -194,13 +178,9 @@ def pack_group_tokens_flat(
             tok_chunks.extend((p_arr, tok_i32[q_i, 0], tail_flat[q_i]))
         return np.concatenate(tok_chunks), len_2d.reshape(n_samples)
 
-    len_2d = np.empty((num_q, group_size), dtype=np.int32)
+    len_1d = np.empty(num_q, dtype=np.int32)
     for q_i, p_ids in enumerate(prompt_ids_list):
         p_arr = np.asarray(p_ids, dtype=np.int32)
-        full_len = int(p_arr.shape[0]) + RQ_CODE_NUM
-        len_2d[q_i, :] = full_len
-        grp_arr = np.empty((group_size, full_len), dtype=np.int32)
-        grp_arr[:, : len(p_ids)] = p_arr[None, :]
-        grp_arr[:, len(p_ids) :] = tok_i32[q_i]
-        tok_chunks.append(grp_arr.reshape(-1))
-    return np.concatenate(tok_chunks), len_2d.reshape(n_samples)
+        len_1d[q_i] = int(p_arr.shape[0]) + RQ_CODE_NUM
+        tok_chunks.extend((p_arr, tok_i32[q_i, 0]))
+    return np.concatenate(tok_chunks), len_1d

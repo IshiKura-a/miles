@@ -2,17 +2,13 @@
 
 from __future__ import annotations
 
-from examples.experimental.generative_retriever.utils.paths import absolute_path, symlink_target
-
 from dataclasses import dataclass
 import json
 import os
-import tempfile
 from pathlib import Path
+import tempfile
 
-import miles.utils.external_utils.command_utils as U
 from examples.experimental.generative_retriever.reward.relevance_reward import (
-    DEFAULT_REWARD_BATCH_SIZE,
     DEFAULT_TRAIN_GROUP_SIZE,
     PROMPT_DATASET_ROWS,
     RewardMode,
@@ -21,17 +17,17 @@ from examples.experimental.generative_retriever.runtime.gr_config import (
     DEFAULT_HBM_KW_MEMORY_FRACTION,
     DEFAULT_SGLANG_WATCHDOG_TIMEOUT_SECONDS,
     Doc2kMode,
-    DocidDenomMode,
     GRConfig,
     UniqueAnnealMode,
     parse_step_temperatures,
 )
+from examples.experimental.generative_retriever.utils.paths import absolute_path, symlink_target
+import miles.utils.external_utils.command_utils as U
 
 _QUERIES_PER_STEP = 4000
 _GLOBAL_BATCH_SIZE = _QUERIES_PER_STEP * DEFAULT_TRAIN_GROUP_SIZE
 _MAX_STEPS = PROMPT_DATASET_ROWS // _QUERIES_PER_STEP
 _IN_FLIGHT_GROUPS = 512
-_REWARD_DEVICES = tuple(f"cuda:{i}" for i in range(8))
 
 
 def required_directory(value: str, name: str) -> str:
@@ -64,7 +60,6 @@ class ScriptArgs(U.ExecuteTrainConfig):
         "train_15M.queryfeat.2026-04-01/Part0.json"
     )
     output_dir: str = "$cosmos_data_path/local/User/zihao/online_rl/gr_offline_syn/"
-    service_log_dir: str = "~/.local/state/miles/generative_retriever/"
     relevance_model: str = (
         "$cosmos_data_path/local/User/yugao/share/qualitymodel/"
         "GCQC/GV2.1/ForArcher/Large/"
@@ -81,36 +76,19 @@ class ScriptArgs(U.ExecuteTrainConfig):
     rollout_max_in_flight_groups: int = _IN_FLIGHT_GROUPS
     n_samples_per_prompt: int = DEFAULT_TRAIN_GROUP_SIZE
     global_batch_size: int = _GLOBAL_BATCH_SIZE
-    micro_batch_size: int = 10 * DEFAULT_TRAIN_GROUP_SIZE
+    micro_batch_size: int = 50 * DEFAULT_TRAIN_GROUP_SIZE
     max_tokens_per_gpu: int = 131072
-    reward_timeout: float = 1800.0
-    reward_batch_size: int = DEFAULT_REWARD_BATCH_SIZE
-    reward_request_concurrency: int = 2 * len(_REWARD_DEVICES)
-    prepare_concurrency: int = 2
-    reward_forward_concurrency: int = len(_REWARD_DEVICES)
-    reward_query_cache_size: int = 0
-    reward_keyword_cache_size: int = 0
-    reward_score_cache_size: int = 0
     num_rollout: int = _MAX_STEPS
-    one_step_async: bool = True
     temperature: float = 0.4
     step_temperatures: str = "0.2,0.25,0.6,0.8"
-    docid_denom_mode: DocidDenomMode = "sqrt_floor"
-    docid_reward_floor: int = 10
-    causal_tree_credit: bool = True
     doc2k_mode: Doc2kMode = "relevance_guided"
-    unique_anneal_mode: UniqueAnnealMode = "none"
+    unique_anneal_mode: UniqueAnnealMode = "cosine"
     unique_weight_start: float = 2.0
     unique_weight_end: float = 0.0
     unique_anneal_warmup_ratio: float = 0.0
-    local_coloc_rollout: bool = True
     local_rollout_batch_size: int = 125
-    compact_train_ipc: bool = True
-    grouped_cross_attention: bool = True
     tree_query_chunk_size: int = 128
-    hbm_kw_cache_enabled: bool = True
     hbm_kw_memory_fraction: float = DEFAULT_HBM_KW_MEMORY_FRACTION
-    hbm_kw_explicit_gib: float | None = None
     lr: float = 2e-6
     save_interval: int = 5
     resume: bool = False
@@ -120,22 +98,14 @@ class ScriptArgs(U.ExecuteTrainConfig):
         return GRConfig(
             reward_mode=self.reward_mode,
             step_temperatures=parse_step_temperatures(self.step_temperatures),
-            docid_denom_mode=self.docid_denom_mode,
-            docid_reward_floor=self.docid_reward_floor,
-            causal_tree_credit=self.causal_tree_credit,
             doc2k_mode=self.doc2k_mode,
             unique_anneal_mode=self.unique_anneal_mode,
             unique_weight_start=self.unique_weight_start,
             unique_weight_end=self.unique_weight_end,
             unique_anneal_warmup_ratio=self.unique_anneal_warmup_ratio,
-            local_coloc_rollout=self.local_coloc_rollout,
             local_rollout_batch_size=self.local_rollout_batch_size,
-            compact_train_ipc=self.compact_train_ipc,
-            grouped_cross_attention=self.grouped_cross_attention,
             tree_query_chunk_size=self.tree_query_chunk_size,
-            hbm_kw_cache_enabled=self.hbm_kw_cache_enabled,
             hbm_kw_memory_fraction=self.hbm_kw_memory_fraction,
-            hbm_kw_explicit_gib=self.hbm_kw_explicit_gib,
         )
 
 

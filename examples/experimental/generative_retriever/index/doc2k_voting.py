@@ -35,15 +35,11 @@ def compute_head_cutoff(group_size: int) -> int:
 
 def partition_head_and_tail_indices(
     group_size: int,
-    lp_sums_1d: np.ndarray | None,
-    *,
-    relevance_guided: bool,
+    lp_sums_1d: np.ndarray,
 ) -> tuple[list[int], list[int]]:
     head_cutoff = compute_head_cutoff(group_size)
-    if relevance_guided and lp_sums_1d is not None:
-        beam_order = np.argsort(-lp_sums_1d, kind="mergesort").tolist()
-        return beam_order[:head_cutoff], beam_order[head_cutoff:]
-    return list(range(head_cutoff)), list(range(head_cutoff, group_size))
+    beam_order = np.argsort(-lp_sums_1d, kind="mergesort").tolist()
+    return beam_order[:head_cutoff], beam_order[head_cutoff:]
 
 
 def build_candidate_head_tiers(
@@ -51,23 +47,19 @@ def build_candidate_head_tiers(
     sample_lens: Sequence[int],
     sample_has_pm: Sequence[bool],
     *,
-    relevance_guided: bool,
     k_floor: int = DOCID_REWARD_FLOOR,
     prune_floor: int = DOC2K_PRUNE_FLOOR,
 ) -> tuple[list[int], list[int]]:
     under_floor: list[int] = []
     under_prune: list[int] = []
     for hi in head_indices:
-        if relevance_guided and not bool(sample_has_pm[hi]):
+        if not bool(sample_has_pm[hi]):
             continue
         hlen = int(sample_lens[hi])
         if hlen < k_floor:
             under_floor.append(hi)
         elif hlen < prune_floor:
             under_prune.append(hi)
-    if not relevance_guided:
-        under_floor.sort(key=lambda hi: int(sample_lens[hi]))
-        under_prune.sort(key=lambda hi: int(sample_lens[hi]))
     return under_floor, under_prune
 
 
@@ -75,39 +67,25 @@ def select_doc2k_target_u32(
     tail_u32: int,
     row_u32: Sequence[int],
     candidate_tiers: tuple[Sequence[int], Sequence[int]],
-    *,
-    relevance_guided: bool,
 ) -> int | None:
     """Select the target head docID for tail enrichment.
 
-    In ``relevance_guided`` mode, matches L3 ``(c0, c1, c2)`` siblings first, then L2 ``(c0, c1)``
-    cousins, preserving policy log-prob rank order and never falling back to noisy L1 ``(c0)``.
-    In ``legacy`` mode, matches L2 then L1 in ascending bucket-length order.
+    Matches L3 ``(c0, c1, c2)`` siblings first, then L2 ``(c0, c1)`` cousins in
+    policy log-prob rank order, without falling back to coarse L1 ``(c0)``.
     """
     tail_p3 = tail_u32 >> 8
     tail_p2 = tail_u32 >> 16
-    tail_p1 = tail_u32 >> 24
     for tier in candidate_tiers:
         if not tier:
             continue
-        if relevance_guided:
-            for hi in tier:
-                hu = int(row_u32[hi])
-                if (hu >> 8) == tail_p3:
-                    return hu
-            for hi in tier:
-                hu = int(row_u32[hi])
-                if (hu >> 16) == tail_p2:
-                    return hu
-        else:
-            for hi in tier:
-                hu = int(row_u32[hi])
-                if (hu >> 16) == tail_p2:
-                    return hu
-            for hi in tier:
-                hu = int(row_u32[hi])
-                if (hu >> 24) == tail_p1:
-                    return hu
+        for hi in tier:
+            hu = int(row_u32[hi])
+            if (hu >> 8) == tail_p3:
+                return hu
+        for hi in tier:
+            hu = int(row_u32[hi])
+            if (hu >> 16) == tail_p2:
+                return hu
     return None
 
 
@@ -120,7 +98,6 @@ def record_query_enrichment_votes(
     tail_indices: Sequence[int],
     head_kids_set: set[int],
     tail_unique_good_kids: Sequence[Iterable[int]],
-    relevance_guided: bool,
     delta: Doc2kVoteDelta,
     k_floor: int = DOCID_REWARD_FLOOR,
     prune_floor: int = DOC2K_PRUNE_FLOOR,
@@ -134,7 +111,6 @@ def record_query_enrichment_votes(
         head_indices,
         sample_lens,
         sample_has_pm,
-        relevance_guided=relevance_guided,
         k_floor=k_floor,
         prune_floor=prune_floor,
     )
@@ -155,7 +131,6 @@ def record_query_enrichment_votes(
             int(row_u32[ti]),
             row_u32,
             tiers,
-            relevance_guided=relevance_guided,
         )
         if target_u32 is None:
             continue

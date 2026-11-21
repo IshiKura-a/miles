@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from examples.experimental.generative_retriever.utils.paths import absolute_path
-
 import os
 from pathlib import Path
 import shutil
@@ -11,9 +9,9 @@ import tempfile
 import threading
 from typing import Any
 
-import httpx
 import torch
 
+from examples.experimental.generative_retriever.utils.paths import absolute_path
 from miles.rollout.data_source import RolloutDataSourceWithBuffer
 from miles.utils.types import Sample
 
@@ -23,7 +21,6 @@ class GRRolloutDataSource(RolloutDataSourceWithBuffer):
         if args.save and args.num_rollout is not None and args.num_rollout % args.update_weights_interval:
             raise ValueError("The final GR checkpoint must coincide with a rollout weight update")
         super().__init__(args)
-        self.pending_mapping_checkpoints: list[int] = []
 
     def get_samples(self, num_samples: int) -> list[list[Sample]]:
         samples = self._get_samples_from_buffer(num_samples)
@@ -112,7 +109,7 @@ class GRRolloutDataSource(RolloutDataSourceWithBuffer):
             "sample_index": position * self.args.n_samples_per_prompt,
             "metadata": self.metadata,
         }
-        if bool(getattr(self.args, "temp_stage_save", True)):
+        if bool(self.args.temp_stage_save):
             fd, tmp_str = tempfile.mkstemp(prefix=f"gr_ds_s{rollout_id}_", suffix=".pt")
             os.close(fd)
             tmp_path = Path(tmp_str)
@@ -131,24 +128,6 @@ class GRRolloutDataSource(RolloutDataSourceWithBuffer):
         else:
             path.parent.mkdir(parents=True, exist_ok=True)
             torch.save(payload, path)
-        self.pending_mapping_checkpoints.append(rollout_id)
-
-    def sync_mapping(self, rollout_id: int) -> None:
-        raw_url = getattr(self.args, "generative_retriever_reward_url", None)
-        if not isinstance(raw_url, str) or not raw_url:
-            self.pending_mapping_checkpoints.clear()
-            return
-        reward_url = raw_url.removesuffix("/score")
-        pending = [step for step in self.pending_mapping_checkpoints if step <= rollout_id]
-        with httpx.Client(timeout=600.0, trust_env=False) as client:
-            for step in sorted(set(pending + [rollout_id])):
-                response = client.post(f"{reward_url}/commit_step_updates", json={"rollout_id": step})
-                response.raise_for_status()
-                if step in pending:
-                    output_dir = Path(self.args.save) / f"iter_{step + 1:07d}" / "mapping"
-                    response = client.post(f"{reward_url}/save_mapping", json={"output_dir": str(output_dir)})
-                    response.raise_for_status()
-                    self.pending_mapping_checkpoints.remove(step)
 
     def load(self, rollout_id: int | None = None) -> None:
         if self.args.load is None:
@@ -164,7 +143,3 @@ class GRRolloutDataSource(RolloutDataSourceWithBuffer):
             raise ValueError("GR rollout checkpoint has an invalid prompt cursor")
         self.sample_offset = self.sample_group_index = position
         self.sample_index = position * self.args.n_samples_per_prompt
-
-
-def sync_mapping_on_weight_update(args: Any, data_source: GRRolloutDataSource, rollout_id: int) -> None:
-    data_source.sync_mapping(rollout_id)

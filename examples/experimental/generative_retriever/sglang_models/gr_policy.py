@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Iterable
+from dataclasses import replace
 import logging
-import os
 import pickle
 from typing import Any, cast
 
@@ -79,12 +79,7 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
         self.runtime_cfg = GRConfig.from_env()
         bundle_reward_mode = raw_gr_config.get("reward_mode")
         if bundle_reward_mode and bundle_reward_mode != self.runtime_cfg.reward_mode:
-            self.runtime_cfg = GRConfig(
-                **{
-                    **{k: getattr(self.runtime_cfg, k) for k in self.runtime_cfg.__dataclass_fields__},
-                    "reward_mode": cast(RewardModeLiteral, bundle_reward_mode),
-                }
-            )
+            self.runtime_cfg = replace(self.runtime_cfg, reward_mode=cast(RewardModeLiteral, bundle_reward_mode))
 
         self.gr_config = T5Config.from_dict(raw_gr_config)
         self.docid_size = int(raw_gr_config["docid_size"])
@@ -98,10 +93,8 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
         if self.decoding_mode in {"beam", "beam_sample"} and not 1 <= self.num_return_sequences <= self.num_beams:
             raise ValueError("Require 1 <= num_return_sequences <= self.num_beams")
         self.id_mapping_path = str(raw_gr_config["id_mapping"])
-        self.qwen_model_path = str(raw_gr_config.get("qwen_model") or os.environ.get("GR_QWEN_MODEL", ""))
-        self.relevance_model_path = str(
-            raw_gr_config.get("relevance_model") or os.environ.get("GR_RELEVANCE_MODEL", "")
-        )
+        self.qwen_model_path = str(raw_gr_config["qwen_model"])
+        self.relevance_model_path = str(raw_gr_config.get("relevance_model") or "")
         self.constraint = load_constraint(self.id_mapping_path, self.docid_size, self.docid_dim)
 
         decoder_config = self._configure_decoder_config(self.gr_config)
@@ -114,14 +107,12 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
         )
 
         if self.relevance_model_path:
-            tokenizer = AutoTokenizer.from_pretrained(self.qwen_model_path, trust_remote_code=True)
-            mapping_engine = ResidentMapping(stage_local_mapping_dir(self.id_mapping_path), read_only=True)
-            object.__setattr__(self, "_qwen_tokenizer", tokenizer)
-            object.__setattr__(self, "_mapping_engine", mapping_engine)
+            self._qwen_tokenizer = AutoTokenizer.from_pretrained(self.qwen_model_path, trust_remote_code=True)
+            self._mapping_engine = ResidentMapping(stage_local_mapping_dir(self.id_mapping_path), read_only=True)
         else:
-            object.__setattr__(self, "_qwen_tokenizer", None)
-            object.__setattr__(self, "_mapping_engine", None)
-        object.__setattr__(self, "_pair_scorer", None)
+            self._qwen_tokenizer = None
+            self._mapping_engine = None
+        self._pair_scorer = None
         self._baseline_kid_cache: LRUCache[str, BaselineKidSets] = LRUCache(32_768)
         self._baseline_initialized = False
         self._has_uncommitted_rollout = False
@@ -161,7 +152,6 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
             projection=self.docEnc2decoder,
             decoder=self.decoder,
             lm_head=self.lm_head,
-            grouped_cross_attention=self.runtime_cfg.grouped_cross_attention,
         )
         object.__setattr__(self, "_generation_model", generation_model)
 
@@ -189,7 +179,6 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
             projection=self.baseline_docEnc2decoder,
             decoder=self.baseline_decoder,
             lm_head=self.baseline_lm_head,
-            grouped_cross_attention=self.runtime_cfg.grouped_cross_attention,
         )
         object.__setattr__(self, "_baseline_generation_model", baseline_generation_model)
 
@@ -197,11 +186,7 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
         if self._pair_scorer is not None:
             return
         if self._qwen_tokenizer is None or self._mapping_engine is None:
-            tokenizer = AutoTokenizer.from_pretrained(self.qwen_model_path, trust_remote_code=True)
-            mapping_engine = ResidentMapping(stage_local_mapping_dir(self.id_mapping_path), read_only=True)
-            object.__setattr__(self, "_qwen_tokenizer", tokenizer)
-            object.__setattr__(self, "_mapping_engine", mapping_engine)
-        assert self._mapping_engine is not None
+            raise RuntimeError("In-process reward requires relevance_model in bundle gr_config")
 
         bin_path, meta_path = resolve_precompiled_kw_paths(self._mapping_engine.path, self.id_mapping_path)
         kw_store = PrecompiledKeywordStore(bin_path, meta_path)
@@ -212,7 +197,7 @@ class GRQwen3ForDocIDGeneration(Qwen3ForPooledOutput):
             gr_config=self.runtime_cfg,
             kw_degrees=self._mapping_engine.keyword_degrees,
         )
-        object.__setattr__(self, "_pair_scorer", fast_scorer)
+        self._pair_scorer = fast_scorer
         hbm_gib = (
             fast_scorer.hbm_cache.total_slots
             * kw_store.num_tokens

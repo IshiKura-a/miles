@@ -203,33 +203,34 @@ unique_bonus = pm_unique_bonus + sm_unique_bonus
 ### `discrete_relevance_unique`
 
 ```text
-discrete_base = P + S
+p_ref_m(q) = max(p_base_m(q), p_group_m(q)),   m in {PM, SM}
+discrete_base = (P - p_ref_PM(q)) + (S - p_ref_SM(q))
 R_discrete = discrete_base + unique_bonus
 ```
 
-- 默认训练模式；`--reward-mode` 可切换。
+- 默认训练模式；`p_ref_m(q)` 为零超参自适应棘轮 Dinkelbach 水位（取冻结 Baseline 唯一词池合格率与当前 Rollout 组唯一词池合格率之最大者）；`unique_bonus` 默认按 `--unique-anneal-mode cosine` 从 `2.0` 余弦退火至 `0.0`（支持 `cosine`、`linear`、`none`、`off`）；`--reward-mode` 可切换。
 
 ### `continuous_relevance_unique`
 
 ```text
-continuous_base = W_PM + W_SM
+continuous_base = (W_PM - p_ref_PM(q)) + (W_SM - p_ref_SM(q))
 R_continuous = continuous_base + unique_bonus
 ```
 
 - 阈值以下的 relevance 提供连续 shaping signal；训练中作为 shadow metric 汇报。
 
-### Doc ID reward、4 层前缀树 Credit Assignment 与耦合 `doc2k` 更新
+### Doc ID reward、4 层因果前缀树 Credit Assignment 与耦合 `doc2k` 更新
 
-- **Doc ID Reward（带 `DOCID_REWARD_FLOOR = 10` 下界）**：
-  对同一个 doc ID $d$ 对应的去重 keyword 集合 $K(d)$ 取带分母下界的平均：
-  `R_docid(q, d) = sum_{k in K(d)} R_keyword(q, k) / max(|K(d)|, 10)`。
-- **4 层 RQ 前缀树 Credit Assignment**（[gr_policy.py](../../examples/experimental/generative_retriever/sglang_models/gr_policy.py) / [rollout_metrics.py](../../examples/experimental/generative_retriever/reward/rollout_metrics.py)）：
-  在同一 query 的 rollout group 内对 512 个候选 doc ID 的原始 reward 按 4 层 RQ 前缀树自底向上聚合子树 `top-k` 均值（`TREE_CREDIT_TOP_K = (8, 4, 2)`，分别对应 depth 1 / 2 / 3），并以每层权重 `TREE_CREDIT_LEVEL_WEIGHT = 0.25` 融合生成 credited reward。
+- **Doc ID Reward（纯几何平均分母）**：
+  对同一个 doc ID $d$ 对应的去重 keyword 集合 $K(d)$ 按组内词频折减求和后除以纯几何平均分母 $\sqrt{\max(|K(d)|, 1)}$：
+  `R_docid(q, d) = sum_{k in K(d)} (R_keyword(q, k) / c_q(k)) / sqrt(max(|K(d)|, 1))`。
+- **4 层因果 RQ 前缀树 Credit Assignment**（[gr_policy.py](../../examples/experimental/generative_retriever/sglang_models/gr_policy.py) / [rollout_metrics.py](../../examples/experimental/generative_retriever/reward/rollout_metrics.py)）：
+  在同一 query 的 rollout group 内对 512 个候选 doc ID 的原始 reward 按 4 层 RQ 前缀树自底向上聚合子树 `top-k` 均值（`TREE_CREDIT_TOP_K = (8, 4, 2)`，分别对应 depth 1 / 2 / 3），按层赋予因果后缀算术平均回报（depth 0..2 分别为 `(v0+v1+v2+r)/4`、`(v1+v2+r)/3`、`((v2+r)/2)`，第 4 层叶子 token 严格仅使用叶子自身 `r`）。
 - **耦合 `doc2k` 在线动态映射更新（全局 `(10, 32)` 投票同步）**：
-  每个 rollout step 期间，各 GPU 上的 SGLang 引擎在进程内打分后将本步候选投票写入本地 `/tmp/gr_doc2k_local_gpu{local_gpu}.pkl`；权重更新时，FSDP learner 通过 `GRStage5Policy._sync_global_doc2k_votes` 使用 NCCL `all_gather_into_tensor` / `broadcast` 汇总全集群投票并广播合并后的全局增量至 `/tmp/gr_doc2k_global_gpu{local_gpu}.pkl`，供同卡 SGLang 引擎在下一次 rollout 前就地更新内存中的 `ResidentMapping`（同一 rollout 内映射不变）：
-  1. **Tail-to-Head 同前缀双头共投注入**：将尾部（rank $\ge$ `DOC2K_HEAD_RANK_CUTOFF = 64`）同时满足 `PM >= 0.58 and SM >= 0.82` 且双头 Unique 的好词，优先路由至共享 RQ 前缀且词数 `< DOCID_REWARD_FLOOR = 10` 的头部 doc ID，全集群累计被至少 `DOC2K_ADD_MIN_QUERIES = 10` 个不同 query 验证通过后注入（每 query 最多投票 `DOC2K_MAX_ADDS_PER_QUERY = 8` 个，单 doc ID 词数上限 `DOCID_MAX_KEYWORDS = 150`）；
-  2. **大桶冗余死词裁剪（`DOC2K_PRUNE_FLOOR = 32` 下界保护）**：对词数 `> DOC2K_PRUNE_FLOOR = 32` 的肥桶 doc ID，每当全集群累计被至少 `DOC2K_PRUNE_MIN_QUERIES = 32` 个不同 query 召回时，裁剪该窗口内 0 次过 PM/SM 阈值的死词，且每桶至少保留 `32` 个词。
-  同时，Baseline 始终查询初始静态映射（`use_initial=True`），保证 $B(q)$ 参照系固定不变。保存 checkpoint 时（默认 `save_interval=5`），`save_doc2k_mapping` 先在本地 `/tmp` 暂存映射快照（`overlay.parquet` 与基础索引符号链接），再异步同步至 `$cosmos_data_path` 下的 `checkpoints/iter_XXXXXXX/mapping/`。通过结构化参数 `--doc2k-mode {relevance_guided,legacy,disabled}`（或兼容环境变量 `GR_DISABLE_DOC2K=1`）可切换相关性制导合并、原版合并或完全静态索引模式。
+  每个 rollout step 期间，各 GPU 上的 SGLang 引擎在进程内打分后将本步候选投票追加写入本地 `/tmp/gr_doc2k_local_gpu{local_gpu}.delta.bin`；权重更新时，FSDP learner 通过 `GRStage5Policy._sync_global_doc2k_votes` 汇总全集群投票并写出 `/tmp/gr_doc2k_global_gpu{local_gpu}.pkl`，供同卡 SGLang 引擎在下一次 rollout 前就地更新内存中的 `ResidentMapping`（同一 rollout 内映射不变）：
+  1. **Tail-to-Head 相关性制导同子树共投注入**：按策略真实对数概率排序划分头部（前 `DOC2K_HEAD_RANK_CUTOFF = 64`）与尾部，将尾部同时满足 `PM >= 0.58 and SM >= 0.82` 且双头 Unique 的好词，优先路由至已命中 `PM > 0`、共享 L3 `(c0,c1,c2)` 或 L2 `(c0,c1)` 前缀且词数 `< 10`（第一梯队）或 `< 32`（第二梯队）的头部 doc ID，全集群累计被至少 `DOC2K_ADD_MIN_QUERIES = 10` 个不同 query 验证通过后注入（每 query 最多投票 `DOC2K_MAX_ADDS_PER_QUERY = 8` 个，单 doc ID 词数上限 `DOCID_MAX_KEYWORDS = 150`）；
+  2. **大桶冗余死词裁剪（`DOC2K_PRUNE_FLOOR = 32` 下界与 `degree > 1` 保护）**：对词数 `> DOC2K_PRUNE_FLOOR = 32` 的肥桶 doc ID，每当全集群累计被至少 `DOC2K_PRUNE_MIN_QUERIES = 32` 个不同 query 召回时，裁剪该窗口内 0 次过 PM 阈值且非孤儿（`degree > 1`）的冗余边，且每桶至少保留 `32` 个词。
+  同时，Baseline 始终查询初始静态映射（`use_initial=True`），保证 $B(q)$ 参照系固定不变。保存 checkpoint 时（默认 `save_interval=5`），`save_doc2k_mapping` 先在本地 `/tmp` 暂存映射快照（`overlay.parquet` 与基础索引符号链接），再异步同步至 `$cosmos_data_path` 下的 `checkpoints/iter_XXXXXXX/mapping/`。通过结构化参数 `--doc2k-mode {relevance_guided,disabled}` 可切换相关性制导动态索引或完全静态索引模式。
 
 GRPO launcher 以 `--reward-mode` 指定训练模式，HTTP reward 请求用 `reward_mode`；
 默认 `discrete_relevance_unique`。W&B 汇报 PM/SM 原始分数、pass、threshold

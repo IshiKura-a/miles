@@ -48,20 +48,13 @@ def resolve_hbm_budget_bytes(
     device: torch.device,
     *,
     num_keywords: int,
-    enabled: bool = True,
     memory_fraction: float = DEFAULT_HBM_KW_MEMORY_FRACTION,
-    explicit_gib: float | None = None,
 ) -> int:
-    if not enabled or device.type != "cuda":
+    if memory_fraction <= 0.0 or device.type != "cuda":
         return 0
     free_bytes, total_bytes = torch.cuda.mem_get_info(device)
     index_bytes = num_keywords * 4
-    raw_target_bytes = (
-        int(explicit_gib * _BYTES_PER_GIB)
-        if explicit_gib is not None
-        else int(total_bytes * memory_fraction)
-    )
-    usable = raw_target_bytes - index_bytes
+    usable = int(total_bytes * memory_fraction) - index_bytes
     granularity = 2 * _BYTES_PER_GIB
     if usable < granularity:
         return 0
@@ -89,9 +82,7 @@ class HbmKeywordCache:
         dtype: torch.dtype,
         kw_degrees: np.ndarray | None = None,
         tag: str = "part25",
-        enabled: bool = True,
         memory_fraction: float = DEFAULT_HBM_KW_MEMORY_FRACTION,
-        explicit_gib: float | None = None,
     ) -> None:
         self._mmap = mmap_u16
         self.num_keywords = num_keywords
@@ -103,9 +94,7 @@ class HbmKeywordCache:
         budget_bytes = resolve_hbm_budget_bytes(
             device,
             num_keywords=num_keywords,
-            enabled=enabled,
             memory_fraction=memory_fraction,
-            explicit_gib=explicit_gib,
         )
         total_slots = min(num_keywords, budget_bytes // row_bytes) if budget_bytes > 0 else 0
 
@@ -165,7 +154,7 @@ class HbmKeywordCache:
         n = int(unique_kids_gpu.numel())
         if n == 0:
             return torch.empty((0, self.num_tokens, self.feature_dim), device=self.device, dtype=self.dtype)
-        if not self.enabled or self._kid_to_slot is None and self._hbm_table is None:
+        if not self.enabled or self._kid_to_slot is None or self._hbm_table is None:
             self.shm_misses += n
             return self._gather_from_shm(unique_kids_gpu.detach().cpu().numpy())
         assert self._kid_to_slot is not None and self._hbm_table is not None

@@ -33,7 +33,6 @@ from examples.experimental.generative_retriever.reward.relevance_model import (
 from examples.experimental.generative_retriever.reward.relevance_reward import REWARD_MODES
 from examples.experimental.generative_retriever.runtime.gr_config import RAY_GRPC_KEEPALIVE_ENV
 from examples.experimental.generative_retriever.runtime.prepare_rocm_env import (
-    derive_sglang_mem_fraction,
     is_rocm,
     locked_accelerator_env,
 )
@@ -111,30 +110,7 @@ def _build_single_node_train_args(
     checkpoint_dir: Path,
 ) -> str:
     quote = shlex.quote
-    effective_mbs = (
-        50 * args.n_samples_per_prompt
-        if (args.compact_train_ipc and args.micro_batch_size == 10 * args.n_samples_per_prompt)
-        else args.micro_batch_size
-    )
-    mem_fraction = (
-        args.sglang_mem_fraction_static
-        if args.sglang_mem_fraction_static > 0
-        else (
-            0.105
-            if args.compact_train_ipc
-            else derive_sglang_mem_fraction(
-                args.sglang_server_concurrency,
-                args.n_samples_per_prompt,
-                args.rollout_num_gpus,
-            )
-        )
-    )
-    rollout_fn_flag = (
-        "--rollout-function-path "
-        "examples.experimental.generative_retriever.model.local_coloc_rollout.GRLocalColocatedRolloutFn "
-        if args.local_coloc_rollout
-        else ""
-    )
+    mem_fraction = args.sglang_mem_fraction_static if args.sglang_mem_fraction_static > 0 else 0.105
     sglang_args = shlex.join(build_sglang_args(args, mem_fraction, colocate=True)) + " "
     optimizer_args = shlex.join(build_optimizer_args(args.lr)) + " "
     grpo_args = shlex.join(build_algorithm_args()) + " "
@@ -144,13 +120,11 @@ def _build_single_node_train_args(
     learner_args = (
         "--train-backend fsdp "
         "--data-source-path examples.experimental.generative_retriever.index.data_source.GRRolloutDataSource "
-        "--custom-weight-sync-function-path "
-        "examples.experimental.generative_retriever.index.data_source.sync_mapping_on_weight_update "
         "--custom-fsdp-model-factory-path "
         "examples.experimental.generative_retriever.model.fsdp_policy.build_gr_stage5_policy "
         "--weight-sync-include-prefixes encoder_list.0.model.encoder.model. docEnc2decoder. decoder. lm_head. "
         "--update-weight-buffer-size 2147483648 "
-        f"--micro-batch-size {effective_mbs} "
+        f"--micro-batch-size {args.micro_batch_size} "
     )
     checkpoint_args = (
         f"--save {quote(os.fspath(checkpoint_dir))} "
@@ -166,7 +140,9 @@ def _build_single_node_train_args(
         f"--input-key {quote(prompt_data.input_key)} "
         f"{f'--label-key {quote(prompt_data.label_key)} ' if prompt_data.label_key else ''}"
         f"{f'--metadata-key {quote(prompt_data.metadata_key)} ' if prompt_data.metadata_key else ''}"
-        f"--rollout-shuffle {rollout_fn_flag}"
+        "--rollout-shuffle "
+        "--rollout-function-path "
+        "examples.experimental.generative_retriever.model.local_coloc_rollout.GRLocalColocatedRolloutFn "
         "--custom-generate-function-path examples.experimental.generative_retriever.model.sglang_encode_generate.generate "
         "--custom-rm-path examples.experimental.generative_retriever.reward.reward.reward "
         "--custom-rollout-log-function-path examples.experimental.generative_retriever.reward.rollout_metrics.log_rollout "
