@@ -198,6 +198,7 @@ def build_algorithm_args() -> list[str]:
     return [
         "--advantage-estimator", "grpo", "--kl-coef", "0", "--kl-loss-coef", "0",
         "--entropy-coef", "0", "--eps-clip", "0.2", "--eps-clip-high", "0.28",
+        "--eps-clip-c", "3.0",
         "--use-rollout-logprobs", "--skip-actor-forward-only",
     ]
 

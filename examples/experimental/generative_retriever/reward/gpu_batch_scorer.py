@@ -149,13 +149,6 @@ def _reduce_edge_metrics_gpu(
     rel_el = p_ok | s_ok
     any_u = u_pm | u_sm
 
-    # Store unit (unique_weight = 1.0) bonus components; caller scales linearly by step unique_weight.
-    unit_pm_ub = torch.where(pm_u_el, 0.5 * rel_q, 0.0)
-    unit_sm_ub = torch.where(sm_u_el, 0.5 * rel_q, 0.0)
-    unit_ub = unit_pm_ub + unit_sm_ub
-
-    is_cont = gr_config.reward_mode == "continuous_relevance_unique"
-    base_raw = cont_b if is_cont else disc_b
     if e_pol > 0:
         p_ref_pm, p_ref_sm = compute_dinkelbach_watermarks_gpu(
             num_queries=n_valid,
@@ -166,7 +159,19 @@ def _reduce_edge_metrics_gpu(
             base_p_pm=base_p_pm_gpu,
             base_p_sm=base_p_sm_gpu,
         )
-        base_raw = base_raw - (p_ref_pm + p_ref_sm)[pol_edge_v_gpu]
+        edge_p_pm = p_ref_pm[pol_edge_v_gpu]
+        edge_p_sm = p_ref_sm[pol_edge_v_gpu]
+    else:
+        edge_p_pm = torch.empty(0, dtype=torch.float64, device=device)
+        edge_p_sm = torch.empty(0, dtype=torch.float64, device=device)
+
+    # Store unit (unique_weight = 1.0) bonus scaled by Dinkelbach surplus (1 - p_ref_m).
+    unit_pm_ub = torch.where(pm_u_el, 0.5 * (1.0 - edge_p_pm).clamp_min(0.0) * rel_q, 0.0)
+    unit_sm_ub = torch.where(sm_u_el, 0.5 * (1.0 - edge_p_sm).clamp_min(0.0) * rel_q, 0.0)
+    unit_ub = unit_pm_ub + unit_sm_ub
+
+    is_cont = gr_config.reward_mode == "continuous_relevance_unique"
+    base_raw = (cont_b if is_cont else disc_b) - (edge_p_pm + edge_p_sm)
     base_rew = base_raw * inv_freq
     unit_ub_rew = unit_ub * inv_freq
 
