@@ -37,7 +37,7 @@ DOC2K_MIN_HEAD_RANKS = 16
 DOC2K_MAX_ADDS_PER_QUERY = 8
 DOC2K_ADD_MIN_QUERIES = 10
 DOC2K_PRUNE_MIN_QUERIES = 32
-TREE_CREDIT_TOP_K = (8, 4, 1)
+TREE_CREDIT_TOP_K = (8, 4, 2)
 
 
 def is_doc2k_disabled() -> bool:
@@ -214,8 +214,6 @@ def score_and_summarize_docid(
     denom_b = float(baseline.total_unique_keywords)
     ref_pm = float(p_ref_pm) if p_ref_pm is not None else (len(base_pm) / denom_b if denom_b > 0.0 else 0.0)
     ref_sm = float(p_ref_sm) if p_ref_sm is not None else (len(base_sm) / denom_b if denom_b > 0.0 else 0.0)
-    pm_surplus = max(0.0, 1.0 - ref_pm)
-    sm_surplus = max(0.0, 1.0 - ref_sm)
     watermark = ref_pm + ref_sm
     is_cont = mode == "continuous_relevance_unique"
 
@@ -268,8 +266,8 @@ def score_and_summarize_docid(
         u_el = pm_u_el or sm_u_el
         rel_el = p_ok or s_ok
 
-        pm_ub = (0.5 * unique_weight * pm_surplus * rel_q) if pm_u_el else 0.0
-        sm_ub = (0.5 * unique_weight * sm_surplus * rel_q) if sm_u_el else 0.0
+        pm_ub = (0.5 * unique_weight * rel_q) if pm_u_el else 0.0
+        sm_ub = (0.5 * unique_weight * rel_q) if sm_u_el else 0.0
         ub = pm_ub + sm_ub
         disc_t = disc_b + ub
         cont_t = cont_b + ub

@@ -106,13 +106,12 @@ def normalize_group_advantages_tensor(
     rewards_norm: bool,
     grpo_std_norm: bool,
 ) -> torch.Tensor:
-    """Center returns per depth across ``dim=1`` and scale uniformly by leaf-level group std."""
+    """Normalize ``[B, G]`` or ``[B, G, C]`` returns across the group dimension ``dim=1``."""
     if not rewards_norm:
         return returns_t
     centered = returns_t - returns_t.mean(dim=1, keepdim=True)
     if grpo_std_norm and returns_t.shape[1] > 1:
-        std_source = returns_t[:, :, -1:] if returns_t.ndim == 3 else returns_t
-        std = std_source.std(dim=1, keepdim=True)
+        std = returns_t.std(dim=1, keepdim=True)
         centered = torch.where(std > 0, centered / (std + 1e-6), centered)
     return centered
 

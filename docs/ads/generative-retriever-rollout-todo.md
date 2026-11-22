@@ -189,13 +189,13 @@ W_PM = clip(s_PM / 0.58, 0, 1)
 W_SM = clip(s_SM / 0.82, 0, 1)
 Q = (W_PM + W_SM) / 2
 c_q(k) = max(1, count_of_rollout_docids_under_q_containing_k)
-pm_unique_bonus = (UNIQUE_WEIGHT * 0.5 / c_q(k)) * (1 - p_ref_PM(q)) * U_PM * P * Q
-sm_unique_bonus = (UNIQUE_WEIGHT * 0.5 / c_q(k)) * (1 - p_ref_SM(q)) * U_SM * S * Q
+pm_unique_bonus = (UNIQUE_WEIGHT * 0.5 / c_q(k)) * U_PM * P * Q
+sm_unique_bonus = (UNIQUE_WEIGHT * 0.5 / c_q(k)) * U_SM * S * Q
 unique_bonus = pm_unique_bonus + sm_unique_bonus
 ```
 
 - `UNIQUE_WEIGHT = 2.0`：PM / SM unique bonus 分别在该头过阈值且 keyword 不属于对应
-  baseline 集合时生效，按当前 query 的 Dinkelbach 净余量 `(1 - p_ref_m(q))` 与跨头连续质量因子 `Q` 对齐尺度，并按该词在同一 query 的 rollout group
+  baseline 集合时生效，乘跨头连续质量因子 `Q`，并按该词在同一 query 的 rollout group
   中出现的 doc ID 频次 $c_q(k)$ 做 $1/c_q(k)$ 折减（抑制多个 doc ID 映射到同一热门词的重复刷分）。
 - 单头 bonus 最大为 `1.0`，总 `unique_bonus` 最大为 `2.0`，两种 reward mode 的单 keyword 范围均为 `[0,4]`。
 - 实现在 [relevance_reward.py](../../examples/experimental/generative_retriever/reward/relevance_reward.py)。
@@ -225,7 +225,7 @@ R_continuous = continuous_base + unique_bonus
   对同一个 doc ID $d$ 对应的去重 keyword 集合 $K(d)$ 按组内词频折减求和后除以纯几何平均分母 $\sqrt{\max(|K(d)|, 1)}$：
   `R_docid(q, d) = sum_{k in K(d)} (R_keyword(q, k) / c_q(k)) / sqrt(max(|K(d)|, 1))`。
 - **4 层因果 RQ 前缀树 Credit Assignment**（[gr_policy.py](../../examples/experimental/generative_retriever/sglang_models/gr_policy.py) / [rollout_metrics.py](../../examples/experimental/generative_retriever/reward/rollout_metrics.py)）：
-  在同一 query 的 rollout group 内对 512 个候选 doc ID 的原始 reward 按 4 层 RQ 前缀树自底向上聚合子树 `top-k` 均值（`TREE_CREDIT_TOP_K = (8, 4, 1)`，分别对应 depth 1 / 2 / 3，三级子树对齐最优单桶），按层赋予因果后缀算术平均回报（depth 0..2 分别为 `(v0+v1+v2+r)/4`、`(v1+v2+r)/3`、`(v2+r)/2`，第 4 层叶子 token 严格仅使用叶子自身 `r`），并在各层减组均值后统一按叶子层标准差归一化（配合 `--eps-clip-c 3.0` Dual-Clip PPO 防负优势长尾梯度尖峰）。
+  在同一 query 的 rollout group 内对 512 个候选 doc ID 的原始 reward 按 4 层 RQ 前缀树自底向上聚合子树 `top-k` 均值（`TREE_CREDIT_TOP_K = (8, 4, 2)`，分别对应 depth 1 / 2 / 3），按层赋予因果后缀算术平均回报（depth 0..2 分别为 `(v0+v1+v2+r)/4`、`(v1+v2+r)/3`、`(v2+r)/2`，第 4 层叶子 token 严格仅使用叶子自身 `r`，配合 `--eps-clip-c 3.0` Dual-Clip PPO 防负优势长尾梯度尖峰）。
 - **耦合 `doc2k` 在线动态映射更新（全局 `(10, 32)` 投票同步）**：
   每个 rollout step 期间，各 GPU 上的 SGLang 引擎在进程内打分后将本步候选投票追加写入本地 `/tmp/gr_doc2k_local_gpu{local_gpu}.delta.bin`；权重更新时，FSDP learner 通过 `GRStage5Policy._sync_global_doc2k_votes` 汇总全集群投票并写出 `/tmp/gr_doc2k_global_gpu{local_gpu}.pkl`，供同卡 SGLang 引擎在下一次 rollout 前就地更新内存中的 `ResidentMapping`（同一 rollout 内映射不变）：
   1. **Tail-to-Head 相关性制导同子树共投注入**：按策略真实对数概率排序划分头部（前 `DOC2K_HEAD_RANK_CUTOFF = 64`）与尾部，将尾部同时满足 `PM >= 0.58 and SM >= 0.82` 且双头 Unique 的好词，优先路由至已命中 `PM > 0`、共享 L3 `(c0,c1,c2)` 或 L2 `(c0,c1)` 前缀且词数 `< 10`（第一梯队）或 `< 32`（第二梯队）的头部 doc ID，全集群累计被至少 `DOC2K_ADD_MIN_QUERIES = 10` 个不同 query 验证通过后注入（每 query 最多投票 `DOC2K_MAX_ADDS_PER_QUERY = 8` 个，单 doc ID 词数上限 `DOCID_MAX_KEYWORDS = 150`）；
