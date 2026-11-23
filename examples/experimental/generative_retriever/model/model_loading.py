@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from examples.experimental.generative_retriever.utils.paths import absolute_path
+from examples.experimental.generative_retriever.utils.paths import absolute_path, stream_copy_file
 
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
@@ -50,7 +50,6 @@ _QWEN_EXPORT_ASSETS = (
     "tokenizer_config.json",
     "vocab.json",
 )
-_COPY_BUFFER_BYTES = 64 * 1024 * 1024
 _WEIGHT_SUFFIXES = (".bin", ".safetensors", ".pt", ".pth", ".onnx", ".tar")
 _STAGE_ASSETS = (
     "added_tokens.json",
@@ -272,11 +271,6 @@ def load_policy_head_checkpoint(model: Any, checkpoint: str | Path) -> int:
     return len(selected)
 
 
-def _stream_copy_file(src: Path, dst: Path) -> None:
-    with src.open("rb") as src_f, dst.open("wb") as dst_f:
-        shutil.copyfileobj(src_f, dst_f, length=_COPY_BUFFER_BYTES)
-
-
 def _load_dcp_policy_tensors(dcp_model_dir: str | Path) -> dict[str, torch.Tensor]:
     ckpt_dir = require_directory(dcp_model_dir, "DCP model checkpoint")
     metadata_file = ckpt_dir / ".metadata"
@@ -334,7 +328,7 @@ def export_policy_head_checkpoint(
     with tempfile.TemporaryDirectory(prefix="gr_policy_pt_") as tmp_dir_str:
         tmp_pt = Path(tmp_dir_str) / "policy_head.pt"
         torch.save(payload, tmp_pt)
-        _stream_copy_file(tmp_pt, out_pt)
+        stream_copy_file(tmp_pt, out_pt)
     return len(tensors)
 
 
@@ -398,7 +392,7 @@ def copy_qwen_export_assets(qwen_model_dir: str | Path, output_dir: str | Path) 
         src_asset = staged_qwen / asset_name if (staged_qwen / asset_name).is_file() else raw_qwen / asset_name
         if not src_asset.is_file():
             raise FileNotFoundError(f"Qwen config/tokenizer asset is missing: {raw_qwen / asset_name}")
-        _stream_copy_file(src_asset, qwen_out / asset_name)
+        stream_copy_file(src_asset, qwen_out / asset_name)
     return len(_QWEN_EXPORT_ASSETS)
 
 
@@ -447,7 +441,7 @@ def export_slmv3_checkpoint(
 
         out_dir.mkdir(parents=True, exist_ok=True)
         for filename in sorted(p.name for p in tmp_out.iterdir()):
-            _stream_copy_file(tmp_out / filename, out_dir / filename)
+            stream_copy_file(tmp_out / filename, out_dir / filename)
 
     qwen_assets = copy_qwen_export_assets(qwen_model_dir, out_dir) if qwen_model_dir is not None else 0
     return {
