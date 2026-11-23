@@ -462,20 +462,27 @@ checkpoint 和 manifest 记录位于 `$cosmos_data_path/local/User/zihao/online_
 
 ### 固定评测集
 
-- 数据源：`$cosmos_data_path/local/Users/tianchiyang/Data/MZLog/`
-  `TA_PA_UnifiedData_202411to202511/TAKeyword/valid_100K.queryfeat/Part0`。
-- 从非空 `query` 字段中的 99,812 个 distinct 文本按 RecordIO 源顺序与固定 seed
-  `20261019` 做 reservoir 抽样，抽取 **10,000** 个 query 作为固定评测集
-  （`queries.jsonl` SHA-256 为 `d36822a89c715a73281af87118bfde972516f3183f99ef6646a82585cf1ce732`；
-  早期单机存档评测曾使用同一 seed 抽取的 1,000-query 子集，SHA-256 为
-  `ebfb9943bfb58ab0e354dafbfd00fc17729c500d4810231e90d680697185dc1a`）。
+- **历史验证评测集（`valid_100k_10k`）**：
+  - 数据源：`$cosmos_data_path/local/Users/tianchiyang/Data/MZLog/`
+    `TA_PA_UnifiedData_202411to202511/TAKeyword/valid_100K.queryfeat/Part0`。
+  - 从非空 `query` 字段中的 99,812 个 distinct 文本按 RecordIO 源顺序与固定 seed
+    `20261019` 做 reservoir 抽样，抽取 **10,000** 个 query，统一入库于
+    `$cosmos_data_path/local/User/zihao/online_rl/gr_offline_syn/eval_sets/valid_100k_10k/`
+    （`queries.jsonl` SHA-256 为 `d36822a89c715a73281af87118bfde972516f3183f99ef6646a82585cf1ce732`；
+    早期单机存档评测曾使用同一 seed 抽取的 1,000-query 子集，SHA-256 为
+    `ebfb9943bfb58ab0e354dafbfd00fc17729c500d4810231e90d680697185dc1a`）。
+- **线上同源评测集（`prod_rl_train_test_20261121_v1_10k`）**：
+  - 数据源：`$cosmos_data_path/local/User/xinyu2/rsi_for_ads/prod_rl_train_test_20261121_v1/test_query_keywords_plain.tsv`（`4,205,877` 行 RFC-4180 TSV，列为 `query, keyword, market`）。
+  - 按首次出现顺序提取全部 **10,000** 条去重非空 `query`（`en-us` `9,309` 条、`en-ca` `535` 条、`fr-ca` `144` 条、其余市场 `12` 条），入库于
+    `$cosmos_data_path/local/User/zihao/online_rl/gr_offline_syn/eval_sets/prod_rl_train_test_20261121_v1_10k/`
+    （`queries.jsonl` SHA-256 为 `20a74c207093d2896f148b036bf4bbfeedefb05904764d5f7a45115be65d537d`）。
 - Frozen baseline 与 policy checkpoint 均使用同一映射、同一 Qwen3-4B 编码器与确定性 constrained
   top-$K$ beam（默认 `--docids-per-query 64`，最高支持 `512`，且同一次评测中 Policy 与 Baseline 的 `docids_per_query` 必须严格一致）；映射展开后按 keyword 原文精确匹配、
   大小写敏感去重。
-- 评测目录结构为
-  `$cosmos_data_path/local/User/zihao/online_rl/gr_offline_syn/<run_id>/eval/valid_100k_10k_top64_step<step>/`，
-  包含 `queries.jsonl`、`evaluation.json`、`baseline.jsonl`、`policy-head-step<step>.pt`、
-  `policy.jsonl` 与 `summary.json`。
+- 评测目录结构默认为
+  `$cosmos_data_path/local/User/zihao/online_rl/gr_offline_syn/<run_id>/eval/<dataset_tag>_top<K>_step<step>/`，
+  包含 `queries.jsonl`、`evaluation.json`、`policy-head-step<step>.pt`、`policy.jsonl` 与 `summary.json`。
+  `eval_cache/` 下的 Baseline 缓存直接由 `evaluation.json` 的 `(source, manifest_sha256)` 与 `(docids_per_query, mapping_version)` 纯字符串映射出唯一文件名，避免 FUSE 大文件扫描或不同评测集串用覆盖。
 
 ### 评测公式与指标协议
 
@@ -535,7 +542,7 @@ Mapping 查询按最多 4,096 个不同 ID 分批；baseline 服务缓存 query 
   中的 `export_policy_head_checkpoint` 读取 FSDP DCP checkpoint（`checkpoints/iter_XXXXXXX/model`）
   中训练更新的 Qwen3-4B 编码器与解码头张量（`encoder_list.0.model.encoder.model.`、`docEnc2decoder.`、`decoder.`、`lm_head.`），
   快速导出 `policy-head-step<step>.pt` 供 `baseline_service.py --policy-checkpoint` 加载（同时向后兼容仅含解码头的旧版导出文件）。
-- 如需交付完整 `SLMv3` 标准目录格式（双分片 `pytorch_model-00001/00002-of-00002.bin` + 索引与配置，默认输出至 `<run_dir>/exported/checkpoint-<step>`，供线上服务、`SLMv3/run_mt.py` 或 `transfer_to_onnx_slm_and_rqvae.py` 直接加载），使用 [export_slmv3_checkpoint.py](../../examples/experimental/generative_retriever/model/export_slmv3_checkpoint.py)（内部调用 `export_slmv3_checkpoint`，在合入全部 442 个训后 `Qwen3-4B` 与解码头张量的同时自动同步 `encoder_list.0.model.encoder.lm_head.weight`、`docid_embedding.weight` 与 `glue.embeds` 三个共享绑定权重）：
+- 如需交付完整 `SLMv3` 标准目录格式（双分片 `pytorch_model-00001/00002-of-00002.bin` + 索引/配置 + `qwen_config/`，默认输出至 `<run_dir>/exported/checkpoint-<step>`，供线上服务、`SLMv3/run_mt.py`、`transfer_to_onnx_slm_and_rqvae.py` 或零仓库依赖脚本 [standalone_slmv3_infer.py](../../examples/experimental/generative_retriever/model/standalone_slmv3_infer.py) 直接加载），使用 [export_slmv3_checkpoint.py](../../examples/experimental/generative_retriever/model/export_slmv3_checkpoint.py)（内部调用 `export_slmv3_checkpoint`，在合入全部 442 个训后 `Qwen3-4B` 与解码头张量的同时自动同步 `encoder_list.0.model.encoder.lm_head.weight`、`docid_embedding.weight` 与 `glue.embeds` 三个共享绑定权重）：
   ```bash
   uv run --env-file .env python -m examples.experimental.generative_retriever.model.export_slmv3_checkpoint \
     --run-id <run_id> --step <step>
