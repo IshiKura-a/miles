@@ -14,19 +14,25 @@ from __future__ import annotations
 from examples.experimental.generative_retriever.utils.paths import absolute_path
 
 import argparse
-import json
+from dataclasses import dataclass
 import os
-import shutil
+from pathlib import Path
 import socket
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
-from pathlib import Path
 from typing import IO, Any, Literal
 
 import httpx
 
+from examples.experimental.generative_retriever.eval.manifest import (
+    EvalManifest,
+    baseline_cache_path,
+    eval_dir_name,
+    load_eval_manifest,
+    publish_baseline_cache,
+    stage_eval_inputs,
+)
 from examples.experimental.generative_retriever.eval.good_count_eval import run as run_good_count_eval
 from examples.experimental.generative_retriever.index.id_text_mapping import is_columnar_index_dir
 from examples.experimental.generative_retriever.model.model_loading import export_policy_head_checkpoint
@@ -53,7 +59,7 @@ class EvalConfig:
     output_dir: str = "$cosmos_data_path/local/User/zihao/online_rl/gr_offline_syn"
     base_eval_root: str = (
         "$cosmos_data_path/local/User/zihao/online_rl/gr_offline_syn/"
-        "261021-114423-121/eval/valid_100k_10k_top64_step840"
+        "eval_sets/valid_100k_10k"
     )
     eval_root: str | None = None
     checkpoint: str = (
@@ -123,64 +129,33 @@ def _resolve_step(run_dir: Path, requested_step: int | None) -> int:
     return candidates[-1]
 
 
-def _baseline_has_version(baseline_path: Path, expected_version: str) -> bool:
-    if not baseline_path.is_file():
-        return False
-    try:
-        with baseline_path.open(encoding="utf-8") as stream:
-            for line in stream:
-                if line.strip():
-                    return json.loads(line).get("mapping_version") == expected_version
-        return False
-    except Exception:
-        return False
-
-
-def _baseline_matches_mapping(baseline_path: Path, expected_version: str, expected_queries: int) -> bool:
-    if not _baseline_has_version(baseline_path, expected_version):
-        return False
-    try:
-        with baseline_path.open(encoding="utf-8") as stream:
-            return sum(1 for line in stream if line.strip()) == expected_queries
-    except Exception:
-        return False
-
-
 def _prepare_eval_directory(
     *,
+    output_root: Path,
     eval_root: Path,
     base_eval_root: Path,
+    base_manifest: EvalManifest,
     dcp_model_dir: Path,
     step: int,
     initial_mapping_version: str,
-    cached_baseline_path: Path,
-) -> tuple[Path, int]:
-    eval_root.mkdir(parents=True, exist_ok=True)
-    for filename in ("queries.jsonl", "evaluation.json"):
-        target = eval_root / filename
-        source = base_eval_root / filename
-        if not target.is_file() and source.is_file():
-            shutil.copy2(source, target)
-    if not (eval_root / "queries.jsonl").is_file():
-        raise FileNotFoundError(f"Missing required evaluation input: {eval_root / 'queries.jsonl'}")
-    with (eval_root / "queries.jsonl").open(encoding="utf-8") as q_stream:
-        expected_queries = sum(1 for line in q_stream if line.strip())
-
-    target_baseline = eval_root / "baseline.jsonl"
-    if not _baseline_matches_mapping(target_baseline, initial_mapping_version, expected_queries):
-        if target_baseline.is_file() and not _baseline_has_version(target_baseline, initial_mapping_version):
-            target_baseline.unlink()
-        if not target_baseline.is_file():
-            if _baseline_matches_mapping(cached_baseline_path, initial_mapping_version, expected_queries):
-                shutil.copy2(cached_baseline_path, target_baseline)
-            elif _baseline_matches_mapping(base_eval_root / "baseline.jsonl", initial_mapping_version, expected_queries):
-                shutil.copy2(base_eval_root / "baseline.jsonl", target_baseline)
-
+    docids_per_query: int,
+) -> tuple[Path, Path, bool]:
+    manifest = stage_eval_inputs(
+        eval_root,
+        base_eval_root=base_eval_root,
+        base_manifest=base_manifest,
+    )
+    cached_baseline = baseline_cache_path(
+        output_root,
+        manifest,
+        docids_per_query=docids_per_query,
+        mapping_version=initial_mapping_version,
+    )
     policy_pt = eval_root / f"policy-head-step{step}.pt"
     if not policy_pt.is_file() or policy_pt.stat().st_size == 0:
         tensor_count = export_policy_head_checkpoint(dcp_model_dir, policy_pt)
         print(f"Exported {tensor_count} policy-head tensors -> {policy_pt}", flush=True)
-    return policy_pt, expected_queries
+    return policy_pt, cached_baseline, not cached_baseline.is_file()
 
 
 def _scorer_already_ready(port: int, mapping_version: str, relevance_model: str) -> bool:
@@ -272,12 +247,13 @@ def run_evaluation(config: EvalConfig) -> dict[str, Any] | None:
     step = _resolve_step(run_dir, config.step)
     step_pad = f"{step:07d}"
     dcp_model_dir = run_dir / "checkpoints" / f"iter_{step_pad}" / "model"
+    base_eval_root = _expand_path(config.base_eval_root, "base_eval_root", expect_dir=True)
+    base_manifest = load_eval_manifest(base_eval_root)
     eval_root = (
         _expand_path(config.eval_root, "eval_root")
         if config.eval_root is not None
-        else run_dir / "eval" / f"valid_100k_10k_top64_step{step}"
+        else run_dir / "eval" / eval_dir_name(base_manifest, docids_per_query=config.docids_per_query, step=step)
     )
-    base_eval_root = _expand_path(config.base_eval_root, "base_eval_root", expect_dir=True)
     stage5_ckpt = _expand_path(config.checkpoint, "checkpoint", expect_dir=True)
     qwen_model = _expand_path(config.qwen_model, "qwen_model", expect_dir=True)
     slm_root = _expand_path(config.slm_root, "slm_root", expect_dir=True)
@@ -289,24 +265,19 @@ def run_evaluation(config: EvalConfig) -> dict[str, Any] | None:
         raise FileNotFoundError(f"Incomplete checkpoint mapping index: {ckpt_mapping_dir}")
     policy_mapping = ckpt_mapping_dir
     relevance_model = _expand_path(config.relevance_model, "relevance_model", expect_dir=True)
-    cached_baseline_path = (
-        output_root
-        / "eval_cache"
-        / f"baseline_top{config.docids_per_query}_{id_mapping.name}.jsonl"
-    )
-
-    policy_pt, expected_queries = _prepare_eval_directory(
+    policy_pt, cached_baseline_path, need_baseline = _prepare_eval_directory(
+        output_root=output_root,
         eval_root=eval_root,
         base_eval_root=base_eval_root,
+        base_manifest=base_manifest,
         dcp_model_dir=dcp_model_dir,
         step=step,
         initial_mapping_version=id_mapping.name,
-        cached_baseline_path=cached_baseline_path,
+        docids_per_query=config.docids_per_query,
     )
 
     pkg = "examples.experimental.generative_retriever.services."
     target_baseline = eval_root / "baseline.jsonl"
-    need_baseline = not _baseline_matches_mapping(target_baseline, id_mapping.name, expected_queries)
     services: list[_ManagedService] = []
     try:
         scorer_svc: _ManagedService | None = None
@@ -387,8 +358,7 @@ def run_evaluation(config: EvalConfig) -> dict[str, Any] | None:
                     docids_per_query=config.docids_per_query,
                     score_head=config.score_head,
                 )
-                cached_baseline_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(target_baseline, cached_baseline_path)
+                publish_baseline_cache(target_baseline, cached_baseline_path)
             finally:
                 _stop_services([base_map_svc])
 
@@ -417,7 +387,7 @@ def run_evaluation(config: EvalConfig) -> dict[str, Any] | None:
         return run_good_count_eval(
             mode="policy",
             manifest=eval_root / "queries.jsonl",
-            baseline_results=eval_root / "baseline.jsonl",
+            baseline_results=cached_baseline_path,
             output=eval_root / "policy.jsonl",
             summary_output=eval_root / "summary.json",
             generate_url=f"http://127.0.0.1:{config.generator_port}/generate",
@@ -431,56 +401,27 @@ def run_evaluation(config: EvalConfig) -> dict[str, Any] | None:
 
 
 def main() -> None:
+    defaults = EvalConfig()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--run-id", default="261027-bs64-v2")
+    parser.add_argument("--run-id", default=defaults.run_id)
     parser.add_argument("--step", type=int)
-    parser.add_argument(
-        "--output-dir",
-        default="$cosmos_data_path/local/User/zihao/online_rl/gr_offline_syn",
-    )
-    parser.add_argument(
-        "--base-eval-root",
-        default=(
-            "$cosmos_data_path/local/User/zihao/online_rl/gr_offline_syn/"
-            "261021-114423-121/eval/valid_100k_10k_top64_step840"
-        ),
-    )
+    parser.add_argument("--output-dir", default=defaults.output_dir)
+    parser.add_argument("--base-eval-root", default=defaults.base_eval_root)
     parser.add_argument("--eval-root")
-    parser.add_argument(
-        "--checkpoint",
-        default=(
-            "$cosmos_data_path/local/Users/tianchiyang/Checkpoints/ASI_RQ/"
-            "SLMv3-202511-4x256-stage5/epoch1-part24/checkpoint-30553"
-        ),
-    )
-    parser.add_argument(
-        "--qwen-model",
-        default="$cosmos_data_path/local/Users/tianchiyang/LLM/Qwen/Qwen3-4B",
-    )
-    parser.add_argument("--slm-root", default="/home/aiscuser/SLMGR_dev/SLMv3")
-    parser.add_argument(
-        "--id-mapping",
-        default=(
-            "$cosmos_data_path/local/User/zihao/online_rl/gr_offline_syn/index/"
-            "slmgrv3_part25_na_intl_20261028_20261029"
-        ),
-    )
-    parser.add_argument(
-        "--relevance-model",
-        default=(
-            "$cosmos_data_path/local/User/yugao/share/qualitymodel/"
-            "GCQC/GV2.1/ForArcher/Large"
-        ),
-    )
-    parser.add_argument("--generator-devices", default=_DEFAULT_GENERATOR_DEVICES)
-    parser.add_argument("--scorer-devices", default=_DEFAULT_SCORER_DEVICES)
-    parser.add_argument("--batch-size", type=int, default=DEFAULT_EVAL_BATCH_SIZE)
-    parser.add_argument("--scorer-batch-size", type=int, default=8192)
-    parser.add_argument("--docids-per-query", type=int, default=DEFAULT_EVAL_GROUP_SIZE)
-    parser.add_argument("--score-head", choices=("sm", "pm"), default="pm")
-    parser.add_argument("--mapping-port", type=int, default=_MAPPING_PORT)
-    parser.add_argument("--generator-port", type=int, default=_GENERATOR_PORT)
-    parser.add_argument("--scorer-port", type=int, default=_SCORER_PORT)
+    parser.add_argument("--checkpoint", default=defaults.checkpoint)
+    parser.add_argument("--qwen-model", default=defaults.qwen_model)
+    parser.add_argument("--slm-root", default=defaults.slm_root)
+    parser.add_argument("--id-mapping", default=defaults.id_mapping)
+    parser.add_argument("--relevance-model", default=defaults.relevance_model)
+    parser.add_argument("--generator-devices", default=defaults.generator_devices)
+    parser.add_argument("--scorer-devices", default=defaults.scorer_devices)
+    parser.add_argument("--batch-size", type=int, default=defaults.batch_size)
+    parser.add_argument("--scorer-batch-size", type=int, default=defaults.scorer_batch_size)
+    parser.add_argument("--docids-per-query", type=int, default=defaults.docids_per_query)
+    parser.add_argument("--score-head", choices=("sm", "pm"), default=defaults.score_head)
+    parser.add_argument("--mapping-port", type=int, default=defaults.mapping_port)
+    parser.add_argument("--generator-port", type=int, default=defaults.generator_port)
+    parser.add_argument("--scorer-port", type=int, default=defaults.scorer_port)
     args = parser.parse_args()
     run_evaluation(
         EvalConfig(
