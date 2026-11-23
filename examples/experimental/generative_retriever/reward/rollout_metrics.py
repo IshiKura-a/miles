@@ -126,10 +126,22 @@ def apply_quota_cap_to_advantages(
     *,
     quota_k: int = QUOTA_CAP_K,
 ) -> torch.Tensor:
-    """Scale positive advantages by ``clamp(1 - K * pi_old(d|q), 0, 1)`` while keeping negative advantages intact."""
+    """Cap positive advantages above ``1/K`` path probability while conserving zero-sum group balance."""
+    adv_f32 = advantages_3d.to(torch.float32)
     seq_probs = token_logprobs_3d.to(torch.float32).sum(dim=-1, keepdim=True).clamp(max=0.0).exp()
     headroom = (1.0 - float(quota_k) * seq_probs).clamp(min=0.0, max=1.0)
-    return torch.where(advantages_3d > 0.0, advantages_3d * headroom.to(advantages_3d.dtype), advantages_3d)
+
+    pos_mask = adv_f32 > 0.0
+    pos_adv = torch.where(pos_mask, adv_f32, 0.0)
+    capped_pos = pos_adv * headroom
+
+    orig_pos_sum = pos_adv.sum(dim=1, keepdim=True)
+    capped_pos_sum = capped_pos.sum(dim=1, keepdim=True)
+    has_under_quota_pos = capped_pos_sum > 1.0e-6
+    scale = orig_pos_sum / capped_pos_sum.clamp_min(1.0e-6)
+    rebalanced = torch.where(pos_mask, capped_pos * scale, adv_f32)
+    out = torch.where(has_under_quota_pos, rebalanced, torch.zeros_like(adv_f32))
+    return out.to(advantages_3d.dtype)
 
 
 def summarize_rollout_prob_concentration(
