@@ -25,6 +25,7 @@ _DEFAULT_BASE_CHECKPOINT = (
     "$cosmos_data_path/local/Users/tianchiyang/Checkpoints/ASI_RQ/"
     "SLMv3-202511-4x256-stage5/epoch1-part24/checkpoint-30553"
 )
+_DEFAULT_QWEN_MODEL = "$cosmos_data_path/local/Users/tianchiyang/LLM/Qwen/Qwen3-4B"
 _DEFAULT_RUNS_ROOT = "$cosmos_data_path/local/User/zihao/online_rl/gr_offline_syn"
 
 
@@ -77,6 +78,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--runs-root", default=_DEFAULT_RUNS_ROOT, help="Root directory containing training runs")
     parser.add_argument("--dcp-model-dir", default=None, help="Explicit path to checkpoints/iter_XXXXXXX/model")
     parser.add_argument("--base-checkpoint", default=_DEFAULT_BASE_CHECKPOINT, help="Base SLMv3 checkpoint directory")
+    parser.add_argument(
+        "--qwen-model",
+        default=_DEFAULT_QWEN_MODEL,
+        help="Qwen3-4B directory whose config/tokenizer files are bundled into <output-dir>/qwen_config",
+    )
     parser.add_argument("--output-dir", default=None, help="Target directory for exported SLMv3 checkpoint")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite non-empty --output-dir if it exists")
     return parser.parse_args()
@@ -86,10 +92,12 @@ def main() -> None:
     args = _parse_args()
     dcp_dir, out_dir = _resolve_dcp_and_default_output(args)
     base_ckpt = _expand_required_path(args.base_checkpoint, "--base-checkpoint")
+    qwen_dir = _expand_required_path(args.qwen_model, "--qwen-model") if args.qwen_model else None
     summary = export_slmv3_checkpoint(
         dcp_dir,
         base_checkpoint=base_ckpt,
         output_dir=out_dir,
+        qwen_model_dir=qwen_dir,
         overwrite=args.overwrite,
     )
     print(json.dumps({"dcp_model_dir": str(dcp_dir), "output_dir": str(out_dir), **summary}, indent=2))

@@ -535,7 +535,7 @@ Mapping 查询按最多 4,096 个不同 ID 分批；baseline 服务缓存 query 
   中的 `export_policy_head_checkpoint` 读取 FSDP DCP checkpoint（`checkpoints/iter_XXXXXXX/model`）
   中训练更新的 Qwen3-4B 编码器与解码头张量（`encoder_list.0.model.encoder.model.`、`docEnc2decoder.`、`decoder.`、`lm_head.`），
   快速导出 `policy-head-step<step>.pt` 供 `baseline_service.py --policy-checkpoint` 加载（同时向后兼容仅含解码头的旧版导出文件）。
-- 如需交付完整 `SLMv3` 标准目录格式（双分片 `pytorch_model-00001/00002-of-00002.bin` + 索引与配置，默认输出至 `<run_dir>/exported/checkpoint-<step>`，供线上服务、`SLMv3/run_mt.py` 或 `transfer_to_onnx_slm_and_rqvae.py` 直接加载），使用 [export_slmv3_checkpoint.py](../../examples/experimental/generative_retriever/model/export_slmv3_checkpoint.py)（内部调用 `export_slmv3_checkpoint`，在合入全部 442 个训后 `Qwen3-4B` 与解码头张量的同时自动同步 `encoder_list.0.model.encoder.lm_head.weight`、`docid_embedding.weight` 与 `glue.embeds` 三个共享绑定权重）：
+- 如需交付完整 `SLMv3` 标准目录格式（双分片 `pytorch_model-00001/00002-of-00002.bin` + 索引/配置 + `qwen_config/`，默认输出至 `<run_dir>/exported/checkpoint-<step>`，供线上服务、`SLMv3/run_mt.py`、`transfer_to_onnx_slm_and_rqvae.py` 或零仓库依赖脚本 [standalone_slmv3_infer.py](../../examples/experimental/generative_retriever/model/standalone_slmv3_infer.py) 直接加载），使用 [export_slmv3_checkpoint.py](../../examples/experimental/generative_retriever/model/export_slmv3_checkpoint.py)（内部调用 `export_slmv3_checkpoint`，在合入全部 442 个训后 `Qwen3-4B` 与解码头张量的同时自动同步 `encoder_list.0.model.encoder.lm_head.weight`、`docid_embedding.weight` 与 `glue.embeds` 三个共享绑定权重）：
   ```bash
   uv run --env-file .env python -m examples.experimental.generative_retriever.model.export_slmv3_checkpoint \
     --run-id <run_id> --step <step>

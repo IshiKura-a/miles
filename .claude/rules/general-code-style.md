@@ -39,11 +39,12 @@ call out deviations in review.
   mixin when required by a framework contract, consistent with an established
   Miles architecture, or when it represents cohesive behavior shared by
   multiple implementations.
-- **Keep public APIs intentional.** Use `_`-prefixed names only for module-local
-  implementation details; promote helpers imported across modules to clean
-  public names, and avoid redundant `from x import y as y` re-export shims.
-  Preserve established public, plugin, and framework interfaces, and do not
-  rename public symbols without a migration plan.
+- **Keep public APIs intentional.** Keep any symbol that may reasonably be
+  referenced or reused by external callers public; use `_`-prefixed names only
+  when you intentionally do not want a symbol called from outside its module.
+  Avoid redundant `from x import y as y` re-export shims. Preserve established
+  public, plugin, and framework interfaces, and do not rename public symbols
+  without a migration plan.
 - **Value code reuse and eliminate duplication.** Share logic through cohesive
   helpers and modules rather than duplicating loops or formulas across call
   sites. Replace magic numbers and ad-hoc environment variables with named
@@ -71,6 +72,16 @@ call out deviations in review.
   startup cost, and make the reason clear.
 - **Use absolute imports.** Prefer absolute project imports over relative imports
   so dependencies remain explicit and code is easier to move and search.
+- **Treat FUSE and remote object-store mounts as stream storage, not local POSIX
+  disks.** Stage remote assets locally (for example under `/tmp` with file
+  locking) before passing paths to directory-scanning or random-access loaders
+  (such as `from_pretrained` or `mmap`), and assemble serialized outputs in local
+  scratch before streaming them out. Avoid directory-wide `stat` scans (`glob`,
+  `iterdir` with `stat`/`is_file`, `ls -la`), which can trigger full remote blob
+  hydration or stall on transient FUSE stub entries; address known filenames or
+  manifest entries explicitly (or inspect entry names via `os.scandir` without
+  `stat`), and copy across FUSE boundaries with buffered `read`/`write`
+  (`shutil.copyfileobj`) rather than `sendfile`-backed `shutil.copyfile`.
 - **Do not add, modify, or run `pytest` unless explicitly requested.** Keep test
   files untouched and skip `pytest` execution by default; rely on static checks
   (such as `ruff` and `pyright`) unless the user explicitly asks for `pytest`.

@@ -38,6 +38,18 @@ _SLMV3_EXPORT_ASSETS = (
     "spiece.model",
     "tokenizer_config.json",
 )
+_QWEN_EXPORT_SUBDIR = "qwen_config"
+_QWEN_EXPORT_ASSETS = (
+    "added_tokens.json",
+    "chat_template.jinja",
+    "config.json",
+    "generation_config.json",
+    "merges.txt",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "vocab.json",
+)
 _COPY_BUFFER_BYTES = 64 * 1024 * 1024
 _WEIGHT_SUFFIXES = (".bin", ".safetensors", ".pt", ".pth", ".onnx", ".tar")
 _STAGE_ASSETS = (
@@ -377,11 +389,25 @@ def _merge_slmv3_shard(
     torch.save(merged, output_shard_path)
 
 
+def copy_qwen_export_assets(qwen_model_dir: str | Path, output_dir: str | Path) -> int:
+    raw_qwen = require_directory(qwen_model_dir, "Qwen model")
+    staged_qwen = stage_local_model_dir(raw_qwen, "Qwen model")
+    qwen_out = absolute_path(output_dir) / _QWEN_EXPORT_SUBDIR
+    qwen_out.mkdir(parents=True, exist_ok=True)
+    for asset_name in _QWEN_EXPORT_ASSETS:
+        src_asset = staged_qwen / asset_name if (staged_qwen / asset_name).is_file() else raw_qwen / asset_name
+        if not src_asset.is_file():
+            raise FileNotFoundError(f"Qwen config/tokenizer asset is missing: {raw_qwen / asset_name}")
+        _stream_copy_file(src_asset, qwen_out / asset_name)
+    return len(_QWEN_EXPORT_ASSETS)
+
+
 def export_slmv3_checkpoint(
     dcp_model_dir: str | Path,
     *,
     base_checkpoint: str | Path,
     output_dir: str | Path,
+    qwen_model_dir: str | Path | None = None,
     overwrite: bool = False,
 ) -> dict[str, int]:
     """Export an FSDP DCP checkpoint into a standalone SLMv3 checkpoint directory."""
@@ -423,10 +449,12 @@ def export_slmv3_checkpoint(
         for filename in sorted(p.name for p in tmp_out.iterdir()):
             _stream_copy_file(tmp_out / filename, out_dir / filename)
 
+    qwen_assets = copy_qwen_export_assets(qwen_model_dir, out_dir) if qwen_model_dir is not None else 0
     return {
         "total_tensors": len(weight_map),
         "updated_policy_tensors": len(policy_tensors),
         "synced_tied_tensors": len(_SLMV3_TIED_WEIGHT_TARGETS),
         "shards": len(keys_by_shard),
+        "qwen_config_assets": qwen_assets,
     }
 
