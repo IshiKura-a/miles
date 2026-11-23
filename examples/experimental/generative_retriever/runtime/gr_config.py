@@ -11,15 +11,24 @@ from typing import Literal, cast
 
 Doc2kMode = Literal["relevance_guided", "disabled"]
 UniqueAnnealMode = Literal["cosine", "linear", "none", "off"]
+AntiCollapseMode = Literal["none", "quota_cap", "target_entropy"]
 RewardModeLiteral = Literal["discrete_relevance_unique", "continuous_relevance_unique"]
 
 DOC2K_MODES: tuple[Doc2kMode, ...] = ("relevance_guided", "disabled")
 UNIQUE_ANNEAL_MODES: tuple[UniqueAnnealMode, ...] = ("cosine", "linear", "none", "off")
+ANTI_COLLAPSE_MODES: tuple[AntiCollapseMode, ...] = ("none", "quota_cap", "target_entropy")
 
 GR_CONFIG_ENV_VAR = "GR_CONFIG_JSON"
 DEFAULT_STEP_TEMPERATURES: tuple[float, float, float, float] = (0.2, 0.25, 0.6, 0.8)
 DEFAULT_SGLANG_WATCHDOG_TIMEOUT_SECONDS = 600
 DEFAULT_HBM_KW_MEMORY_FRACTION = 0.20
+
+QUOTA_CAP_K = 64
+TARGET_PATH_ENTROPY = math.log(float(QUOTA_CAP_K))
+TARGET_TOKEN_ENTROPY = TARGET_PATH_ENTROPY / 4.0
+DUAL_ENTROPY_STEP_SIZE = 0.01
+MIN_ACTIVE_ENTROPY_COEF = 1.0e-8
+MAX_ADAPTIVE_ENTROPY_COEF = 0.20
 
 RAY_GRPC_KEEPALIVE_ENV: dict[str, str] = {
     "RAY_grpc_client_idle_timeout_ms": "36000000",
@@ -60,6 +69,7 @@ class GRConfig:
     step_temperatures: tuple[float, ...] = DEFAULT_STEP_TEMPERATURES
     doc2k_mode: Doc2kMode = "relevance_guided"
     unique_anneal_mode: UniqueAnnealMode = "cosine"
+    anti_collapse_mode: AntiCollapseMode = "none"
     unique_weight_start: float = 2.0
     unique_weight_end: float = 0.0
     unique_anneal_warmup_ratio: float = 0.0
@@ -74,6 +84,8 @@ class GRConfig:
             raise ValueError(f"Unsupported doc2k_mode: {self.doc2k_mode!r}")
         if self.unique_anneal_mode not in UNIQUE_ANNEAL_MODES:
             raise ValueError(f"Unsupported unique_anneal_mode: {self.unique_anneal_mode!r}")
+        if self.anti_collapse_mode not in ANTI_COLLAPSE_MODES:
+            raise ValueError(f"Unsupported anti_collapse_mode: {self.anti_collapse_mode!r}")
         if self.unique_weight_start < 0.0 or self.unique_weight_end < 0.0:
             raise ValueError("unique_weight_start and unique_weight_end must be non-negative")
         if not (0.0 <= self.unique_anneal_warmup_ratio < 1.0):

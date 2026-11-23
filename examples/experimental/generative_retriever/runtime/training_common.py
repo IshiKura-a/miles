@@ -14,10 +14,12 @@ from examples.experimental.generative_retriever.reward.relevance_reward import (
     RewardMode,
 )
 from examples.experimental.generative_retriever.runtime.gr_config import (
+    AntiCollapseMode,
     DEFAULT_HBM_KW_MEMORY_FRACTION,
     DEFAULT_SGLANG_WATCHDOG_TIMEOUT_SECONDS,
     Doc2kMode,
     GRConfig,
+    MIN_ACTIVE_ENTROPY_COEF,
     UniqueAnnealMode,
     parse_step_temperatures,
 )
@@ -83,6 +85,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     step_temperatures: str = "0.2,0.25,0.6,0.8"
     doc2k_mode: Doc2kMode = "relevance_guided"
     unique_anneal_mode: UniqueAnnealMode = "cosine"
+    anti_collapse_mode: AntiCollapseMode = "none"
     unique_weight_start: float = 2.0
     unique_weight_end: float = 0.0
     unique_anneal_warmup_ratio: float = 0.0
@@ -100,6 +103,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
             step_temperatures=parse_step_temperatures(self.step_temperatures),
             doc2k_mode=self.doc2k_mode,
             unique_anneal_mode=self.unique_anneal_mode,
+            anti_collapse_mode=self.anti_collapse_mode,
             unique_weight_start=self.unique_weight_start,
             unique_weight_end=self.unique_weight_end,
             unique_anneal_warmup_ratio=self.unique_anneal_warmup_ratio,
@@ -194,10 +198,12 @@ def build_optimizer_args(lr: float) -> list[str]:
     ]
 
 
-def build_algorithm_args() -> list[str]:
+def build_algorithm_args(anti_collapse_mode: AntiCollapseMode = "none") -> list[str]:
+    entropy_coef = str(MIN_ACTIVE_ENTROPY_COEF) if anti_collapse_mode == "target_entropy" else "0"
     return [
         "--advantage-estimator", "grpo", "--kl-coef", "0", "--kl-loss-coef", "0",
-        "--entropy-coef", "0", "--eps-clip", "0.2", "--eps-clip-high", "0.28",
+        "--entropy-coef", entropy_coef, "--observe-training-entropy",
+        "--eps-clip", "0.2", "--eps-clip-high", "0.28",
         "--eps-clip-c", "3.0",
         "--use-rollout-logprobs", "--skip-actor-forward-only",
     ]

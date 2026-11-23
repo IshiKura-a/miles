@@ -14,6 +14,10 @@ from examples.experimental.generative_retriever.reward.relevance_reward import (
     RQ_CODE_NUM,
     TREE_CREDIT_TOP_K,
 )
+from examples.experimental.generative_retriever.runtime.gr_config import (
+    GRConfig,
+    QUOTA_CAP_K,
+)
 from miles.utils.metric_utils import compute_rollout_step
 from miles.utils.tracking_utils import tracking
 
@@ -114,6 +118,34 @@ def normalize_group_advantages_tensor(
         std = returns_t.std(dim=1, keepdim=True)
         centered = torch.where(std > 0, centered / (std + 1e-6), centered)
     return centered
+
+
+def apply_quota_cap_to_advantages(
+    advantages_3d: torch.Tensor,
+    token_logprobs_3d: torch.Tensor,
+    *,
+    quota_k: int = QUOTA_CAP_K,
+) -> torch.Tensor:
+    """Scale positive advantages by ``clamp(1 - K * pi_old(d|q), 0, 1)`` while keeping negative advantages intact."""
+    seq_probs = token_logprobs_3d.to(torch.float32).sum(dim=-1, keepdim=True).clamp(max=0.0).exp()
+    headroom = (1.0 - float(quota_k) * seq_probs).clamp(min=0.0, max=1.0)
+    return torch.where(advantages_3d > 0.0, advantages_3d * headroom.to(advantages_3d.dtype), advantages_3d)
+
+
+def summarize_rollout_prob_concentration(
+    lp_3d: np.ndarray,
+    *,
+    quota_k: int = QUOTA_CAP_K,
+) -> tuple[float, float, float]:
+    """Return ``(over_quota_count_sum, top16_prob_mass_sum, sampled_prob_mass_sum)`` across query groups."""
+    if lp_3d.size == 0:
+        return 0.0, 0.0, 0.0
+    seq_p = np.exp(np.clip(lp_3d.astype(np.float64, copy=False).sum(axis=-1), a_min=None, a_max=0.0))
+    over_quota_sum = float(np.sum(seq_p >= (1.0 / float(quota_k))))
+    top_n = min(16, seq_p.shape[1])
+    top16_sum = float(np.sum(np.partition(seq_p, seq_p.shape[1] - top_n, axis=1)[:, -top_n:]))
+    samp_sum = float(np.sum(seq_p))
+    return over_quota_sum, top16_sum, samp_sum
 
 
 def _is_regular_group_layout(samples: list[Any], g_size: int) -> bool:
@@ -245,6 +277,11 @@ def convert_gr_samples_to_train_data(args: Any, samples: list[Any]) -> dict[str,
             rewards_norm=bool(args.rewards_normalization),
             grpo_std_norm=grpo_std,
         )
+        if GRConfig.from_env().anti_collapse_mode == "quota_cap":
+            lp_3d = torch.tensor([s.rollout_log_probs for s in samples], dtype=torch.float32).view(
+                -1, g_size, RQ_CODE_NUM
+            )
+            norm_3d = apply_quota_cap_to_advantages(norm_3d, lp_3d)
         norm_rewards: list[Any] = norm_3d.reshape(-1, RQ_CODE_NUM).tolist()
     else:
         raw_rewards = []

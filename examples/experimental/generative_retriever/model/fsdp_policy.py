@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 from pathlib import Path
 from typing import Any, cast
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 from transformers import T5Config, T5ForConditionalGeneration
@@ -35,7 +38,13 @@ from examples.experimental.generative_retriever.reward.in_process_protocol impor
 from examples.experimental.generative_retriever.reward.relevance_reward import (
     DEFAULT_TRAIN_GROUP_SIZE,
 )
-from examples.experimental.generative_retriever.runtime.gr_config import GRConfig
+from examples.experimental.generative_retriever.runtime.gr_config import (
+    DUAL_ENTROPY_STEP_SIZE,
+    GRConfig,
+    MAX_ADAPTIVE_ENTROPY_COEF,
+    MIN_ACTIVE_ENTROPY_COEF,
+    TARGET_TOKEN_ENTROPY,
+)
 from examples.experimental.generative_retriever.services.mapping_service import ResidentMapping
 from examples.experimental.generative_retriever.services.mapping_staging import (
     save_static_mapping_snapshot,
@@ -43,7 +52,9 @@ from examples.experimental.generative_retriever.services.mapping_staging import 
 )
 from miles.utils.distributed_utils import get_gloo_group
 
+logger = logging.getLogger(__name__)
 _INVALID_DOCID_LOGIT = -1.0e9
+_DUAL_ENTROPY_STATE_FILENAME = "dual_entropy_state.json"
 
 
 def _required_path(variable: str) -> Path:
@@ -62,7 +73,12 @@ class GRStage5Policy(nn.Module):
     _no_split_modules = ["Qwen3DecoderLayer", "T5Block"]
 
     def __init__(
-        self, source_model: nn.Module, pad_token_id: int, constraint: PrefixConstraint,
+        self,
+        source_model: nn.Module,
+        pad_token_id: int,
+        constraint: PrefixConstraint,
+        *,
+        train_args: Any = None,
     ) -> None:
         super().__init__()
         source: Any = source_model
@@ -73,6 +89,11 @@ class GRStage5Policy(nn.Module):
         self.code_num: int = source.docid_size
         self.constraint = constraint
         self.gr_config = GRConfig.from_env()
+        self._train_args = train_args
+        self._dual_entropy_alpha: float = 0.0
+        self._ent_token_sum: float = 0.0
+        self._ent_token_count: int = 0
+        self._restore_dual_entropy_state_if_resuming()
         self._prefix_allowed_cache: dict[tuple[int, ...], tuple[torch.Tensor, set[int]]] = {}
         self._fast_doc2k_state = FastDoc2kSyncState()
         self._doc2k_sync_mapping: ResidentMapping | None = None
@@ -133,6 +154,43 @@ class GRStage5Policy(nn.Module):
         self._doc2k_sync_mapping = ResidentMapping(staged_dir, read_only=True)
         return self._doc2k_sync_mapping
 
+    def _restore_dual_entropy_state_if_resuming(self) -> None:
+        if self.gr_config.anti_collapse_mode != "target_entropy" or self._train_args is None:
+            return
+        load_dir_raw = self._train_args.load
+        if not load_dir_raw:
+            self._train_args.entropy_coef = MIN_ACTIVE_ENTROPY_COEF
+            return
+        load_root = Path(load_dir_raw)
+        tracker = load_root / "latest_checkpointed_iteration.txt"
+        if tracker.is_file():
+            step = int(tracker.read_text(encoding="utf-8").strip())
+            state_file = load_root / f"iter_{step:07d}" / _DUAL_ENTROPY_STATE_FILENAME
+            if state_file.is_file():
+                payload = json.loads(state_file.read_text(encoding="utf-8"))
+                self._dual_entropy_alpha = float(payload["alpha"])
+        self._train_args.entropy_coef = max(MIN_ACTIVE_ENTROPY_COEF, self._dual_entropy_alpha)
+
+    def _sync_dual_target_entropy(self) -> None:
+        if self.gr_config.anti_collapse_mode != "target_entropy" or self._ent_token_count <= 0:
+            return
+        stats = torch.tensor([self._ent_token_sum, float(self._ent_token_count)], dtype=torch.float64)
+        if dist.is_initialized():
+            dist.all_reduce(stats, op=dist.ReduceOp.SUM, group=cast(Any, get_gloo_group()))
+        self._ent_token_sum = 0.0
+        self._ent_token_count = 0
+
+        mean_tok_ent = float(stats[0].item()) / max(1.0, float(stats[1].item()))
+        next_alpha = self._dual_entropy_alpha + DUAL_ENTROPY_STEP_SIZE * (TARGET_TOKEN_ENTROPY - mean_tok_ent)
+        self._dual_entropy_alpha = min(MAX_ADAPTIVE_ENTROPY_COEF, max(0.0, next_alpha))
+        if self._train_args is not None:
+            self._train_args.entropy_coef = max(MIN_ACTIVE_ENTROPY_COEF, self._dual_entropy_alpha)
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            logger.info(
+                f"[DualTargetEntropy] H_sum4={4.0 * mean_tok_ent:.4f} "
+                f"(H_tok={mean_tok_ent:.4f}, target={TARGET_TOKEN_ENTROPY:.4f}) -> alpha={self._dual_entropy_alpha:.6f}"
+            )
+
     def save_doc2k_mapping(
         self,
         output_dir: str | Path,
@@ -140,6 +198,14 @@ class GRStage5Policy(nn.Module):
         stage_dir: str | Path | None = None,
         async_transfer: bool = True,
     ) -> None:
+        self._sync_dual_target_entropy()
+        out_path = Path(output_dir)
+        if self.gr_config.anti_collapse_mode == "target_entropy" and (not dist.is_initialized() or dist.get_rank() == 0):
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            (out_path.parent / _DUAL_ENTROPY_STATE_FILENAME).write_text(
+                json.dumps({"alpha": self._dual_entropy_alpha}) + "\n",
+                encoding="utf-8",
+            )
         if self.gr_config.doc2k_disabled:
             if not dist.is_initialized() or dist.get_rank() == 0:
                 save_static_mapping_snapshot(
@@ -163,6 +229,7 @@ class GRStage5Policy(nn.Module):
             dist.barrier(group=cast(Any, get_gloo_group()))
 
     def state_dict(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        self._sync_dual_target_entropy()
         self._sync_global_doc2k_votes()
         return super().state_dict(*args, **kwargs)
 
@@ -414,6 +481,13 @@ class GRStage5Policy(nn.Module):
         response_logits = self.lm_head(decoder_outputs.last_hidden_state)
         allowed_mask = self._build_allowed_mask(responses, vocab_size)
         masked_response_logits = response_logits.masked_fill(~allowed_mask, _INVALID_DOCID_LOGIT)
+        if self.gr_config.anti_collapse_mode == "target_entropy" and torch.is_grad_enabled():
+            with torch.no_grad():
+                lp_det = F.log_softmax(masked_response_logits.detach().float(), dim=-1)
+                p_det = lp_det.exp().masked_fill(~allowed_mask, 0.0)
+                ent_sum = -(p_det * lp_det.masked_fill(~allowed_mask, 0.0)).sum()
+                self._ent_token_sum += float(ent_sum.item())
+                self._ent_token_count += int(sample_count * self.code_num)
         starts = torch.tensor(
             [
                 output_offset + prompt_length - 1
@@ -433,7 +507,7 @@ class GRStage5Policy(nn.Module):
 
 def build_gr_stage5_policy(checkpoint_path: str, args: Any, init_context) -> GRStage5Policy:
     """Miles ``--custom-fsdp-model-factory-path`` entrypoint."""
-    del checkpoint_path, args
+    del checkpoint_path
 
     checkpoint = _required_path("GR_CHECKPOINT")
     qwen_model = _required_path("GR_QWEN_MODEL")
@@ -474,4 +548,5 @@ def build_gr_stage5_policy(checkpoint_path: str, args: Any, init_context) -> GRS
         source_model,
         pad_token_id=qwen_encoder.tokenizer.pad_token_id,
         constraint=constraint,
+        train_args=args,
     )

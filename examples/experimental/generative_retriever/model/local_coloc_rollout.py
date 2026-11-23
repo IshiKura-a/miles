@@ -32,10 +32,12 @@ from examples.experimental.generative_retriever.reward.relevance_reward import (
 )
 from examples.experimental.generative_retriever.reward.rollout_metrics import (
     add_distribution_metrics,
+    apply_quota_cap_to_advantages,
     compute_causal_tree_credit_3d,
     normalize_group_advantages_tensor,
+    summarize_rollout_prob_concentration,
 )
-from examples.experimental.generative_retriever.runtime.gr_config import GRConfig
+from examples.experimental.generative_retriever.runtime.gr_config import AntiCollapseMode, GRConfig
 from miles.rollout.base_types import (
     BaseRolloutFn,
     RolloutFnConstructorInput,
@@ -89,6 +91,7 @@ def build_local_gpu_shard(
     unique_weight: float,
     rewards_norm: bool,
     grpo_std_norm: bool,
+    anti_collapse_mode: AntiCollapseMode = "none",
 ) -> tuple[Box, dict[str, Any]]:
     """Convert raw SGLang embeddings for one local GPU into a zero-copy compact DP shard + summary."""
     num_q = len(prompt_ids_list)
@@ -101,6 +104,7 @@ def build_local_gpu_shard(
 
     s_u32 = np.sort(u32_mat, axis=1)
     distinct_sum = float(np.sum(1.0 + np.sum(s_u32[:, 1:] != s_u32[:, :-1], axis=1).astype(np.float64)))
+    over_quota_sum, top16_mass_sum, samp_mass_sum = summarize_rollout_prob_concentration(lp_f32)
 
     causal_3d = compute_causal_tree_credit_3d(u32_mat, raw_f64)
     cred_f64 = causal_3d[:, :, 0].astype(np.float64)
@@ -109,6 +113,8 @@ def build_local_gpu_shard(
         rewards_norm=rewards_norm,
         grpo_std_norm=grpo_std_norm,
     )
+    if anti_collapse_mode == "quota_cap":
+        norm_3d = apply_quota_cap_to_advantages(norm_3d, torch.from_numpy(lp_f32))
     rewards_tensor = norm_3d.reshape(n_samples, RQ_CODE_NUM).contiguous()
 
     stds_arr = np.std(cred_f64, axis=1, ddof=1) if group_size > 1 else np.zeros(num_q, dtype=np.float64)
@@ -155,6 +161,9 @@ def build_local_gpu_shard(
         "adv_abs_sum": float(np.sum(abs_1d)),
         "adv_abs_max": float(np.max(abs_1d)) if abs_1d.size > 0 else 0.0,
         "distinct_sum": distinct_sum,
+        "over_quota_sum": over_quota_sum,
+        "top16_mass_sum": top16_mass_sum,
+        "samp_mass_sum": samp_mass_sum,
         "raw_sum": float(np.sum(raw_f64)),
         "all_zero_cnt": int(np.sum(raw_zero_mask & (np.round(raw_f64[:, 0], 1) == 0.0))),
         "all_one_cnt": int(np.sum(raw_zero_mask & (np.round(raw_f64[:, 0], 1) == 1.0))),
@@ -211,6 +220,15 @@ def aggregate_cluster_rollout_metrics(
     extra["rollout/generative_retriever/distinct_docid_ratio"] = sum(
         float(s["distinct_sum"]) for s in summaries
     ) / float(total_q * group_size)
+    extra["rollout/generative_retriever/prob_over_quota64_count"] = sum(
+        float(s["over_quota_sum"]) for s in summaries
+    ) / float(total_q)
+    extra["rollout/generative_retriever/top16_prob_mass"] = sum(
+        float(s["top16_mass_sum"]) for s in summaries
+    ) / float(total_q)
+    extra["rollout/generative_retriever/sampled512_prob_mass"] = sum(
+        float(s["samp_mass_sum"]) for s in summaries
+    ) / float(total_q)
     total_resp_tokens = float(total_samples * RQ_CODE_NUM)
     safe_time = max(1e-6, rollout_time)
     return {
@@ -272,6 +290,7 @@ class _NodeColocRolloutWorker:
         group_size: int,
         rewards_norm: bool,
         grpo_std_norm: bool,
+        anti_collapse_mode: AntiCollapseMode = "none",
     ) -> None:
         self.local_urls = list(local_urls)
         self.gpus_per_node = len(self.local_urls)
@@ -279,6 +298,7 @@ class _NodeColocRolloutWorker:
         self.group_size = group_size
         self.rewards_norm = rewards_norm
         self.grpo_std_norm = grpo_std_norm
+        self.anti_collapse_mode: AntiCollapseMode = anti_collapse_mode
         self.tokenizer = AutoTokenizer.from_pretrained(hf_checkpoint, trust_remote_code=True)
         self.pad_tok_id = int(self.tokenizer.pad_token_id)
         sentinel = "__GR_QUERY_PLACEHOLDER__"
@@ -356,6 +376,7 @@ class _NodeColocRolloutWorker:
                 unique_weight=unique_weight,
                 rewards_norm=self.rewards_norm,
                 grpo_std_norm=self.grpo_std_norm,
+                anti_collapse_mode=self.anti_collapse_mode,
             ),
         )
 
@@ -437,6 +458,7 @@ class GRLocalColocatedRolloutFn(BaseRolloutFn):
                 group_size=int(self.args.n_samples_per_prompt),
                 rewards_norm=bool(self.args.rewards_normalization),
                 grpo_std_norm=grpo_std,
+                anti_collapse_mode=self.gr_config.anti_collapse_mode,
             )
             for host_ip, urls in worker_groups
         ]
