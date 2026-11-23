@@ -24,6 +24,21 @@ from torch.distributed.checkpoint.state_dict_loader import load
 _POLICY_ENCODER_PREFIX = "encoder_list.0.model.encoder.model."
 _POLICY_HEAD_PREFIXES = ("docEnc2decoder.", "decoder.", "lm_head.")
 _POLICY_EXPORT_PREFIXES = (_POLICY_ENCODER_PREFIX, *_POLICY_HEAD_PREFIXES)
+_SLMV3_TIED_WEIGHT_TARGETS: tuple[tuple[str, str], ...] = (
+    ("encoder_list.0.model.encoder.lm_head.weight", "encoder_list.0.model.encoder.model.embed_tokens.weight"),
+    ("docid_embedding.weight", "decoder.embed_tokens.weight"),
+    ("glue.embeds", "decoder.embed_tokens.weight"),
+)
+_SLMV3_EXPORT_ASSETS = (
+    "config.json",
+    "customized_preprocess_fill_prompt.py",
+    "generation_config.json",
+    "pytorch_model.bin.index.json",
+    "special_tokens_map.json",
+    "spiece.model",
+    "tokenizer_config.json",
+)
+_COPY_BUFFER_BYTES = 64 * 1024 * 1024
 _WEIGHT_SUFFIXES = (".bin", ".safetensors", ".pt", ".pth", ".onnx", ".tar")
 _STAGE_ASSETS = (
     "added_tokens.json",
@@ -245,16 +260,16 @@ def load_policy_head_checkpoint(model: Any, checkpoint: str | Path) -> int:
     return len(selected)
 
 
-def export_policy_head_checkpoint(
-    dcp_model_dir: str | Path,
-    output_path: str | Path,
-) -> int:
+def _stream_copy_file(src: Path, dst: Path) -> None:
+    with src.open("rb") as src_f, dst.open("wb") as dst_f:
+        shutil.copyfileobj(src_f, dst_f, length=_COPY_BUFFER_BYTES)
+
+
+def _load_dcp_policy_tensors(dcp_model_dir: str | Path) -> dict[str, torch.Tensor]:
     ckpt_dir = require_directory(dcp_model_dir, "DCP model checkpoint")
     metadata_file = ckpt_dir / ".metadata"
     if not metadata_file.is_file():
         raise FileNotFoundError(f"DCP checkpoint metadata is missing: {metadata_file}")
-    out_pt = absolute_path(output_path)
-    out_pt.parent.mkdir(parents=True, exist_ok=True)
 
     dcp_prefix = "model_state.model."
     prefixes = tuple(dcp_prefix + head for head in _POLICY_EXPORT_PREFIXES)
@@ -280,7 +295,7 @@ def export_policy_head_checkpoint(
             list(executor.map(_copy_shard_prefix, sorted(max_end.items())))
 
         entries = {
-            name[len(dcp_prefix):]: spec
+            name[len(dcp_prefix) :]: spec
             for name, spec in meta.state_dict_metadata.items()
             if name.startswith(prefixes) and isinstance(spec, TensorStorageMetadata)
         }
@@ -290,12 +305,128 @@ def export_policy_head_checkpoint(
             name: torch.empty(tuple(spec.size), dtype=spec.properties.dtype)
             for name, spec in entries.items()
         }
-        payload = {"model_state": {"model": tensors}}
-        load(payload, storage_reader=reader)
+        load({"model_state": {"model": tensors}}, storage_reader=reader)
         if not all(torch.isfinite(tensor).all().item() for tensor in tensors.values()):
-            raise RuntimeError(f"Exported policy head contains non-finite weights: {ckpt_dir}")
-        tmp_pt = tmp_dir / "policy_head.pt"
+            raise RuntimeError(f"Exported policy tensors contain non-finite weights: {ckpt_dir}")
+        return tensors
+
+
+def export_policy_head_checkpoint(
+    dcp_model_dir: str | Path,
+    output_path: str | Path,
+) -> int:
+    out_pt = absolute_path(output_path)
+    out_pt.parent.mkdir(parents=True, exist_ok=True)
+    tensors = _load_dcp_policy_tensors(dcp_model_dir)
+    payload = {"model_state": {"model": tensors}}
+    with tempfile.TemporaryDirectory(prefix="gr_policy_pt_") as tmp_dir_str:
+        tmp_pt = Path(tmp_dir_str) / "policy_head.pt"
         torch.save(payload, tmp_pt)
-        shutil.copy2(tmp_pt, out_pt)
+        _stream_copy_file(tmp_pt, out_pt)
     return len(tensors)
+
+
+def _build_slmv3_weight_updates(
+    policy_tensors: dict[str, torch.Tensor],
+    weight_map: dict[str, str],
+) -> dict[str, torch.Tensor]:
+    expected_policy_keys = {key for key in weight_map if key.startswith(_POLICY_EXPORT_PREFIXES)}
+    missing = expected_policy_keys - policy_tensors.keys()
+    unexpected = policy_tensors.keys() - expected_policy_keys
+    if missing or unexpected:
+        raise ValueError(
+            f"DCP policy keys do not match base checkpoint: "
+            f"missing={sorted(missing)}, unexpected={sorted(unexpected)}"
+        )
+
+    updates = dict(policy_tensors)
+    for target_key, source_key in _SLMV3_TIED_WEIGHT_TARGETS:
+        if target_key not in weight_map:
+            raise KeyError(f"Base checkpoint index is missing tied target {target_key!r}")
+        if source_key not in policy_tensors:
+            raise KeyError(f"DCP policy checkpoint is missing tied source {source_key!r}")
+        updates[target_key] = policy_tensors[source_key]
+    return updates
+
+
+def _merge_slmv3_shard(
+    shard_path: Path,
+    expected_keys: set[str],
+    updates: dict[str, torch.Tensor],
+    output_shard_path: Path,
+) -> None:
+    orig_shard = torch.load(shard_path, map_location="cpu", weights_only=True)
+    if not isinstance(orig_shard, dict):
+        raise TypeError(f"Base checkpoint shard is not a state dict: {shard_path}")
+    if set(orig_shard.keys()) != expected_keys:
+        raise ValueError(f"Base checkpoint shard keys mismatch index for {shard_path.name}")
+
+    merged: dict[str, torch.Tensor] = {}
+    for key, orig_tensor in orig_shard.items():
+        if key not in updates:
+            merged[key] = orig_tensor
+            continue
+        new_tensor = updates[key]
+        if tuple(new_tensor.shape) != tuple(orig_tensor.shape):
+            raise ValueError(
+                f"Shape mismatch for {key!r}: DCP {tuple(new_tensor.shape)} vs base {tuple(orig_tensor.shape)}"
+            )
+        if not orig_tensor.is_floating_point():
+            raise TypeError(f"Expected floating-point parameter for updated key {key!r}, got {orig_tensor.dtype}")
+        merged[key] = new_tensor.to(dtype=orig_tensor.dtype).contiguous()
+    torch.save(merged, output_shard_path)
+
+
+def export_slmv3_checkpoint(
+    dcp_model_dir: str | Path,
+    *,
+    base_checkpoint: str | Path,
+    output_dir: str | Path,
+    overwrite: bool = False,
+) -> dict[str, int]:
+    """Export an FSDP DCP checkpoint into a standalone SLMv3 checkpoint directory."""
+    raw_base = require_directory(base_checkpoint, "base checkpoint")
+    staged_base = stage_local_model_dir(raw_base, "base checkpoint")
+    out_dir = absolute_path(output_dir)
+    if out_dir.exists() and any(out_dir.iterdir()):
+        if not overwrite:
+            raise FileExistsError(f"Refusing to overwrite non-empty output directory: {out_dir}")
+        shutil.rmtree(out_dir)
+
+    for asset_name in _SLMV3_EXPORT_ASSETS:
+        if not (raw_base / asset_name).is_file():
+            raise FileNotFoundError(f"Base checkpoint asset is missing: {raw_base / asset_name}")
+
+    index_data = json.loads((staged_base / "pytorch_model.bin.index.json").read_text(encoding="utf-8"))
+    weight_map = index_data.get("weight_map")
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise ValueError(f"Invalid weight_map in {raw_base / 'pytorch_model.bin.index.json'}")
+
+    policy_tensors = _load_dcp_policy_tensors(dcp_model_dir)
+    updates = _build_slmv3_weight_updates(policy_tensors, weight_map)
+
+    keys_by_shard: dict[str, set[str]] = {}
+    for tensor_key, shard_name in weight_map.items():
+        if not (shard_name.startswith("pytorch_model") and shard_name.endswith(".bin")):
+            raise ValueError(f"Unexpected SLMv3 shard filename {shard_name!r} for {tensor_key!r}")
+        keys_by_shard.setdefault(shard_name, set()).add(tensor_key)
+
+    with tempfile.TemporaryDirectory(prefix="gr_slmv3_export_") as tmp_dir_str:
+        tmp_out = Path(tmp_dir_str)
+        for asset_name in _SLMV3_EXPORT_ASSETS:
+            src_asset = staged_base / asset_name if (staged_base / asset_name).is_file() else raw_base / asset_name
+            shutil.copyfile(src_asset, tmp_out / asset_name)
+        for shard_name, shard_keys in sorted(keys_by_shard.items()):
+            _merge_slmv3_shard(staged_base / shard_name, shard_keys, updates, tmp_out / shard_name)
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for filename in sorted(p.name for p in tmp_out.iterdir()):
+            _stream_copy_file(tmp_out / filename, out_dir / filename)
+
+    return {
+        "total_tensors": len(weight_map),
+        "updated_policy_tensors": len(policy_tensors),
+        "synced_tied_tensors": len(_SLMV3_TIED_WEIGHT_TARGETS),
+        "shards": len(keys_by_shard),
+    }
 

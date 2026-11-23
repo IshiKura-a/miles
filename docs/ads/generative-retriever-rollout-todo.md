@@ -535,8 +535,15 @@ Mapping 查询按最多 4,096 个不同 ID 分批；baseline 服务缓存 query 
   中的 `export_policy_head_checkpoint` 读取 FSDP DCP checkpoint（`checkpoints/iter_XXXXXXX/model`）
   中训练更新的 Qwen3-4B 编码器与解码头张量（`encoder_list.0.model.encoder.model.`、`docEnc2decoder.`、`decoder.`、`lm_head.`），
   快速导出 `policy-head-step<step>.pt` 供 `baseline_service.py --policy-checkpoint` 加载（同时向后兼容仅含解码头的旧版导出文件）。
-- 关于全量索引桶结构、1,000-query DocID 级与 Keyword 级候选分布诊断及 32 卡机制消融实验设计，参见
-  [generative-retriever-ablation-study.md](./generative-retriever-ablation-study.md)。
+- 如需交付完整 `SLMv3` 标准目录格式（双分片 `pytorch_model-00001/00002-of-00002.bin` + 索引与配置，默认输出至 `<run_dir>/exported/checkpoint-<step>`，供线上服务、`SLMv3/run_mt.py` 或 `transfer_to_onnx_slm_and_rqvae.py` 直接加载），使用 [export_slmv3_checkpoint.py](../../examples/experimental/generative_retriever/model/export_slmv3_checkpoint.py)（内部调用 `export_slmv3_checkpoint`，在合入全部 442 个训后 `Qwen3-4B` 与解码头张量的同时自动同步 `encoder_list.0.model.encoder.lm_head.weight`、`docid_embedding.weight` 与 `glue.embeds` 三个共享绑定权重）：
+  ```bash
+  uv run --env-file .env python -m examples.experimental.generative_retriever.model.export_slmv3_checkpoint \
+    --run-id <run_id> --step <step>
+  ```
+- 相关研究与诊断文档已按主题分门别类归档于 `docs/ads/`：
+  - [generative-retriever-index-and-oracle.md](./generative-retriever-index-and-oracle.md)：静态索引 `part25` 桶容量/市场分布、5 类桶型储量、10,000-Query `Oracle_R / Oracle_Metric` 上界与 4 层树掉出诊断；
+  - [generative-retriever-system-optimization.md](./generative-retriever-system-optimization.md)：`S0`–`S4` 无损吞吐加速、HBM3 词缓存与自产自销架构验收报告；
+  - [generative-retriever-ablation-study.md](./generative-retriever-ablation-study.md)：RL 算法机制消融、15M 全量演进与 `~150` 步策略熵坍缩（Mode Collapse）分析。
 - 离线 generator 使用 `--docids-per-query 64`（默认在 GPU 0–3 上并行），
   评分服务默认在全 8 卡 GPU 0–7 上以 `--batch-size 8192` 运行，评测客户端默认
   `--batch-size 1024`；当前批评分与下一批生成流水线并行，且支持从已完成 query 断点续跑。
