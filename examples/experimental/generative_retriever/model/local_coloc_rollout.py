@@ -32,9 +32,7 @@ from examples.experimental.generative_retriever.reward.relevance_reward import (
 )
 from examples.experimental.generative_retriever.reward.rollout_metrics import (
     add_distribution_metrics,
-    apply_quota_cap_to_advantages,
-    compute_causal_tree_credit_3d,
-    normalize_group_advantages_tensor,
+    build_rollout_advantages_3d,
     summarize_rollout_prob_concentration,
 )
 from examples.experimental.generative_retriever.runtime.gr_config import AntiCollapseMode, GRConfig
@@ -106,15 +104,14 @@ def build_local_gpu_shard(
     distinct_sum = float(np.sum(1.0 + np.sum(s_u32[:, 1:] != s_u32[:, :-1], axis=1).astype(np.float64)))
     over_quota_sum, top16_mass_sum, samp_mass_sum = summarize_rollout_prob_concentration(lp_f32)
 
-    causal_3d = compute_causal_tree_credit_3d(u32_mat, raw_f64)
-    cred_f64 = causal_3d[:, :, 0].astype(np.float64)
-    norm_3d = normalize_group_advantages_tensor(
-        torch.from_numpy(causal_3d),
+    norm_3d, cred_f64 = build_rollout_advantages_3d(
+        u32_mat,
+        raw_f64,
+        lp_f32,
+        anti_collapse_mode=anti_collapse_mode,
         rewards_norm=rewards_norm,
         grpo_std_norm=grpo_std_norm,
     )
-    if anti_collapse_mode == "quota_cap":
-        norm_3d = apply_quota_cap_to_advantages(norm_3d, torch.from_numpy(lp_f32))
     rewards_tensor = norm_3d.reshape(n_samples, RQ_CODE_NUM).contiguous()
 
     stds_arr = np.std(cred_f64, axis=1, ddof=1) if group_size > 1 else np.zeros(num_q, dtype=np.float64)
@@ -122,15 +119,7 @@ def build_local_gpu_shard(
     ranges_arr = ordered_cred[:, -1] - ordered_cred[:, 0]
     top_gaps_arr = ordered_cred[:, -1] - ordered_cred[:, -2] if group_size > 1 else np.zeros(num_q, dtype=np.float64)
     unique_cnt_arr = 1.0 + np.sum(ordered_cred[:, 1:] != ordered_cred[:, :-1], axis=1).astype(np.float64)
-
-    centered_cred = cred_f64 - np.mean(cred_f64, axis=1, keepdims=True)
-    if rewards_norm and grpo_std_norm:
-        norm_cred_1d = centered_cred / np.where(stds_arr[:, None] > 0, stds_arr[:, None] + 1e-6, 1.0)
-    elif rewards_norm:
-        norm_cred_1d = centered_cred
-    else:
-        norm_cred_1d = cred_f64
-    abs_1d = np.abs(norm_cred_1d)
+    abs_1d = norm_3d[:, :, 0].detach().abs().cpu().numpy().astype(np.float64)
 
     flat_tokens_i32, token_lengths_i32 = pack_group_tokens_flat(
         prompt_ids_list,

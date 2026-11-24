@@ -15,6 +15,7 @@ from examples.experimental.generative_retriever.reward.relevance_reward import (
     TREE_CREDIT_TOP_K,
 )
 from examples.experimental.generative_retriever.runtime.gr_config import (
+    AntiCollapseMode,
     GRConfig,
     QUOTA_CAP_K,
 )
@@ -142,6 +143,74 @@ def apply_quota_cap_to_advantages(
     rebalanced = torch.where(pos_mask, capped_pos * scale, adv_f32)
     out = torch.where(has_under_quota_pos, rebalanced, torch.zeros_like(adv_f32))
     return out.to(advantages_3d.dtype)
+
+
+def compute_pos_mean_advantages(raw_rewards_2d: torch.Tensor) -> torch.Tensor:
+    """Compute beam-agnostic positive-mean zero-sum unit-RMS trajectory advantages ``[B, G, C]``."""
+    rw = raw_rewards_2d.to(torch.float32)
+    if rw.shape[1] <= 1:
+        return torch.zeros((*rw.shape, RQ_CODE_NUM), dtype=torch.float32, device=rw.device)
+    std = rw.std(dim=1, keepdim=True)
+    has_var = std > 1.0e-12
+    grp_mean = rw.mean(dim=1, keepdim=True)
+    pos_mask = rw > 0.0
+    pos_count = pos_mask.sum(dim=1, keepdim=True).clamp_min(1)
+    pos_mean = torch.where(pos_mask, rw, 0.0).sum(dim=1, keepdim=True) / pos_count
+    has_strict_above_pos_mean = (rw > (pos_mean + 1.0e-12)).any(dim=1, keepdim=True)
+    thresh = torch.where(has_strict_above_pos_mean, pos_mean, grp_mean)
+    adv_1d = torch.where(has_var, (rw - thresh) / (std + 1.0e-6), torch.zeros_like(rw))
+
+    above_mask = adv_1d > 0.0
+    pos_sum = torch.where(above_mask, adv_1d, 0.0).sum(dim=1, keepdim=True)
+    neg_sum = torch.where(~above_mask, -adv_1d, 0.0).sum(dim=1, keepdim=True)
+    active = has_var & (pos_sum > 1.0e-6) & (neg_sum > 1.0e-6)
+    balanced = torch.where(above_mask, adv_1d, adv_1d * (pos_sum / neg_sum.clamp_min(1.0e-6)))
+    rms = balanced.square().mean(dim=1, keepdim=True).sqrt().clamp_min(1.0e-6)
+    out_1d = torch.where(active, balanced / rms, torch.zeros_like(adv_1d))
+    return out_1d.unsqueeze(-1).expand(-1, -1, RQ_CODE_NUM).contiguous()
+
+
+def compute_boltzmann_advantages(
+    raw_rewards_2d: torch.Tensor,
+    token_logprobs_3d: torch.Tensor,
+) -> torch.Tensor:
+    """Compute leak-free Boltzmann ranking PPO advantages ``G * (softmax(R / std) - pi_old(d))`` ``[B, G, C]``."""
+    rw = raw_rewards_2d.to(torch.float32)
+    group_size = rw.shape[1]
+    if group_size <= 1:
+        return torch.zeros((*rw.shape, RQ_CODE_NUM), dtype=torch.float32, device=rw.device)
+    std = rw.std(dim=1, keepdim=True)
+    has_var = std > 1.0e-12
+    target_q = torch.softmax(rw / (std + 1.0e-6), dim=1)
+    seq_probs = token_logprobs_3d.to(torch.float32).sum(dim=-1).clamp(max=0.0).exp()
+    adv_1d = torch.where(has_var, float(group_size) * (target_q - seq_probs), torch.zeros_like(rw))
+    return adv_1d.unsqueeze(-1).expand(-1, -1, RQ_CODE_NUM).contiguous()
+
+
+def build_rollout_advantages_3d(
+    u32_mat: np.ndarray,
+    raw_f64: np.ndarray,
+    lp_f32: np.ndarray,
+    *,
+    anti_collapse_mode: AntiCollapseMode,
+    rewards_norm: bool,
+    grpo_std_norm: bool,
+) -> tuple[torch.Tensor, np.ndarray]:
+    """Compute ``(advantages_3d, summary_credit_2d)`` for one rollout shard."""
+    if anti_collapse_mode == "pos_mean":
+        return compute_pos_mean_advantages(torch.from_numpy(raw_f64)), raw_f64
+    if anti_collapse_mode == "boltzmann":
+        return compute_boltzmann_advantages(torch.from_numpy(raw_f64), torch.from_numpy(lp_f32)), raw_f64
+    causal_3d = compute_causal_tree_credit_3d(u32_mat, raw_f64)
+    cred_f64 = causal_3d[:, :, 0].astype(np.float64)
+    adv_3d = normalize_group_advantages_tensor(
+        torch.from_numpy(causal_3d),
+        rewards_norm=rewards_norm,
+        grpo_std_norm=grpo_std_norm,
+    )
+    if anti_collapse_mode == "quota_cap":
+        adv_3d = apply_quota_cap_to_advantages(adv_3d, torch.from_numpy(lp_f32))
+    return adv_3d, cred_f64
 
 
 def summarize_rollout_prob_concentration(
@@ -283,17 +352,28 @@ def convert_gr_samples_to_train_data(args: Any, samples: list[Any]) -> dict[str,
         raise ValueError("GR sample conversion requires precomputed causal returns and raw rewards on regular groups")
     grpo_std = args.advantage_estimator in ["grpo", "gspo"] and bool(args.grpo_std_normalization)
     if n > 0:
-        r_3d = torch.from_numpy(causal_2d).view(-1, g_size, RQ_CODE_NUM)
-        norm_3d = normalize_group_advantages_tensor(
-            r_3d,
-            rewards_norm=bool(args.rewards_normalization),
-            grpo_std_norm=grpo_std,
-        )
-        if GRConfig.from_env().anti_collapse_mode == "quota_cap":
-            lp_3d = torch.tensor([s.rollout_log_probs for s in samples], dtype=torch.float32).view(
-                -1, g_size, RQ_CODE_NUM
+        mode = GRConfig.from_env().anti_collapse_mode
+        lp_np = np.asarray([s.rollout_log_probs for s in samples], dtype=np.float32).reshape(-1, g_size, RQ_CODE_NUM)
+        if mode in {"pos_mean", "boltzmann"}:
+            raw_2d = np.asarray(raw_rewards, dtype=np.float64).reshape(-1, g_size)
+            u32_dummy = np.zeros_like(raw_2d, dtype=np.uint32)
+            norm_3d, _ = build_rollout_advantages_3d(
+                u32_dummy,
+                raw_2d,
+                lp_np,
+                anti_collapse_mode=mode,
+                rewards_norm=bool(args.rewards_normalization),
+                grpo_std_norm=grpo_std,
             )
-            norm_3d = apply_quota_cap_to_advantages(norm_3d, lp_3d)
+        else:
+            r_3d = torch.from_numpy(causal_2d).view(-1, g_size, RQ_CODE_NUM)
+            norm_3d = normalize_group_advantages_tensor(
+                r_3d,
+                rewards_norm=bool(args.rewards_normalization),
+                grpo_std_norm=grpo_std,
+            )
+            if mode == "quota_cap":
+                norm_3d = apply_quota_cap_to_advantages(norm_3d, torch.from_numpy(lp_np))
         norm_rewards: list[Any] = norm_3d.reshape(-1, RQ_CODE_NUM).tolist()
     else:
         raw_rewards = []
