@@ -14,7 +14,10 @@ import pyarrow.parquet as pq
 
 from examples.experimental.generative_retriever.index.id_text_mapping import COLUMNAR_INDEX_FILES
 from examples.experimental.generative_retriever.reward.relevance_reward import is_doc2k_disabled
-from examples.experimental.generative_retriever.utils.paths import absolute_path
+from examples.experimental.generative_retriever.utils.paths import (
+    absolute_path,
+    atomic_stream_copy_file,
+)
 
 RESUME_OVERLAY_FILENAME = "gr_doc2k_resume_overlay.parquet"
 STAGED_MAPPING_SENTINEL = ".staged_arrow_ok"
@@ -47,11 +50,7 @@ def stage_local_mapping_dir(mapping_path: str | Path) -> Path:
                         raise FileNotFoundError(f"Columnar mapping file missing: {src}")
                     dst = target / fname
                     if dst != src and (not dst.is_file() or dst.stat().st_size != src.stat().st_size):
-                        tmp_fd, tmp_name = tempfile.mkstemp(prefix=f".{fname}.", dir=target)
-                        os.close(tmp_fd)
-                        tmp_path = Path(tmp_name)
-                        shutil.copyfile(src, tmp_path)
-                        tmp_path.replace(dst)
+                        atomic_stream_copy_file(src, dst)
                 ipc_dst = target / "keywords_only.arrow"
                 if not ipc_dst.is_file():
                     tmp_fd, tmp_name = tempfile.mkstemp(prefix=".keywords_only.arrow.", dir=target)
@@ -91,11 +90,7 @@ def stage_local_doc2k_state(
     if not overlay_src.is_file():
         resume_dst.unlink(missing_ok=True)
         return
-    tmp_fd, tmp_name = tempfile.mkstemp(prefix=".gr_resume_overlay.", dir=local_root)
-    os.close(tmp_fd)
-    tmp_path = Path(tmp_name)
-    shutil.copyfile(overlay_src, tmp_path)
-    tmp_path.replace(resume_dst)
+    atomic_stream_copy_file(overlay_src, resume_dst)
 
 
 def save_static_mapping_snapshot(
@@ -142,9 +137,7 @@ def save_static_mapping_snapshot(
     def _sync_worker() -> None:
         try:
             target_dir.mkdir(parents=True, exist_ok=True)
-            dst_tmp = target_dir / "overlay.parquet.tmp"
-            shutil.copyfile(tmp_dir / "overlay.parquet", dst_tmp)
-            dst_tmp.replace(target_dir / "overlay.parquet")
+            atomic_stream_copy_file(tmp_dir / "overlay.parquet", target_dir / "overlay.parquet")
             for link_name in COLUMNAR_INDEX_FILES:
                 src_link = tmp_dir / link_name
                 dst_link = target_dir / link_name
