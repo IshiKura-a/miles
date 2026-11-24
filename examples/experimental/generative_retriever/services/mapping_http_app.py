@@ -1,4 +1,4 @@
-"""FastAPI HTTP service wrapper around ResidentMapping."""
+"""FastAPI HTTP service wrapper and wire schemas around ResidentMapping."""
 
 from __future__ import annotations
 
@@ -7,25 +7,97 @@ from contextlib import asynccontextmanager
 import gc
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Annotated, Any
 
 from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel, Field, StrictInt, field_validator
 import uvicorn
 
+from examples.experimental.generative_retriever.index.id_text_mapping import (
+    PositionalID,
+    validate_docid,
+)
+from examples.experimental.generative_retriever.reward.relevance_reward import DOCID_MAX_KEYWORDS
 from examples.experimental.generative_retriever.utils.paths import absolute_path
 
 if TYPE_CHECKING:
-    from examples.experimental.generative_retriever.services.mapping_service import (
-        ClaimMappingRequest,
-        DeltaMappingIdsRequest,
-        DeltaMappingRequest,
-        LookupRequest,
-        LookupResponse,
-        ResidentMapping,
-        ResolveKeywordsRequest,
-        SaveMappingRequest,
-        UpdateMappingRequest,
-    )
+    from examples.experimental.generative_retriever.services.mapping_service import ResidentMapping
+
+
+class LookupRequest(BaseModel):
+    docids: Annotated[list[tuple[StrictInt, StrictInt, StrictInt, StrictInt]], Field(min_length=1, max_length=4096)]
+    market: str | None = None
+    use_initial: bool = False
+
+    @field_validator("docids")
+    @classmethod
+    def validate_docids(cls, values: list[PositionalID]) -> list[PositionalID]:
+        for value in values:
+            validate_docid(value)
+        return values
+
+
+class KeywordResult(BaseModel):
+    docid: PositionalID
+    keywords: list[str]
+    status: str
+
+
+class LookupResponse(BaseModel):
+    mapping_version: str
+    results: list[KeywordResult]
+
+
+class DocidKeywordPair(BaseModel):
+    docid: tuple[StrictInt, StrictInt, StrictInt, StrictInt]
+    keyword_ids: Annotated[list[StrictInt], Field(min_length=1)]
+
+    @field_validator("docid")
+    @classmethod
+    def validate_docid(cls, value: PositionalID) -> PositionalID:
+        validate_docid(value)
+        return value
+
+
+class DocidKeywordTextPair(BaseModel):
+    docid: tuple[StrictInt, StrictInt, StrictInt, StrictInt]
+    keywords: Annotated[list[str], Field(min_length=1)]
+
+    @field_validator("docid")
+    @classmethod
+    def validate_docid(cls, value: PositionalID) -> PositionalID:
+        validate_docid(value)
+        return value
+
+
+class UpdateMappingRequest(BaseModel):
+    entries: Annotated[list[DocidKeywordPair], Field(min_length=1)]
+    replace_all: bool = False
+
+
+class DeltaMappingRequest(BaseModel):
+    additions: list[DocidKeywordTextPair] = Field(default_factory=list)
+    removals: list[DocidKeywordTextPair] = Field(default_factory=list)
+    k_max: int = DOCID_MAX_KEYWORDS
+
+
+class DeltaMappingIdsRequest(BaseModel):
+    additions: list[DocidKeywordPair] = Field(default_factory=list)
+    removals: list[DocidKeywordPair] = Field(default_factory=list)
+    k_max: int = DOCID_MAX_KEYWORDS
+
+
+class ResolveKeywordsRequest(BaseModel):
+    keywords: list[str]
+
+
+class ClaimMappingRequest(BaseModel):
+    owner: str
+    checkpoint: str | None = None
+
+
+class SaveMappingRequest(BaseModel):
+    output_dir: str
 
 
 def build_mapping_app(
@@ -33,14 +105,6 @@ def build_mapping_app(
     *,
     mapping_cls: type[ResidentMapping],
     api_version: int,
-    claim_req_cls: type[ClaimMappingRequest],
-    lookup_req_cls: type[LookupRequest],
-    lookup_resp_cls: type[LookupResponse],
-    resolve_req_cls: type[ResolveKeywordsRequest],
-    delta_req_cls: type[DeltaMappingRequest],
-    delta_ids_req_cls: type[DeltaMappingIdsRequest],
-    update_req_cls: type[UpdateMappingRequest],
-    save_req_cls: type[SaveMappingRequest],
 ) -> FastAPI:
     path = absolute_path(mapping)
 
@@ -76,22 +140,22 @@ def build_mapping_app(
             raise HTTPException(status_code=409, detail=str(error)) from error
 
     @app.post("/claim")
-    def claim(request: claim_req_cls) -> None:  # type: ignore[valid-type]
+    def claim(request: ClaimMappingRequest) -> None:
         try:
             app.state.mapping.claim(request.owner, request.checkpoint)
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
 
     @app.post("/release")
-    def release(request: claim_req_cls) -> None:  # type: ignore[valid-type]
+    def release(request: ClaimMappingRequest) -> None:
         try:
             app.state.mapping.release(request.owner)
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
 
-    @app.post("/lookup", response_model=lookup_resp_cls)
-    @app.post("/runs/{owner}/lookup", response_model=lookup_resp_cls)
-    def lookup(request: lookup_req_cls, http_request: Request) -> LookupResponse:  # type: ignore[valid-type]
+    @app.post("/lookup", response_model=LookupResponse)
+    @app.post("/runs/{owner}/lookup", response_model=LookupResponse)
+    def lookup(request: LookupRequest, http_request: Request) -> LookupResponse:
         try:
             with app.state.mapping.access(http_request.path_params.get("owner")):
                 return app.state.mapping.lookup(
@@ -103,7 +167,7 @@ def build_mapping_app(
             raise HTTPException(status_code=409, detail=str(error)) from error
 
     @app.post("/runs/{owner}/resolve_keywords")
-    def resolve_keywords(request: resolve_req_cls, http_request: Request) -> dict[str, list[int]]:  # type: ignore[valid-type]
+    def resolve_keywords(request: ResolveKeywordsRequest, http_request: Request) -> dict[str, list[int]]:
         try:
             with app.state.mapping.access(http_request.path_params["owner"]):
                 return {"keyword_ids": app.state.mapping.resolve_keywords(request.keywords)}
@@ -112,7 +176,7 @@ def build_mapping_app(
 
     @app.post("/update_delta")
     @app.post("/runs/{owner}/update_delta")
-    def update_delta(request: delta_req_cls, http_request: Request) -> dict[str, int]:  # type: ignore[valid-type]
+    def update_delta(request: DeltaMappingRequest, http_request: Request) -> dict[str, int]:
         try:
             with app.state.mapping.access(http_request.path_params.get("owner")):
                 return app.state.mapping.apply_delta(request)
@@ -120,7 +184,7 @@ def build_mapping_app(
             raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.post("/runs/{owner}/update_delta_ids")
-    def update_delta_ids(request: delta_ids_req_cls, http_request: Request) -> dict[str, int]:  # type: ignore[valid-type]
+    def update_delta_ids(request: DeltaMappingIdsRequest, http_request: Request) -> dict[str, int]:
         try:
             with app.state.mapping.access(http_request.path_params["owner"]):
                 return app.state.mapping.apply_id_delta(request)
@@ -129,7 +193,7 @@ def build_mapping_app(
 
     @app.post("/update")
     @app.post("/runs/{owner}/update")
-    def update(request: update_req_cls, http_request: Request) -> dict[str, int]:  # type: ignore[valid-type]
+    def update(request: UpdateMappingRequest, http_request: Request) -> dict[str, int]:
         try:
             with app.state.mapping.access(http_request.path_params.get("owner")):
                 return app.state.mapping.update_docid_mappings(request.entries, replace_all=request.replace_all)
@@ -138,7 +202,7 @@ def build_mapping_app(
 
     @app.post("/save")
     @app.post("/runs/{owner}/save")
-    def save(request: save_req_cls, http_request: Request) -> dict[str, Any]:  # type: ignore[valid-type]
+    def save(request: SaveMappingRequest, http_request: Request) -> dict[str, Any]:
         try:
             with app.state.mapping.access(http_request.path_params.get("owner")):
                 return app.state.mapping.save_docid_mappings(request.output_dir)

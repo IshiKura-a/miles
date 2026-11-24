@@ -18,19 +18,17 @@ import tempfile
 import threading
 from threading import RLock
 import time
-from typing import Annotated, Any
+from typing import Any
 
 from fastapi import FastAPI
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
-from pydantic import BaseModel, Field, StrictInt, field_validator
 
 from examples.experimental.generative_retriever.index.id_text_mapping import (
     PositionalID,
     is_columnar_index_dir,
     pack_docid_u32,
-    validate_docid,
 )
 from examples.experimental.generative_retriever.reward.relevance_reward import (
     DOC2K_PRUNE_FLOOR,
@@ -38,92 +36,26 @@ from examples.experimental.generative_retriever.reward.relevance_reward import (
     is_doc2k_disabled,
 )
 from examples.experimental.generative_retriever.services.mapping_http_app import (
+    DeltaMappingIdsRequest,
+    DeltaMappingRequest,
+    DocidKeywordPair,
+    DocidKeywordTextPair,
+    KeywordResult,
+    LookupResponse,
     build_mapping_app,
     run_mapping_cli,
 )
 from examples.experimental.generative_retriever.services.mapping_staging import RESUME_OVERLAY_FILENAME
-from examples.experimental.generative_retriever.utils.paths import absolute_path, symlink_target
+from examples.experimental.generative_retriever.utils.paths import (
+    absolute_path,
+    atomic_stream_copy_file,
+    symlink_target,
+)
 
 logger = logging.getLogger(__name__)
 MAPPING_SERVICE_API_VERSION = 3
 _SERVICE_API_VERSION = MAPPING_SERVICE_API_VERSION
 _NA_LOCALE_ALIASES = frozenset({"NA", "EN-US", "EN-CA", "ES-US", "FR-CA"})
-
-
-class LookupRequest(BaseModel):
-    docids: Annotated[list[tuple[StrictInt, StrictInt, StrictInt, StrictInt]], Field(min_length=1, max_length=4096)]
-    market: str | None = None
-    use_initial: bool = False
-
-    @field_validator("docids")
-    @classmethod
-    def validate_docids(cls, values: list[PositionalID]) -> list[PositionalID]:
-        for value in values:
-            validate_docid(value)
-        return values
-
-
-class KeywordResult(BaseModel):
-    docid: PositionalID
-    keywords: list[str]
-    status: str
-
-
-class LookupResponse(BaseModel):
-    mapping_version: str
-    results: list[KeywordResult]
-
-
-class DocidKeywordPair(BaseModel):
-    docid: tuple[StrictInt, StrictInt, StrictInt, StrictInt]
-    keyword_ids: Annotated[list[StrictInt], Field(min_length=1)]
-
-    @field_validator("docid")
-    @classmethod
-    def validate_docid(cls, value: PositionalID) -> PositionalID:
-        validate_docid(value)
-        return value
-
-
-class DocidKeywordTextPair(BaseModel):
-    docid: tuple[StrictInt, StrictInt, StrictInt, StrictInt]
-    keywords: Annotated[list[str], Field(min_length=1)]
-
-    @field_validator("docid")
-    @classmethod
-    def validate_docid(cls, value: PositionalID) -> PositionalID:
-        validate_docid(value)
-        return value
-
-
-class UpdateMappingRequest(BaseModel):
-    entries: Annotated[list[DocidKeywordPair], Field(min_length=1)]
-    replace_all: bool = False
-
-
-class DeltaMappingRequest(BaseModel):
-    additions: list[DocidKeywordTextPair] = Field(default_factory=list)
-    removals: list[DocidKeywordTextPair] = Field(default_factory=list)
-    k_max: int = DOCID_MAX_KEYWORDS
-
-
-class DeltaMappingIdsRequest(BaseModel):
-    additions: list[DocidKeywordPair] = Field(default_factory=list)
-    removals: list[DocidKeywordPair] = Field(default_factory=list)
-    k_max: int = DOCID_MAX_KEYWORDS
-
-
-class ResolveKeywordsRequest(BaseModel):
-    keywords: list[str]
-
-
-class ClaimMappingRequest(BaseModel):
-    owner: str
-    checkpoint: str | None = None
-
-
-class SaveMappingRequest(BaseModel):
-    output_dir: str
 
 
 class ResidentMapping:
@@ -292,6 +224,95 @@ class ResidentMapping:
         with self._lock:
             self.replace_overlay(overlay)
         return len(overlay)
+
+    def claim(self, owner: str, checkpoint: str | None) -> None:
+        overlay: dict[int, tuple[int, ...]] = {}
+        if checkpoint is not None:
+            table = pq.read_table(Path(checkpoint) / "overlay.parquet")
+            metadata = table.schema.metadata or {}
+            if metadata.get(b"base_mapping") != str(self.path).encode():
+                raise ValueError("Checkpoint belongs to a different base mapping")
+            overlay = {
+                int(docid): tuple(dict.fromkeys(int(k) for k in kids))
+                for docid, kids in zip(
+                    table.column("docid_u32").to_pylist(),
+                    table.column("keyword_ids").to_pylist(),
+                    strict=True,
+                )
+                if kids
+            }
+        with self._lock:
+            if not owner or self._owner is not None or self._active_requests:
+                raise ValueError("Mapping service is already in use")
+            self.replace_overlay(overlay)
+            self._owner = owner
+
+    def release(self, owner: str) -> None:
+        with self._lock:
+            if self._owner != owner or self._active_requests:
+                raise ValueError("Mapping service is still in use or owned by another run")
+            self._owner = None
+
+    def resolve_keywords(self, keywords: list[str]) -> list[int]:
+        with self._lock:
+            return [self._text_to_kid[keyword] for keyword in keywords]
+
+    def lookup(
+        self,
+        docids: list[PositionalID],
+        *,
+        market: str | None = None,
+        use_initial: bool = False,
+    ) -> LookupResponse:
+        target_mkt = market.strip().upper() if market else None
+        packed_targets = np.asarray([pack_docid_u32(d) for d in docids], dtype=np.uint32)
+        with self._lock:
+            positions = np.searchsorted(self._unique_docids_u32, packed_targets)
+            n_unique = len(self._unique_docids_u32)
+            overlay_map = None if use_initial else self._overlay_kw_ids
+            cache = self._docid_kw_cache
+            results: list[KeywordResult] = []
+            for docid, target_u32, pos in zip(docids, packed_targets.tolist(), positions.tolist(), strict=True):
+                u32_int = int(target_u32)
+                overlay_kids = None if overlay_map is None else overlay_map.get(u32_int)
+                if target_mkt is None and overlay_kids is not None:
+                    cached = cache.get(u32_int)
+                    if cached is None:
+                        cached = [self._decode_kid(int(k)) for k in dict.fromkeys(overlay_kids)]
+                        cache[u32_int] = cached
+                    results.append(KeywordResult(docid=docid, keywords=list(cached), status="ok"))
+                    continue
+                if target_mkt is None and (not use_initial or u32_int not in self._overlay_kw_ids):
+                    cached = cache.get(u32_int)
+                    if cached is not None:
+                        results.append(KeywordResult(docid=docid, keywords=list(cached), status="ok"))
+                        continue
+
+                if overlay_kids is not None:
+                    dedup_kids = dict.fromkeys(int(k) for k in overlay_kids)
+                else:
+                    idx = int(pos)
+                    if idx >= n_unique or int(self._unique_docids_u32[idx]) != u32_int:
+                        logger.warning("Columnar mapping ID not found: %s", docid)
+                        results.append(KeywordResult(docid=docid, keywords=[], status="not_found"))
+                        continue
+                    start = int(self._csr_offsets[idx])
+                    end = int(self._csr_offsets[idx + 1])
+                    dedup_kids = dict.fromkeys(int(x) for x in self._csr_kw_ids[start:end])
+
+                if target_mkt is None:
+                    texts = [self._decode_kid(kid) for kid in dedup_kids]
+                    if not use_initial or u32_int not in self._overlay_kw_ids:
+                        cache[u32_int] = texts
+                    results.append(KeywordResult(docid=docid, keywords=list(texts), status="ok"))
+                else:
+                    texts = [
+                        self._decode_kid(kid)
+                        for kid in dedup_kids
+                        if self._market_allows(kid, target_mkt)
+                    ]
+                    results.append(KeywordResult(docid=docid, keywords=texts, status="ok"))
+            return LookupResponse(mapping_version=self.version, results=results)
 
     def lookup_u32(
         self,
@@ -810,9 +831,7 @@ class ResidentMapping:
             try:
                 target_dir.mkdir(parents=True, exist_ok=True)
                 for fname in ("docid_offsets.i64.npy", "docid_kw_ids.u32.npy", "overlay.parquet"):
-                    dst_tmp = target_dir / f"{fname}.tmp"
-                    shutil.copyfile(tmp_dir / fname, dst_tmp)
-                    dst_tmp.replace(target_dir / fname)
+                    atomic_stream_copy_file(tmp_dir / fname, target_dir / fname)
                 for link_name in ("keywords.parquet", "docid_keywords.parquet", "docid_unique.u32.npy"):
                     src_link = tmp_dir / link_name
                     dst_link = target_dir / link_name
@@ -850,14 +869,6 @@ def create_app(mapping: str | Path) -> FastAPI:
         mapping,
         mapping_cls=ResidentMapping,
         api_version=_SERVICE_API_VERSION,
-        claim_req_cls=ClaimMappingRequest,
-        lookup_req_cls=LookupRequest,
-        lookup_resp_cls=LookupResponse,
-        resolve_req_cls=ResolveKeywordsRequest,
-        delta_req_cls=DeltaMappingRequest,
-        delta_ids_req_cls=DeltaMappingIdsRequest,
-        update_req_cls=UpdateMappingRequest,
-        save_req_cls=SaveMappingRequest,
     )
 
 

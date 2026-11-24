@@ -18,7 +18,7 @@ import xxhash
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from examples.experimental.generative_retriever.services.mapping_service import SaveMappingRequest
+from examples.experimental.generative_retriever.services.mapping_http_app import SaveMappingRequest
 from examples.experimental.generative_retriever.services.reward_service import (
     BaselinePrepareRequest,
     RewardRequest,
