@@ -11,7 +11,7 @@ from typing import Literal, cast
 
 Doc2kMode = Literal["relevance_guided", "disabled"]
 UniqueAnnealMode = Literal["cosine", "linear", "none", "off"]
-AntiCollapseMode = Literal["none", "quota_cap", "target_entropy", "pos_mean", "boltzmann"]
+AntiCollapseMode = Literal["none", "quota_cap", "target_entropy", "pos_mean", "pos_mean_quota"]
 RewardModeLiteral = Literal["discrete_relevance_unique", "continuous_relevance_unique"]
 
 DOC2K_MODES: tuple[Doc2kMode, ...] = ("relevance_guided", "disabled")
@@ -21,7 +21,7 @@ ANTI_COLLAPSE_MODES: tuple[AntiCollapseMode, ...] = (
     "quota_cap",
     "target_entropy",
     "pos_mean",
-    "boltzmann",
+    "pos_mean_quota",
 )
 
 GR_CONFIG_ENV_VAR = "GR_CONFIG_JSON"

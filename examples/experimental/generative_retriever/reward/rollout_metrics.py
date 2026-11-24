@@ -145,7 +145,12 @@ def apply_quota_cap_to_advantages(
     return out.to(advantages_3d.dtype)
 
 
-def compute_pos_mean_advantages(raw_rewards_2d: torch.Tensor) -> torch.Tensor:
+def compute_pos_mean_advantages(
+    raw_rewards_2d: torch.Tensor,
+    token_logprobs_3d: torch.Tensor | None = None,
+    *,
+    adaptive_quota: bool = False,
+) -> torch.Tensor:
     """Compute beam-agnostic positive-mean zero-sum unit-RMS trajectory advantages ``[B, G, C]``."""
     rw = raw_rewards_2d.to(torch.float32)
     if rw.shape[1] <= 1:
@@ -161,30 +166,23 @@ def compute_pos_mean_advantages(raw_rewards_2d: torch.Tensor) -> torch.Tensor:
     adv_1d = torch.where(has_var, (rw - thresh) / (std + 1.0e-6), torch.zeros_like(rw))
 
     above_mask = adv_1d > 0.0
-    pos_sum = torch.where(above_mask, adv_1d, 0.0).sum(dim=1, keepdim=True)
+    if adaptive_quota:
+        if token_logprobs_3d is None:
+            raise ValueError("token_logprobs_3d is required when adaptive_quota=True")
+        m_winners = above_mask.sum(dim=1, keepdim=True).to(torch.float32).clamp_min(1.0)
+        seq_probs = token_logprobs_3d.to(torch.float32).sum(dim=-1).clamp(max=0.0).exp()
+        headroom = (1.0 - m_winners * seq_probs).clamp(min=0.0, max=1.0)
+        pos_part = torch.where(above_mask, adv_1d * headroom, 0.0)
+    else:
+        pos_part = torch.where(above_mask, adv_1d, 0.0)
+
+    pos_sum = pos_part.sum(dim=1, keepdim=True)
     neg_sum = torch.where(~above_mask, -adv_1d, 0.0).sum(dim=1, keepdim=True)
     active = has_var & (pos_sum > 1.0e-6) & (neg_sum > 1.0e-6)
-    balanced = torch.where(above_mask, adv_1d, adv_1d * (pos_sum / neg_sum.clamp_min(1.0e-6)))
+    balanced = torch.where(above_mask, pos_part, adv_1d * (pos_sum / neg_sum.clamp_min(1.0e-6)))
     rms = balanced.square().mean(dim=1, keepdim=True).sqrt().clamp_min(1.0e-6)
     out_1d = torch.where(active, balanced / rms, torch.zeros_like(adv_1d))
     return out_1d.unsqueeze(-1).expand(-1, -1, RQ_CODE_NUM).contiguous()
-
-
-def compute_boltzmann_advantages(
-    raw_rewards_2d: torch.Tensor,
-    token_logprobs_3d: torch.Tensor,
-) -> torch.Tensor:
-    """Compute leak-free Boltzmann ranking PPO advantages ``G * (softmax(R / std) - pi_old(d))`` ``[B, G, C]``."""
-    rw = raw_rewards_2d.to(torch.float32)
-    group_size = rw.shape[1]
-    if group_size <= 1:
-        return torch.zeros((*rw.shape, RQ_CODE_NUM), dtype=torch.float32, device=rw.device)
-    std = rw.std(dim=1, keepdim=True)
-    has_var = std > 1.0e-12
-    target_q = torch.softmax(rw / (std + 1.0e-6), dim=1)
-    seq_probs = token_logprobs_3d.to(torch.float32).sum(dim=-1).clamp(max=0.0).exp()
-    adv_1d = torch.where(has_var, float(group_size) * (target_q - seq_probs), torch.zeros_like(rw))
-    return adv_1d.unsqueeze(-1).expand(-1, -1, RQ_CODE_NUM).contiguous()
 
 
 def build_rollout_advantages_3d(
@@ -199,8 +197,15 @@ def build_rollout_advantages_3d(
     """Compute ``(advantages_3d, summary_credit_2d)`` for one rollout shard."""
     if anti_collapse_mode == "pos_mean":
         return compute_pos_mean_advantages(torch.from_numpy(raw_f64)), raw_f64
-    if anti_collapse_mode == "boltzmann":
-        return compute_boltzmann_advantages(torch.from_numpy(raw_f64), torch.from_numpy(lp_f32)), raw_f64
+    if anti_collapse_mode == "pos_mean_quota":
+        return (
+            compute_pos_mean_advantages(
+                torch.from_numpy(raw_f64),
+                torch.from_numpy(lp_f32),
+                adaptive_quota=True,
+            ),
+            raw_f64,
+        )
     causal_3d = compute_causal_tree_credit_3d(u32_mat, raw_f64)
     cred_f64 = causal_3d[:, :, 0].astype(np.float64)
     adv_3d = normalize_group_advantages_tensor(
@@ -354,7 +359,7 @@ def convert_gr_samples_to_train_data(args: Any, samples: list[Any]) -> dict[str,
     if n > 0:
         mode = GRConfig.from_env().anti_collapse_mode
         lp_np = np.asarray([s.rollout_log_probs for s in samples], dtype=np.float32).reshape(-1, g_size, RQ_CODE_NUM)
-        if mode in {"pos_mean", "boltzmann"}:
+        if mode in {"pos_mean", "pos_mean_quota"}:
             raw_2d = np.asarray(raw_rewards, dtype=np.float64).reshape(-1, g_size)
             u32_dummy = np.zeros_like(raw_2d, dtype=np.uint32)
             norm_3d, _ = build_rollout_advantages_3d(
