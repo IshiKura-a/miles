@@ -41,11 +41,16 @@ from examples.experimental.generative_retriever.runtime.training_common import (
     PromptData,
     ScriptArgs,
     build_algorithm_args,
+    build_checkpoint_args,
+    build_learner_args,
     build_optimizer_args,
+    build_rollout_args,
     build_sglang_args,
+    build_wandb_args,
     expanded_path,
     prepare_prompt_data,
     required_directory,
+    validate_resume_checkpoint,
 )
 from examples.experimental.generative_retriever.services.mapping_staging import (
     stage_local_doc2k_state,
@@ -109,58 +114,32 @@ def _build_single_node_train_args(
     prompt_data: PromptData,
     checkpoint_dir: Path,
 ) -> str:
-    quote = shlex.quote
     mem_fraction = args.sglang_mem_fraction_static if args.sglang_mem_fraction_static > 0 else 0.105
-    sglang_args = shlex.join(build_sglang_args(args, mem_fraction, colocate=True)) + " "
-    optimizer_args = shlex.join(build_optimizer_args(args.lr)) + " "
-    grpo_args = shlex.join(build_algorithm_args()) + " "
-    wandb_args = (
-        f"--use-wandb --wandb-project miles-run_grpo --wandb-group {quote(args.run_id)} --disable-wandb-random-suffix "
-    )
-    learner_args = (
-        "--train-backend fsdp "
-        "--data-source-path examples.experimental.generative_retriever.index.data_source.GRRolloutDataSource "
-        "--custom-fsdp-model-factory-path "
-        "examples.experimental.generative_retriever.model.fsdp_policy.build_gr_stage5_policy "
-        "--weight-sync-include-prefixes encoder_list.0.model.encoder.model. docEnc2decoder. decoder. lm_head. "
-        "--update-weight-buffer-size 2147483648 "
-        f"--micro-batch-size {args.micro_batch_size} "
-    )
-    checkpoint_args = (
-        f"--save {quote(os.fspath(checkpoint_dir))} "
-        f"{f'--load {quote(os.fspath(checkpoint_dir))} ' if args.resume else ''}"
-        f"--save-interval {args.save_interval} "
-    )
-    misc_args = (
-        "--colocate --no-offload-train --no-offload-rollout "
-        f"--actor-num-nodes 1 --actor-num-gpus-per-node {args.actor_num_gpus_per_node} "
-    )
-    rollout_args = (
-        f"--prompt-data {quote(os.fspath(prompt_data.path))} "
-        f"--input-key {quote(prompt_data.input_key)} "
-        f"{f'--label-key {quote(prompt_data.label_key)} ' if prompt_data.label_key else ''}"
-        f"{f'--metadata-key {quote(prompt_data.metadata_key)} ' if prompt_data.metadata_key else ''}"
-        "--rollout-shuffle "
-        "--rollout-function-path "
-        "examples.experimental.generative_retriever.model.local_coloc_rollout.GRLocalColocatedRolloutFn "
-        "--custom-generate-function-path examples.experimental.generative_retriever.model.sglang_encode_generate.generate "
-        "--custom-rm-path examples.experimental.generative_retriever.reward.reward.reward "
-        "--custom-rollout-log-function-path examples.experimental.generative_retriever.reward.rollout_metrics.log_rollout "
-        "--custom-convert-samples-to-train-data-path "
-        "examples.experimental.generative_retriever.reward.rollout_metrics.convert_gr_samples_to_train_data "
-        f"--generative-retriever-reward-mode {args.reward_mode} "
-        f"--num-rollout {args.num_rollout} "
-        f"--rollout-batch-size {args.rollout_batch_size} "
-        f"--rollout-max-in-flight-groups {args.rollout_max_in_flight_groups} "
-        f"--n-samples-per-prompt {args.n_samples_per_prompt} "
-        "--rollout-max-response-len 4 --rollout-temperature 1.0 --rollout-top-p 1 "
-        f"--global-batch-size {args.global_batch_size} "
-    )
-    return (
-        f"--hf-checkpoint {quote(os.fspath(bundle))} "
-        f"{rollout_args}{optimizer_args}{grpo_args}{sglang_args}"
-        f"{learner_args}{checkpoint_args}{misc_args}{wandb_args}{args.extra_args}"
-    )
+    blocks = [
+        build_learner_args(bundle=bundle, micro_batch_size=args.micro_batch_size),
+        build_rollout_args(
+            args,
+            prompt_path=prompt_data.path,
+            input_key=prompt_data.input_key,
+            label_key=prompt_data.label_key,
+            metadata_key=prompt_data.metadata_key,
+        ),
+        build_optimizer_args(args.lr) + build_algorithm_args(),
+        [
+            "--colocate",
+            "--no-offload-train",
+            "--no-offload-rollout",
+            "--actor-num-nodes", "1",
+            "--actor-num-gpus-per-node", str(args.actor_num_gpus_per_node),
+        ] + build_sglang_args(args, mem_fraction, colocate=True),
+        build_checkpoint_args(
+            checkpoint_dir=checkpoint_dir,
+            save_interval=args.save_interval,
+            resume=args.resume,
+        ) + build_wandb_args(args.run_id),
+    ]
+    joined = shlex.join(item for block in blocks for item in block)
+    return f"{joined} {args.extra_args}".strip()
 
 
 def _run_rocm_single_node(args: ScriptArgs, node_ip: str, train_args: str, extra_env: dict[str, str]) -> None:
@@ -244,23 +223,11 @@ def execute(args: ScriptArgs) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir = output_dir / args.run_id / "checkpoints"
     if args.resume:
-        tracker = checkpoint_dir / "latest_checkpointed_iteration.txt"
-        if not tracker.is_file():
-            raise FileNotFoundError(f"GR resume checkpoint tracker is missing: {tracker}")
-        iteration = int(tracker.read_text().strip())
-        if iteration <= 0 or not (checkpoint_dir / f"iter_{iteration:07d}" / "meta.json").is_file():
-            raise ValueError(f"GR resume checkpoint is incomplete at iteration {iteration}")
-        if not (checkpoint_dir / "rollout" / f"global_dataset_state_dict_{iteration - 1}.pt").is_file():
-            raise FileNotFoundError("GR resume requires the matching rollout dataset state")
+        validate_resume_checkpoint(checkpoint_dir)
 
     prompt_data = prepare_prompt_data(prompt_source, output_dir / args.run_id / "prompt_data.jsonl")
-    required_queries = args.num_rollout * args.rollout_batch_size
-    if required_queries > prompt_data.sample_count:
-        raise ValueError(
-            "Fixed-step training must not reuse dataset rows implicitly: "
-            f"num_rollout * rollout_batch_size requires {required_queries} queries, "
-            f"but the dataset contains {prompt_data.sample_count}."
-        )
+    if args.num_rollout < 1:
+        raise ValueError(f"num_rollout must be positive, got {args.num_rollout}")
     local_ckpt = str(stage_local_model_dir(checkpoint, "checkpoint"))
     local_qwen = str(stage_local_model_dir(qwen_model, "Qwen model"))
     staged_mapping = stage_local_mapping_dir(mapping)

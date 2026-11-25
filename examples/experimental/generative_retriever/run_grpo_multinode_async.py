@@ -55,11 +55,11 @@ from examples.experimental.generative_retriever.runtime.gr_config import (
     apply_ray_keepalive_env,
 )
 from examples.experimental.generative_retriever.runtime.multinode_recipe import (
-    MAX_STEPS_PER_PAIR,
     SAMPLES_PER_PROMPT,
     build_multinode_recipe,
     build_multinode_runtime_env,
     build_multinode_train_args,
+    steps_per_epoch,
 )
 from examples.experimental.generative_retriever.runtime.multinode_setup import (
     Manifest,
@@ -78,7 +78,14 @@ from examples.experimental.generative_retriever.runtime.service_processes import
     ProcessSupervisor,
 )
 from examples.experimental.generative_retriever.runtime.training_common import (
-    ScriptArgs, count_records, expanded_path, prepare_prompt_data, required_directory,
+    ScriptArgs,
+    count_records,
+    expanded_path,
+    prepare_prompt_data,
+     required_directory,
+    resolve_rollout_steps,
+    validate_resume_checkpoint,
+    wait_completed_checkpoint,
 )
 from examples.experimental.generative_retriever.services.mapping_staging import (
     stage_local_doc2k_state,
@@ -132,20 +139,11 @@ def build_manifest(
     alias = run_dir / "prompt_data.jsonl"
     local_bundle = local_bundle_path(args.run_id)
     count = count_records(prompt)
-    if count != PROMPT_DATASET_ROWS or args.rollout_batch_size * args.num_rollout > count:
-        raise ValueError(f"Expected {PROMPT_DATASET_ROWS} source rows without wrapping, got {count}")
+    if count != PROMPT_DATASET_ROWS:
+        raise ValueError(f"Expected {PROMPT_DATASET_ROWS} source rows, got {count}")
     if validate_checkpoints:
         if resume:
-            tracker = checkpoint_dir / "latest_checkpointed_iteration.txt"
-            if not tracker.is_file():
-                raise FileNotFoundError(f"Resume checkpoint missing: {tracker}")
-            iteration = int(tracker.read_text().strip())
-            if iteration <= 0 or not (checkpoint_dir / f"iter_{iteration:07d}" / "meta.json").is_file():
-                raise ValueError(f"Incomplete checkpoint at iteration {iteration}")
-            if not (
-                checkpoint_dir / "rollout" / f"global_dataset_state_dict_{iteration - 1}.pt"
-            ).is_file():
-                raise FileNotFoundError("Resume requires the matching rollout dataset state")
+            validate_resume_checkpoint(checkpoint_dir)
         elif (checkpoint_dir / "latest_checkpointed_iteration.txt").is_file():
             raise FileExistsError(f"Run directory already contains checkpoints; pass --resume: {run_dir}")
     gr_cfg = args.build_gr_config()
@@ -390,8 +388,7 @@ def run_cluster(manifest: Manifest) -> None:
             time.sleep(5)
         if training.returncode:
             raise RuntimeError(f"train.py exited {training.returncode}: {run_dir / 'training.log'}")
-        tracker = run_dir / "checkpoints/latest_checkpointed_iteration.txt"
-        completed = int(tracker.read_text().strip()) if tracker.is_file() else -1
+        completed = wait_completed_checkpoint(run_dir / "checkpoints", manifest["num_rollout"])
         if completed != manifest["num_rollout"]:
             raise RuntimeError(f"Expected {manifest['num_rollout']} checkpointed steps, got {completed}")
         print(f"Completed {completed} GRPO optimizer steps: {run_dir}", flush=True)
@@ -412,6 +409,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--hosts", default="node-0,node-1")
     parser.add_argument("--run-id", default=create_run_id())
+    parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--num-rollout", type=int)
     parser.add_argument("--save-interval", type=int, default=ScriptArgs.save_interval)
     parser.add_argument("--step-temperatures", default=ScriptArgs.step_temperatures)
@@ -450,8 +448,17 @@ def main() -> None:
         parser.error("Manifest path and index are only accepted with an internal role")
     hosts, addresses = resolve_hosts(cli.hosts)
     pairs = len(hosts) // 2
+    try:
+        target_rollouts = resolve_rollout_steps(
+            steps_per_epoch=steps_per_epoch(pairs),
+            epochs=cli.epochs,
+            num_rollout=cli.num_rollout,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     base_args = replace(
         ScriptArgs(),
+        epochs=cli.epochs,
         save_interval=cli.save_interval,
         step_temperatures=cli.step_temperatures,
         doc2k_mode=cli.doc2k_mode,
@@ -466,7 +473,7 @@ def main() -> None:
     args = build_multinode_recipe(
         cli.run_id,
         pairs,
-        cli.num_rollout if cli.num_rollout is not None else MAX_STEPS_PER_PAIR // pairs,
+        target_rollouts,
         base_args=base_args,
     )
     manifest = build_manifest(

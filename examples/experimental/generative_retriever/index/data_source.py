@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-import shutil
 import tempfile
 import threading
 from typing import Any
 
 import torch
 
-from examples.experimental.generative_retriever.utils.paths import absolute_path
+from examples.experimental.generative_retriever.utils.paths import (
+    absolute_path,
+    atomic_stream_copy_file,
+)
 from miles.rollout.data_source import RolloutDataSourceWithBuffer
+from miles.utils.data import Dataset
 from miles.utils.types import Sample
 
 
@@ -22,25 +25,44 @@ class GRRolloutDataSource(RolloutDataSourceWithBuffer):
             raise ValueError("The final GR checkpoint must coincide with a rollout weight update")
         super().__init__(args)
 
+    def _require_dataset(self) -> Dataset:
+        if self.dataset is None:
+            raise ValueError("GR rollout requires a global prompt dataset")
+        if len(self.dataset) <= 0:
+            raise ValueError("GR prompt dataset must not be empty")
+        return self.dataset
+
+    def _live_consumed(self) -> int:
+        dataset = self._require_dataset()
+        return self.epoch_id * len(dataset) + self.sample_offset
+
+    def _consume_dataset_samples(self, count: int) -> list[Sample]:
+        dataset = self._require_dataset()
+        dataset_len = len(dataset)
+        collected: list[Sample] = []
+        remaining = count
+        while remaining > 0:
+            available = dataset_len - self.sample_offset
+            if remaining <= available:
+                collected.extend(dataset.samples[self.sample_offset : self.sample_offset + remaining])
+                self.sample_offset += remaining
+                remaining = 0
+            else:
+                if available > 0:
+                    collected.extend(dataset.samples[self.sample_offset :])
+                    remaining -= available
+                self.epoch_id += 1
+                if self.args.rollout_shuffle:
+                    dataset.shuffle(self.epoch_id)
+                self.sample_offset = 0
+        return collected
+
     def get_samples(self, num_samples: int) -> list[list[Sample]]:
         samples = self._get_samples_from_buffer(num_samples)
         remaining = num_samples - len(samples)
         if remaining == 0:
             return samples
-        if self.dataset is None:
-            raise ValueError("GR rollout requires a global prompt dataset")
-        if self.sample_offset + remaining <= len(self.dataset):
-            prompt_samples = self.dataset.samples[self.sample_offset : self.sample_offset + remaining]
-            self.sample_offset += remaining
-        else:
-            prompt_samples = self.dataset.samples[self.sample_offset :]
-            remaining -= len(prompt_samples)
-            self.epoch_id += 1
-            if self.args.rollout_shuffle:
-                self.dataset.shuffle(self.epoch_id)
-            prompt_samples += self.dataset.samples[:remaining]
-            self.sample_offset = remaining
-
+        prompt_samples = self._consume_dataset_samples(remaining)
         group_size = self.args.n_samples_per_prompt
         for prompt_sample in prompt_samples:
             group_index = self.sample_group_index
@@ -67,20 +89,7 @@ class GRRolloutDataSource(RolloutDataSourceWithBuffer):
         prompts: list[str] = [str(grp[0].prompt) for grp in buffered]
         remaining = num_samples - len(prompts)
         if remaining > 0:
-            if self.dataset is None:
-                raise ValueError("GR rollout requires a global prompt dataset")
-            if self.sample_offset + remaining <= len(self.dataset):
-                prompt_samples = self.dataset.samples[self.sample_offset : self.sample_offset + remaining]
-                self.sample_offset += remaining
-            else:
-                prompt_samples = self.dataset.samples[self.sample_offset :]
-                remaining -= len(prompt_samples)
-                self.epoch_id += 1
-                if self.args.rollout_shuffle:
-                    self.dataset.shuffle(self.epoch_id)
-                prompt_samples += self.dataset.samples[:remaining]
-                self.sample_offset = remaining
-            prompts.extend(str(ps.prompt) for ps in prompt_samples)
+            prompts.extend(str(ps.prompt) for ps in self._consume_dataset_samples(remaining))
         start_group_idx = self.sample_group_index
         start_sample_idx = self.sample_index
         non_buffered = num_samples - len(buffered)
@@ -89,22 +98,24 @@ class GRRolloutDataSource(RolloutDataSourceWithBuffer):
         return prompts, start_group_idx, start_sample_idx
 
     def completed_position(self, rollout_id: int) -> int:
-        if self.dataset is None:
-            raise ValueError("GR resume requires a global prompt dataset")
-        position = (rollout_id + 1) * self.args.rollout_batch_size
-        if position > len(self.dataset):
-            raise ValueError("GR rollout checkpoint exceeds the prompt dataset")
-        return position
+        self._require_dataset()
+        return (rollout_id + 1) * self.args.rollout_batch_size
+
+    def completed_cursor(self, rollout_id: int) -> tuple[int, int, int]:
+        dataset = self._require_dataset()
+        position = self.completed_position(rollout_id)
+        epoch_id, sample_offset = divmod(position, len(dataset))
+        return position, epoch_id, sample_offset
 
     def save(self, rollout_id: int) -> None:
-        position = self.completed_position(rollout_id)
-        if self.epoch_id != 0 or self.sample_offset < position or self.buffer:
-            raise ValueError("GR rollout cannot checkpoint a wrapped or buffered prompt dataset")
+        position, epoch_id, sample_offset = self.completed_cursor(rollout_id)
+        if self._live_consumed() < position or self.buffer:
+            raise ValueError("GR rollout cannot checkpoint an incomplete or buffered prompt dataset")
         save_root = absolute_path(self.args.save)
         path = save_root / "rollout" / f"global_dataset_state_dict_{rollout_id}.pt"
         payload = {
-            "sample_offset": position,
-            "epoch_id": 0,
+            "sample_offset": sample_offset,
+            "epoch_id": epoch_id,
             "sample_group_index": position,
             "sample_index": position * self.args.n_samples_per_prompt,
             "metadata": self.metadata,
@@ -117,10 +128,7 @@ class GRRolloutDataSource(RolloutDataSourceWithBuffer):
 
             def _sync_ds() -> None:
                 try:
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    dst_tmp = path.with_suffix(".pt.tmp")
-                    shutil.copyfile(tmp_path, dst_tmp)
-                    dst_tmp.replace(path)
+                    atomic_stream_copy_file(tmp_path, path)
                 finally:
                     tmp_path.unlink(missing_ok=True)
 
@@ -137,9 +145,14 @@ class GRRolloutDataSource(RolloutDataSourceWithBuffer):
         path = Path(self.args.load) / "rollout" / f"global_dataset_state_dict_{rollout_id}.pt"
         if not path.is_file():
             raise FileNotFoundError(f"GR rollout checkpoint is missing: {path}")
+        dataset = self._require_dataset()
         super().load(rollout_id)
-        position = self.completed_position(rollout_id)
-        if self.epoch_id != 0 or self.sample_offset < position or self.buffer:
+        position, epoch_id, sample_offset = self.completed_cursor(rollout_id)
+        if self._live_consumed() < position or self.buffer:
             raise ValueError("GR rollout checkpoint has an invalid prompt cursor")
-        self.sample_offset = self.sample_group_index = position
+        self.epoch_id = epoch_id
+        self.sample_offset = sample_offset
+        self.sample_group_index = position
         self.sample_index = position * self.args.n_samples_per_prompt
+        if self.args.rollout_global_dataset and self.args.rollout_shuffle:
+            dataset.shuffle(self.epoch_id)

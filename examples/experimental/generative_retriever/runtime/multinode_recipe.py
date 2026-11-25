@@ -20,8 +20,13 @@ from examples.experimental.generative_retriever.runtime.prepare_rocm_env import 
 from examples.experimental.generative_retriever.runtime.training_common import (
     ScriptArgs,
     build_algorithm_args,
+    build_checkpoint_args,
+    build_learner_args,
     build_optimizer_args,
+    build_rollout_args,
     build_sglang_args,
+    build_wandb_args,
+    resolve_rollout_steps,
 )
 
 _REPO = Path(__file__).absolute().parents[4]
@@ -38,6 +43,15 @@ MAX_STEPS_PER_PAIR = PROMPT_DATASET_ROWS // QUERIES_PER_STEP_PER_PAIR
 _SGLANG_CONCURRENCY_PER_PAIR = 16_384
 
 
+def steps_per_epoch(pairs: int) -> int:
+    if pairs <= 0:
+        raise ValueError("pairs must be positive")
+    steps = MAX_STEPS_PER_PAIR // pairs
+    if steps < 1:
+        raise ValueError(f"Prompt dataset too small for {pairs} node pairs")
+    return steps
+
+
 def build_multinode_recipe(
     run_id: str,
     pairs: int,
@@ -47,28 +61,29 @@ def build_multinode_recipe(
 ) -> ScriptArgs:
     if not run_id or "/" in run_id or run_id in {".", ".."}:
         raise ValueError("run-id must be a nonempty directory name without slashes")
-    if pairs <= 0:
-        raise ValueError("pairs must be positive")
-    max_rollouts = MAX_STEPS_PER_PAIR // pairs
-    if max_rollouts < 1 or not 1 <= num_rollout <= max_rollouts:
-        raise ValueError(f"num-rollout must be between 1 and {max_rollouts}")
+    resolved_rollout = resolve_rollout_steps(
+        steps_per_epoch=steps_per_epoch(pairs),
+        num_rollout=num_rollout,
+    )
 
     template = ScriptArgs() if base_args is None else base_args
-    derived_mem = derive_sglang_mem_fraction(
-        _SGLANG_CONCURRENCY_PER_PAIR * pairs,
-        SAMPLES_PER_PROMPT,
-        ROLLOUT_GPUS_PER_PAIR * pairs,
-    )
     mem_fraction = (
         template.sglang_mem_fraction_static
         if template.sglang_mem_fraction_static > 0
-        else min(derived_mem, 0.18)
+        else min(
+            derive_sglang_mem_fraction(
+                _SGLANG_CONCURRENCY_PER_PAIR * pairs,
+                SAMPLES_PER_PROMPT,
+                ROLLOUT_GPUS_PER_PAIR * pairs,
+            ),
+            0.18,
+        )
     )
     mbs = template.micro_batch_size
     return replace(
         template,
         run_id=run_id,
-        num_rollout=num_rollout,
+        num_rollout=resolved_rollout,
         rollout_batch_size=QUERIES_PER_STEP_PER_PAIR * pairs,
         rollout_max_in_flight_groups=IN_FLIGHT_GROUPS_PER_PAIR * pairs,
         n_samples_per_prompt=SAMPLES_PER_PROMPT,
@@ -94,41 +109,8 @@ def build_multinode_train_args(
     resume: bool,
 ) -> list[str]:
     blocks = [
-        [
-            "--hf-checkpoint", str(bundle),
-            "--train-backend", "fsdp",
-            "--custom-fsdp-model-factory-path",
-            "examples.experimental.generative_retriever.model.fsdp_policy.build_gr_stage5_policy",
-            "--data-source-path",
-            "examples.experimental.generative_retriever.index.data_source.GRRolloutDataSource",
-            "--weight-sync-include-prefixes",
-            "encoder_list.0.model.encoder.model.", "docEnc2decoder.", "decoder.", "lm_head.",
-            "--update-weight-buffer-size", "2147483648",
-            "--micro-batch-size", str(args.micro_batch_size),
-        ],
-        [
-            "--prompt-data", str(prompt),
-            "--input-key", "query",
-            "--rollout-shuffle",
-            "--rollout-function-path",
-            "examples.experimental.generative_retriever.model.local_coloc_rollout.GRLocalColocatedRolloutFn",
-            "--custom-generate-function-path",
-            "examples.experimental.generative_retriever.model.sglang_encode_generate.generate",
-            "--custom-rm-path", "examples.experimental.generative_retriever.reward.reward.reward",
-            "--custom-rollout-log-function-path",
-            "examples.experimental.generative_retriever.reward.rollout_metrics.log_rollout",
-            "--custom-convert-samples-to-train-data-path",
-            "examples.experimental.generative_retriever.reward.rollout_metrics.convert_gr_samples_to_train_data",
-            "--generative-retriever-reward-mode", args.reward_mode,
-            "--num-rollout", str(args.num_rollout),
-            "--rollout-batch-size", str(args.rollout_batch_size),
-            "--rollout-max-in-flight-groups", str(args.rollout_max_in_flight_groups),
-            "--n-samples-per-prompt", str(args.n_samples_per_prompt),
-            "--rollout-max-response-len", "4",
-            "--rollout-temperature", "1.0",
-            "--rollout-top-p", "1",
-            "--global-batch-size", str(args.global_batch_size),
-        ],
+        build_learner_args(bundle=bundle, micro_batch_size=args.micro_batch_size),
+        build_rollout_args(args, prompt_path=prompt),
         build_optimizer_args(args.lr) + build_algorithm_args(),
         [
             "--colocate",
@@ -140,15 +122,11 @@ def build_multinode_train_args(
             "--dp-replicate-size", str(len(addresses)),
             "--router-policy", "round_robin",
         ] + build_sglang_args(args, args.sglang_mem_fraction_static, colocate=True),
-        [
-            "--save", str(checkpoint_dir),
-            *(["--load", str(checkpoint_dir)] if resume else []),
-            "--save-interval", str(args.save_interval),
-            "--use-wandb",
-            "--wandb-project", "miles-run_grpo",
-            "--wandb-group", args.run_id,
-            "--disable-wandb-random-suffix",
-        ],
+        build_checkpoint_args(
+            checkpoint_dir=checkpoint_dir,
+            save_interval=args.save_interval,
+            resume=resume,
+        ) + build_wandb_args(args.run_id),
     ]
     return [item for block in blocks for item in block]
 

@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import time
 
 from examples.experimental.generative_retriever.reward.relevance_reward import (
     DEFAULT_TRAIN_GROUP_SIZE,
@@ -29,6 +30,14 @@ _QUERIES_PER_STEP = 4000
 _GLOBAL_BATCH_SIZE = _QUERIES_PER_STEP * DEFAULT_TRAIN_GROUP_SIZE
 _MAX_STEPS = PROMPT_DATASET_ROWS // _QUERIES_PER_STEP
 _IN_FLIGHT_GROUPS = 512
+_WANDB_PROJECT = "miles-run_grpo"
+_UPDATE_WEIGHT_BUFFER_BYTES = 2_147_483_648
+_WEIGHT_SYNC_INCLUDE_PREFIXES: tuple[str, ...] = (
+    "encoder_list.0.model.encoder.model.",
+    "docEnc2decoder.",
+    "decoder.",
+    "lm_head.",
+)
 
 
 def required_directory(value: str, name: str) -> str:
@@ -79,6 +88,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     global_batch_size: int = _GLOBAL_BATCH_SIZE
     micro_batch_size: int = 50 * DEFAULT_TRAIN_GROUP_SIZE
     max_tokens_per_gpu: int = 131072
+    epochs: int = 1
     num_rollout: int = _MAX_STEPS
     temperature: float = 1.0
     step_temperatures: str = "1.0"
@@ -188,6 +198,127 @@ def prepare_prompt_data(source: Path, jsonl_alias: Path) -> PromptData:
         metadata_key=None,
         sample_count=count_records(source),
     )
+
+
+def resolve_rollout_steps(
+    *,
+    steps_per_epoch: int,
+    epochs: int = 1,
+    num_rollout: int | None = None,
+) -> int:
+    if steps_per_epoch < 1:
+        raise ValueError(f"steps_per_epoch must be positive, got {steps_per_epoch}")
+    if epochs < 1:
+        raise ValueError(f"epochs must be positive, got {epochs}")
+    resolved = steps_per_epoch * epochs if num_rollout is None else num_rollout
+    if resolved < 1:
+        raise ValueError(f"num_rollout must be positive, got {resolved}")
+    return resolved
+
+
+def validate_resume_checkpoint(checkpoint_dir: Path) -> int:
+    tracker = checkpoint_dir / "latest_checkpointed_iteration.txt"
+    if not tracker.is_file():
+        raise FileNotFoundError(f"Resume checkpoint missing: {tracker}")
+    raw = tracker.read_text(encoding="utf-8").strip()
+    if not raw.isdigit():
+        raise ValueError(f"Invalid checkpoint iteration in {tracker}: {raw!r}")
+    iteration = int(raw)
+    if iteration <= 0 or not (checkpoint_dir / f"iter_{iteration:07d}" / "meta.json").is_file():
+        raise ValueError(f"Incomplete checkpoint at iteration {iteration}")
+    if not (checkpoint_dir / "rollout" / f"global_dataset_state_dict_{iteration - 1}.pt").is_file():
+        raise FileNotFoundError("Resume requires the matching rollout dataset state")
+    return iteration
+
+
+def wait_completed_checkpoint(
+    checkpoint_dir: Path,
+    expected_step: int,
+    *,
+    timeout: float = 120.0,
+) -> int:
+    tracker = checkpoint_dir / "latest_checkpointed_iteration.txt"
+    target_meta = checkpoint_dir / f"iter_{expected_step:07d}" / "model" / ".metadata"
+    deadline = time.monotonic() + timeout
+    completed = -1
+    while True:
+        if target_meta.is_file():
+            return expected_step
+        if tracker.is_file():
+            raw = tracker.read_text(encoding="utf-8").strip()
+            if raw.isdigit():
+                completed = int(raw)
+                if completed == expected_step:
+                    return completed
+        if time.monotonic() >= deadline:
+            return completed
+        time.sleep(2.0)
+
+
+def build_learner_args(*, bundle: Path, micro_batch_size: int) -> list[str]:
+    return [
+        "--hf-checkpoint", str(bundle),
+        "--train-backend", "fsdp",
+        "--custom-fsdp-model-factory-path",
+        "examples.experimental.generative_retriever.model.fsdp_policy.build_gr_stage5_policy",
+        "--data-source-path",
+        "examples.experimental.generative_retriever.index.data_source.GRRolloutDataSource",
+        "--weight-sync-include-prefixes", *_WEIGHT_SYNC_INCLUDE_PREFIXES,
+        "--update-weight-buffer-size", str(_UPDATE_WEIGHT_BUFFER_BYTES),
+        "--micro-batch-size", str(micro_batch_size),
+    ]
+
+
+def build_rollout_args(
+    args: ScriptArgs,
+    *,
+    prompt_path: Path,
+    input_key: str = "query",
+    label_key: str | None = None,
+    metadata_key: str | None = None,
+) -> list[str]:
+    return [
+        "--prompt-data", str(prompt_path),
+        "--input-key", input_key,
+        *(["--label-key", label_key] if label_key else []),
+        *(["--metadata-key", metadata_key] if metadata_key else []),
+        "--rollout-shuffle",
+        "--rollout-function-path",
+        "examples.experimental.generative_retriever.model.local_coloc_rollout.GRLocalColocatedRolloutFn",
+        "--custom-generate-function-path",
+        "examples.experimental.generative_retriever.model.sglang_encode_generate.generate",
+        "--custom-rm-path", "examples.experimental.generative_retriever.reward.reward.reward",
+        "--custom-rollout-log-function-path",
+        "examples.experimental.generative_retriever.reward.rollout_metrics.log_rollout",
+        "--custom-convert-samples-to-train-data-path",
+        "examples.experimental.generative_retriever.reward.rollout_metrics.convert_gr_samples_to_train_data",
+        "--generative-retriever-reward-mode", args.reward_mode,
+        "--num-rollout", str(args.num_rollout),
+        "--rollout-batch-size", str(args.rollout_batch_size),
+        "--rollout-max-in-flight-groups", str(args.rollout_max_in_flight_groups),
+        "--n-samples-per-prompt", str(args.n_samples_per_prompt),
+        "--rollout-max-response-len", "4",
+        "--rollout-temperature", "1.0",
+        "--rollout-top-p", "1",
+        "--global-batch-size", str(args.global_batch_size),
+    ]
+
+
+def build_checkpoint_args(*, checkpoint_dir: Path, save_interval: int, resume: bool) -> list[str]:
+    return [
+        "--save", str(checkpoint_dir),
+        *(["--load", str(checkpoint_dir)] if resume else []),
+        "--save-interval", str(save_interval),
+    ]
+
+
+def build_wandb_args(run_id: str) -> list[str]:
+    return [
+        "--use-wandb",
+        "--wandb-project", _WANDB_PROJECT,
+        "--wandb-group", run_id,
+        "--disable-wandb-random-suffix",
+    ]
 
 
 def build_optimizer_args(lr: float) -> list[str]:

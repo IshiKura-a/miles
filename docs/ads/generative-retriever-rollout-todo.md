@@ -398,11 +398,12 @@ CUDA_VISIBLE_DEVICES=4,5 uv run python -m \
 
 - **全卡 Colocated 架构**：集群内全部 `16n` 张 GPU 同时承载 SGLang Rollout 引擎（每卡 1 个实例，进程内含 Policy、Frozen Baseline、零拷贝 Arrow `ResidentMapping`、同卡 `RelevanceScorer` 及节点内 `/dev/shm` 共享 keyword 向量表）与 FSDP Learner（节点内 8 卡 FSDP 分片、跨 `2n` 台节点 HSDP 副本 `--dp-replicate-size 2n`）。
 - **单步吞吐与 Batch 规模**：每对节点（16 卡）每步处理 **`16,000` query × `512` sample**，因此 `n` 对节点每步处理 **`16,000n` query × `512` sample**（两机 16 卡为 `16,000` query/step，`global_batch_size = 8,192,000n`；八机 64 卡 `n=4` 为 `64,000` query/step，`global_batch_size = 32,768,000`；同时在途 query group 上限 `rollout_max_in_flight_groups = 512n`，`sglang_server_concurrency = 16,384n`，`micro_batch_size = 5,120`）。
-- **1500 万条数据完整 1 Epoch 步数**：完整遍历 `15,000,000` 条数据且不越界回绕的最大 optimizer step 数为 **`937 // n`**：
-  - `n=1`（两机 16 卡）：**`937` 步**（消费 `14,992,000` 条）；
-  - `n=3`（六机 48 卡）：**`312` 步**（消费 `14,976,000` 条）；
-  - `n=4`（八机 64 卡）：**`234` 步**（`234 × 64,000 = 14,976,000` 条，占全量 99.84%）。
-  支持 `--num-rollout` 指定不超过该上限的短验收步骤；正式训练省略此参数。
+- **1500 万条数据 Epoch 步数与多轮回绕**：单轮（1 Epoch）步数为 **`937 // n`**：
+  - `n=1`（两机 16 卡）：**`937` 步/Epoch**（消费 `14,992,000` 条）；
+  - `n=2`（四机 32 卡）：**`468` 步/Epoch**（消费 `14,976,000` 条）；
+  - `n=3`（六机 48 卡）：**`312` 步/Epoch**（消费 `14,976,000` 条）；
+  - `n=4`（八机 64 卡）：**`234` 步/Epoch**（`234 × 64,000 = 14,976,000` 条，占全量 99.84%）。
+  支持 `--epochs <E>`（默认 `1`，总步数 `(937 // n) * E`，如八机 64 卡 `--epochs 3` 为 `702` 步）或 `--num-rollout` 显式指定任意正整数步数；跨 Epoch 边界时 `GRRolloutDataSource` 按 `seed + epoch_id` 自动重排洗牌，`save / load` 按 `divmod(position, len(dataset))` 精确保存与恢复 `(epoch_id, sample_offset)` 游标，且 `unique_weight` 退火自动跨越完整 `num_rollout` 总步数。
   此精确遍历前提是每轮无请求或 group 失败；否则现有 rollout 会
   跳过失败 group 并补取 query，不能将运行结果视为精确遍历。
   旧 run `261021-114423-121` 在早期 rollout 已跳过失败 group，即使其
