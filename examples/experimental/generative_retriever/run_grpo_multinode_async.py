@@ -49,7 +49,7 @@ from examples.experimental.generative_retriever.reward.relevance_reward import (
     PROMPT_DATASET_ROWS,
 )
 from examples.experimental.generative_retriever.runtime.gr_config import (
-    ANTI_COLLAPSE_MODES,
+    ADVANTAGE_MODES,
     DOC2K_MODES,
     UNIQUE_ANNEAL_MODES,
     apply_ray_keepalive_env,
@@ -417,7 +417,7 @@ def main() -> None:
     parser.add_argument("--step-temperatures", default=ScriptArgs.step_temperatures)
     parser.add_argument("--doc2k-mode", choices=DOC2K_MODES, default=ScriptArgs.doc2k_mode)
     parser.add_argument("--unique-anneal-mode", choices=UNIQUE_ANNEAL_MODES, default=ScriptArgs.unique_anneal_mode)
-    parser.add_argument("--anti-collapse-mode", choices=ANTI_COLLAPSE_MODES, default=ScriptArgs.anti_collapse_mode)
+    parser.add_argument("--advantage-mode", choices=ADVANTAGE_MODES, default=ScriptArgs.advantage_mode)
     parser.add_argument("--unique-weight-start", type=float, default=ScriptArgs.unique_weight_start)
     parser.add_argument("--unique-weight-end", type=float, default=ScriptArgs.unique_weight_end)
     parser.add_argument("--unique-anneal-warmup-ratio", type=float, default=ScriptArgs.unique_anneal_warmup_ratio)
@@ -456,7 +456,7 @@ def main() -> None:
         step_temperatures=cli.step_temperatures,
         doc2k_mode=cli.doc2k_mode,
         unique_anneal_mode=cli.unique_anneal_mode,
-        anti_collapse_mode=cli.anti_collapse_mode,
+        advantage_mode=cli.advantage_mode,
         unique_weight_start=cli.unique_weight_start,
         unique_weight_end=cli.unique_weight_end,
         unique_anneal_warmup_ratio=cli.unique_anneal_warmup_ratio,

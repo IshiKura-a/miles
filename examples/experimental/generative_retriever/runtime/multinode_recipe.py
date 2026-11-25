@@ -129,7 +129,7 @@ def build_multinode_train_args(
             "--rollout-top-p", "1",
             "--global-batch-size", str(args.global_batch_size),
         ],
-        build_optimizer_args(args.lr) + build_algorithm_args(args.anti_collapse_mode),
+        build_optimizer_args(args.lr) + build_algorithm_args(),
         [
             "--colocate",
             "--no-offload-train",

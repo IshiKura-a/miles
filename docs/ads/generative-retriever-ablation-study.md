@@ -96,8 +96,9 @@
 ### 1.4 零超参、Beam 无关的 `PosMean` 与自适应胜者配额裁剪 `PosMean + AdaptiveQuota` 单变量消融
 
 同时拔除上述三项根因——改用全层无偏温度 `--step-temperatures 1.0`、移除前缀光环（4 个 RQ token 共享纯叶子轨迹优势 $A_{g,0..3} = A_g$）、并以正奖励均值 $\mu_+(q)$ 为分界构造采样内严格零和优势（[rollout_metrics.py](../../examples/experimental/generative_retriever/reward/rollout_metrics.py) 中的 `compute_pos_mean_advantages`）——在两套 4 机 32 卡集群上完成了严格单变量全量 468 步对照：
-- **`Arm A: PosMean`（`--anti-collapse-mode pos_mean`）**：纯正均值零和优势，无概率上限裁剪；
-- **`Arm B': PosMean + AdaptiveQuota`（`--anti-collapse-mode pos_mean_quota`）**：在 `Arm A` 基础上，仅对正优势乘以零超参自适应胜者配额阻尼项 $\operatorname{clip}(1 - M_+(q)\,\pi_{\text{old}}(d_g),\, 0,\, 1)$。
+- **`Arm A: PosMean`（`--advantage-mode pos_mean`）**：纯正均值零和优势，无概率上限裁剪；
+- **`Arm B': PosMean + AdaptiveQuota`（`--advantage-mode pos_mean_quota`，已设为现行默认）**：在 `Arm A` 基础上，仅对正优势乘以零超参自适应胜者配额阻尼项 $\operatorname{clip}(1 - M_+(q)\,\pi_{\text{old}}(d_g),\, 0,\, 1)$。
+  *(注：已证伪的第一轮 `quota_cap` 与 `target_entropy` 实验分支已在定版后从代码库清理，当前 `--advantage-mode` 仅保留 `{pos_mean_quota, pos_mean, causal_tree}` 且默认启用 `pos_mean_quota` + `--step-temperatures 1.0`。)*
 
 #### 1.4.1 算法公式定义（零魔法常数、无 `64` 硬编码）
 
