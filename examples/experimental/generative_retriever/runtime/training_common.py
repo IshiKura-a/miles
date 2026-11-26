@@ -18,6 +18,7 @@ from examples.experimental.generative_retriever.runtime.gr_config import (
     AdvantageMode,
     DEFAULT_HBM_KW_MEMORY_FRACTION,
     DEFAULT_SGLANG_WATCHDOG_TIMEOUT_SECONDS,
+    DEFAULT_UNIQUE_WEIGHT,
     Doc2kMode,
     GRConfig,
     UniqueAnnealMode,
@@ -93,9 +94,9 @@ class ScriptArgs(U.ExecuteTrainConfig):
     temperature: float = 1.0
     step_temperatures: str = "1.0"
     doc2k_mode: Doc2kMode = "relevance_guided"
-    unique_anneal_mode: UniqueAnnealMode = "cosine"
+    unique_anneal_mode: UniqueAnnealMode = "none"
     advantage_mode: AdvantageMode = "pos_mean_quota"
-    unique_weight_start: float = 2.0
+    unique_weight_start: float = DEFAULT_UNIQUE_WEIGHT
     unique_weight_end: float = 0.0
     unique_anneal_warmup_ratio: float = 0.0
     local_rollout_batch_size: int = 125

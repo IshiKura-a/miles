@@ -24,6 +24,7 @@ ADVANTAGE_MODES: tuple[AdvantageMode, ...] = (
 
 GR_CONFIG_ENV_VAR = "GR_CONFIG_JSON"
 DEFAULT_STEP_TEMPERATURES: tuple[float, float, float, float] = (1.0, 1.0, 1.0, 1.0)
+DEFAULT_UNIQUE_WEIGHT = 0.5
 DEFAULT_SGLANG_WATCHDOG_TIMEOUT_SECONDS = 600
 DEFAULT_HBM_KW_MEMORY_FRACTION = 0.20
 
@@ -65,9 +66,9 @@ class GRConfig:
     reward_mode: RewardModeLiteral = "discrete_relevance_unique"
     step_temperatures: tuple[float, ...] = DEFAULT_STEP_TEMPERATURES
     doc2k_mode: Doc2kMode = "relevance_guided"
-    unique_anneal_mode: UniqueAnnealMode = "cosine"
+    unique_anneal_mode: UniqueAnnealMode = "none"
     advantage_mode: AdvantageMode = "pos_mean_quota"
-    unique_weight_start: float = 2.0
+    unique_weight_start: float = DEFAULT_UNIQUE_WEIGHT
     unique_weight_end: float = 0.0
     unique_anneal_warmup_ratio: float = 0.0
     local_rollout_batch_size: int = 125

@@ -87,21 +87,26 @@ def compute_dinkelbach_watermarks_gpu(
     num_queries: int,
     edge_query_idx: torch.Tensor,
     inv_freq: torch.Tensor,
-    pm_pass: torch.Tensor,
-    sm_pass: torch.Tensor,
-    base_p_pm: torch.Tensor,
-    base_p_sm: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute per-query ``(p_ref_pm, p_ref_sm)`` self-ratcheting Dinkelbach watermarks."""
+    pm_rel: torch.Tensor,
+    sm_rel: torch.Tensor,
+    unit_ub: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute per-query deduplicated ``(p_ref_pm, p_ref_sm, u_ref)`` rollout watermarks."""
+    zeros = torch.zeros(num_queries, dtype=torch.float64, device=inv_freq.device)
     if edge_query_idx.numel() == 0:
-        return base_p_pm, base_p_sm
-    grp_u_cols = torch.stack((inv_freq, pm_pass * inv_freq, sm_pass * inv_freq), dim=1)
-    grp_u_sums = torch.zeros((num_queries, 3), dtype=torch.float64, device=inv_freq.device)
+        return zeros, zeros, zeros
+    grp_u_cols = torch.stack(
+        (inv_freq, pm_rel * inv_freq, sm_rel * inv_freq, unit_ub * inv_freq),
+        dim=1,
+    )
+    grp_u_sums = torch.zeros((num_queries, 4), dtype=torch.float64, device=inv_freq.device)
     grp_u_sums.index_add_(0, edge_query_idx, grp_u_cols)
     denom_u = grp_u_sums[:, 0].clamp_min(1.0)
-    p_ref_pm = torch.maximum(base_p_pm, grp_u_sums[:, 1] / denom_u)
-    p_ref_sm = torch.maximum(base_p_sm, grp_u_sums[:, 2] / denom_u)
-    return p_ref_pm, p_ref_sm
+    return (
+        grp_u_sums[:, 1] / denom_u,
+        grp_u_sums[:, 2] / denom_u,
+        grp_u_sums[:, 3] / denom_u,
+    )
 
 
 def _reduce_edge_metrics_gpu(
@@ -115,8 +120,6 @@ def _reduce_edge_metrics_gpu(
     pm_sm_pol: torch.Tensor,
     sorted_bpm_gpu: torch.Tensor,
     sorted_bsm_gpu: torch.Tensor,
-    base_p_pm_gpu: torch.Tensor,
-    base_p_sm_gpu: torch.Tensor,
     gr_config: GRConfig,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, torch.Tensor, torch.Tensor, torch.Tensor]:
     device = pol_lens_gpu.device
@@ -149,26 +152,29 @@ def _reduce_edge_metrics_gpu(
     rel_el = p_ok | s_ok
     any_u = u_pm | u_sm
 
-    # Store unit (unique_weight = 1.0) bonus components; caller scales linearly by step unique_weight.
+    # Store centered unit (unique_weight = 1.0) bonus components; caller scales linearly by step unique_weight.
     unit_pm_ub = torch.where(pm_u_el, 0.5 * rel_q, 0.0)
     unit_sm_ub = torch.where(sm_u_el, 0.5 * rel_q, 0.0)
     unit_ub = unit_pm_ub + unit_sm_ub
 
     is_cont = gr_config.reward_mode == "continuous_relevance_unique"
+    pm_rel = norm_pm if is_cont else pm_p
+    sm_rel = norm_sm if is_cont else sm_p
     base_raw = cont_b if is_cont else disc_b
+    centered_ub = unit_ub
     if e_pol > 0:
-        p_ref_pm, p_ref_sm = compute_dinkelbach_watermarks_gpu(
+        p_ref_pm, p_ref_sm, u_ref = compute_dinkelbach_watermarks_gpu(
             num_queries=n_valid,
             edge_query_idx=pol_edge_v_gpu,
             inv_freq=inv_freq,
-            pm_pass=pm_p,
-            sm_pass=sm_p,
-            base_p_pm=base_p_pm_gpu,
-            base_p_sm=base_p_sm_gpu,
+            pm_rel=pm_rel,
+            sm_rel=sm_rel,
+            unit_ub=unit_ub,
         )
         base_raw = base_raw - (p_ref_pm + p_ref_sm)[pol_edge_v_gpu]
+        centered_ub = unit_ub - u_ref[pol_edge_v_gpu]
     base_rew = base_raw * inv_freq
-    unit_ub_rew = unit_ub * inv_freq
+    unit_ub_rew = centered_ub * inv_freq
 
     edge_cols = torch.stack(
         (
@@ -428,16 +434,12 @@ def score_batch_gpu_vectorized(
 
     base_pm_list: list[frozenset[int]] = []
     base_sm_list: list[frozenset[int]] = []
-    base_p_pm_vals: list[float] = []
-    base_p_sm_vals: list[float] = []
     for q_str in valid_queries:
         bset = baseline_kid_cache.get(q_str)
-        assert bset is not None
+        if bset is None:
+            raise KeyError(f"Missing baseline keyword set for query {q_str!r}")
         base_pm_list.append(bset.pm)
         base_sm_list.append(bset.sm)
-        denom_b = float(bset.total_unique_kids)
-        base_p_pm_vals.append(len(bset.pm) / denom_b if denom_b > 0.0 else 0.0)
-        base_p_sm_vals.append(len(bset.sm) / denom_b if denom_b > 0.0 else 0.0)
 
     (
         base_valid_np,
@@ -457,8 +459,6 @@ def score_batch_gpu_vectorized(
         pm_sm_pol=pm_sm_gpu[inv_all_gpu[:e_pol]],
         sorted_bpm_gpu=pack_vk_sorted(base_pm_list, device),
         sorted_bsm_gpu=pack_vk_sorted(base_sm_list, device),
-        base_p_pm_gpu=torch.as_tensor(base_p_pm_vals, dtype=torch.float64, device=device),
-        base_p_sm_gpu=torch.as_tensor(base_p_sm_vals, dtype=torch.float64, device=device),
         gr_config=gr_config,
     )
 

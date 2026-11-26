@@ -203,18 +203,22 @@ unique_bonus = pm_unique_bonus + sm_unique_bonus
 ### `discrete_relevance_unique`
 
 ```text
-p_ref_m(q) = max(p_base_m(q), p_group_m(q)),   m in {PM, SM}
-discrete_base = (P - p_ref_PM(q)) + (S - p_ref_SM(q))
-R_discrete = discrete_base + unique_bonus
+p_ref_PM(q) = sum_{g,k} (P / c_q(k)) / sum_{g,k} (1 / c_q(k))
+p_ref_SM(q) = sum_{g,k} (S / c_q(k)) / sum_{g,k} (1 / c_q(k))
+u_1(q, k)   = 0.5 * Q * (U_PM * P + U_SM * S)
+u_ref(q)    = sum_{g,k} (u_1 / c_q(k)) / sum_{g,k} (1 / c_q(k))
+discrete_base     = (P - p_ref_PM(q)) + (S - p_ref_SM(q))
+centered_unique   = w * (u_1(q, k) - u_ref(q))
+R_discrete        = discrete_base + centered_unique
 ```
 
-- 默认训练模式；`p_ref_m(q)` 为零超参自适应棘轮 Dinkelbach 水位（取冻结 Baseline 唯一词池合格率与当前 Rollout 组唯一词池合格率之最大者）；`unique_bonus` 默认按 `--unique-anneal-mode cosine` 从 `2.0` 余弦退火至 `0.0`（支持 `cosine`、`linear`、`none`、`off`）；`--reward-mode` 可切换。
+- 默认训练模式（实现于 [gpu_batch_scorer.py](../../examples/experimental/generative_retriever/reward/gpu_batch_scorer.py)）；相关性水位 `p_ref_PM(q), p_ref_SM(q)` 与增量新词水位 `u_ref(q)` 均为当前 Rollout 512 桶去重唯一词池 $\mathcal{K}_{512}(q)$ 上的等权算术平均（无需外部参考模型的输出全集分母，仅需外部已知好词集 $B_{\text{PM}}(q), B_{\text{SM}}(q)$）；默认 `--unique-anneal-mode none --unique-weight-start 0.5`（恒定 $w = 0.5$ 不退火，亦支持 `cosine`、`linear`、`off`）；`--reward-mode` 可切换。
 
 ### `continuous_relevance_unique`
 
 ```text
 continuous_base = (W_PM - p_ref_PM(q)) + (W_SM - p_ref_SM(q))
-R_continuous = continuous_base + unique_bonus
+R_continuous    = continuous_base + centered_unique
 ```
 
 - 阈值以下的 relevance 提供连续 shaping signal；训练中作为 shadow metric 汇报。
