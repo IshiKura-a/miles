@@ -81,6 +81,7 @@ class EvalConfig:
     batch_size: int = DEFAULT_EVAL_BATCH_SIZE
     scorer_batch_size: int = 8192
     docids_per_query: int = DEFAULT_EVAL_GROUP_SIZE
+    policy_mapping_mode: Literal["checkpoint", "initial"] = "checkpoint"
     score_head: Literal["sm", "pm"] = "pm"
     mapping_port: int = _MAPPING_PORT
     generator_port: int = _GENERATOR_PORT
@@ -249,10 +250,13 @@ def run_evaluation(config: EvalConfig) -> dict[str, Any] | None:
     dcp_model_dir = run_dir / "checkpoints" / f"iter_{step_pad}" / "model"
     base_eval_root = _expand_path(config.base_eval_root, "base_eval_root", expect_dir=True)
     base_manifest = load_eval_manifest(base_eval_root)
+    default_dir_name = eval_dir_name(base_manifest, docids_per_query=config.docids_per_query, step=step)
+    if config.policy_mapping_mode == "initial":
+        default_dir_name = f"{default_dir_name}_policy_only"
     eval_root = (
         _expand_path(config.eval_root, "eval_root")
         if config.eval_root is not None
-        else run_dir / "eval" / eval_dir_name(base_manifest, docids_per_query=config.docids_per_query, step=step)
+        else run_dir / "eval" / default_dir_name
     )
     stage5_ckpt = _expand_path(config.checkpoint, "checkpoint", expect_dir=True)
     qwen_model = _expand_path(config.qwen_model, "qwen_model", expect_dir=True)
@@ -260,10 +264,13 @@ def run_evaluation(config: EvalConfig) -> dict[str, Any] | None:
     id_mapping = _expand_path(config.id_mapping, "id_mapping")
     if not is_columnar_index_dir(id_mapping):
         raise FileNotFoundError(f"Incomplete initial mapping index: {id_mapping}")
-    ckpt_mapping_dir = run_dir / "checkpoints" / f"iter_{step_pad}" / "mapping"
-    if not is_columnar_index_dir(ckpt_mapping_dir):
-        raise FileNotFoundError(f"Incomplete checkpoint mapping index: {ckpt_mapping_dir}")
-    policy_mapping = ckpt_mapping_dir
+    if config.policy_mapping_mode == "initial":
+        policy_mapping = id_mapping
+    else:
+        ckpt_mapping_dir = run_dir / "checkpoints" / f"iter_{step_pad}" / "mapping"
+        if not is_columnar_index_dir(ckpt_mapping_dir):
+            raise FileNotFoundError(f"Incomplete checkpoint mapping index: {ckpt_mapping_dir}")
+        policy_mapping = ckpt_mapping_dir
     relevance_model = _expand_path(config.relevance_model, "relevance_model", expect_dir=True)
     policy_pt, cached_baseline_path, need_baseline = _prepare_eval_directory(
         output_root=output_root,
@@ -418,6 +425,11 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=defaults.batch_size)
     parser.add_argument("--scorer-batch-size", type=int, default=defaults.scorer_batch_size)
     parser.add_argument("--docids-per-query", type=int, default=defaults.docids_per_query)
+    parser.add_argument(
+        "--policy-mapping-mode",
+        choices=("checkpoint", "initial"),
+        default=defaults.policy_mapping_mode,
+    )
     parser.add_argument("--score-head", choices=("sm", "pm"), default=defaults.score_head)
     parser.add_argument("--mapping-port", type=int, default=defaults.mapping_port)
     parser.add_argument("--generator-port", type=int, default=defaults.generator_port)
@@ -440,6 +452,7 @@ def main() -> None:
             batch_size=args.batch_size,
             scorer_batch_size=args.scorer_batch_size,
             docids_per_query=args.docids_per_query,
+            policy_mapping_mode=args.policy_mapping_mode,
             score_head=args.score_head,
             mapping_port=args.mapping_port,
             generator_port=args.generator_port,

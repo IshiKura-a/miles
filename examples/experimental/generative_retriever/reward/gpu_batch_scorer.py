@@ -10,6 +10,7 @@ import torch
 from examples.experimental.generative_retriever.index.doc2k_voting import (
     Doc2kVoteDelta,
     compute_head_cutoff,
+    compute_natural_winner_counts,
     partition_head_and_tail_indices,
     record_query_enrichment_votes,
 )
@@ -246,6 +247,7 @@ def accumulate_batch_doc2k_votes(
     token_logprobs: torch.Tensor,
     valid_rows: list[int],
     group_size: int,
+    head_cutoffs: np.ndarray | None = None,
 ) -> Doc2kVoteDelta:
     """Extract fat-bucket survival edges and head-enrichment votes into a compact ``Doc2kVoteDelta``."""
     delta = Doc2kVoteDelta()
@@ -270,8 +272,7 @@ def accumulate_batch_doc2k_votes(
     fp_bounds = np.searchsorted(fp_s_np, np.arange(n_valid * group_size + 1))
     ug_bounds = np.searchsorted(ug_s_np, np.arange(n_valid * group_size + 1))
     lp_np_all = token_logprobs[valid_rows].detach().cpu().numpy().sum(axis=-1)
-    head_cutoff = compute_head_cutoff(group_size)
-    can_enrich = group_size >= DOC2K_MIN_GROUP_SAMPLES and group_size > head_cutoff
+    default_cutoff = compute_head_cutoff(group_size)
 
     for v in range(n_valid):
         s_base = v * group_size
@@ -293,9 +294,18 @@ def accumulate_batch_doc2k_votes(
                     edge = (u32_val, int(kid_p))
                     delta.edge_passes[edge] = delta.edge_passes.get(edge, 0) + 1
 
-        if not can_enrich or int(ug_bounds[s_base + group_size]) == int(ug_bounds[s_base]):
+        row_cutoff = int(head_cutoffs[v]) if head_cutoffs is not None else default_cutoff
+        if (
+            group_size < DOC2K_MIN_GROUP_SAMPLES
+            or not (0 < row_cutoff < group_size)
+            or int(ug_bounds[s_base + group_size]) == int(ug_bounds[s_base])
+        ):
             continue
-        head_indices, tail_indices = partition_head_and_tail_indices(group_size, lp_np_all[v])
+        head_indices, tail_indices = partition_head_and_tail_indices(
+            group_size,
+            lp_np_all[v],
+            head_cutoff=row_cutoff,
+        )
         head_chunks = [all_kids_cpu[r_offs[s_base + hi] : r_offs[s_base + hi + 1]] for hi in head_indices]
         head_kids_set = set(np.concatenate(head_chunks).tolist()) if head_chunks else set()
         tail_ug_slices = [ug_kid_np[int(ug_bounds[s_base + ti]) : int(ug_bounds[s_base + ti + 1])] for ti in tail_indices]
@@ -462,8 +472,14 @@ def score_batch_gpu_vectorized(
         gr_config=gr_config,
     )
 
-    vote_delta = (
-        accumulate_batch_doc2k_votes(
+    if not gr_config.doc2k_disabled:
+        effective_uw = 0.0 if gr_config.unique_anneal_mode == "off" else float(gr_config.unique_weight_start)
+        head_cutoffs = (
+            compute_natural_winner_counts(base_valid_np + effective_uw * unit_ub_valid_np)
+            if gr_config.advantage_mode in {"pos_mean_quota", "pos_mean"}
+            else None
+        )
+        vote_delta = accumulate_batch_doc2k_votes(
             pol_valid_u32=pol_valid_u32,
             pol_lens_np=pol_lens_np,
             pol_edge_s_gpu=pol_edge_s_gpu,
@@ -474,10 +490,10 @@ def score_batch_gpu_vectorized(
             token_logprobs=token_logprobs,
             valid_rows=valid_rows,
             group_size=group_size,
+            head_cutoffs=head_cutoffs,
         )
-        if not gr_config.doc2k_disabled
-        else Doc2kVoteDelta()
-    )
+    else:
+        vote_delta = Doc2kVoteDelta()
 
     base_mat = np.zeros((batch_size, group_size), dtype=np.float32)
     unit_ub_mat = np.zeros((batch_size, group_size), dtype=np.float32)

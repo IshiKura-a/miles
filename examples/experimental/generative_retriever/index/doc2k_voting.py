@@ -33,13 +33,36 @@ def compute_head_cutoff(group_size: int) -> int:
     return min(DOC2K_HEAD_RANK_CUTOFF, max(DOC2K_MIN_HEAD_RANKS, group_size // 2))
 
 
+def compute_natural_winner_counts(rewards_2d: np.ndarray) -> np.ndarray:
+    """Compute per-query natural winner counts ``M_+(q)`` above positive-reward mean ``E[R | R > 0]``."""
+    rw = np.asarray(rewards_2d, dtype=np.float64)
+    if rw.ndim != 2 or rw.shape[1] <= 1:
+        return np.zeros(rw.shape[0] if rw.ndim >= 1 else 0, dtype=np.int32)
+    std = rw.std(axis=1, ddof=1, keepdims=True)
+    has_var = std > 1.0e-12
+    grp_mean = rw.mean(axis=1, keepdims=True)
+    pos_mask = rw > 0.0
+    pos_count = np.maximum(1, pos_mask.sum(axis=1, keepdims=True))
+    pos_mean = np.where(pos_mask, rw, 0.0).sum(axis=1, keepdims=True) / pos_count
+    has_strict = (rw > (pos_mean + 1.0e-12)).any(axis=1, keepdims=True)
+    thresh = np.where(has_strict, pos_mean, grp_mean)
+    winners = has_var & (rw > thresh)
+    return winners.sum(axis=1, dtype=np.int32)
+
+
 def partition_head_and_tail_indices(
     group_size: int,
     lp_sums_1d: np.ndarray,
+    *,
+    head_cutoff: int | None = None,
 ) -> tuple[list[int], list[int]]:
-    head_cutoff = compute_head_cutoff(group_size)
+    cutoff = (
+        compute_head_cutoff(group_size)
+        if head_cutoff is None
+        else max(0, min(int(head_cutoff), group_size))
+    )
     beam_order = np.argsort(-lp_sums_1d, kind="mergesort").tolist()
-    return beam_order[:head_cutoff], beam_order[head_cutoff:]
+    return beam_order[:cutoff], beam_order[cutoff:]
 
 
 def build_candidate_head_tiers(
@@ -104,8 +127,7 @@ def record_query_enrichment_votes(
     max_adds_per_query: int = DOC2K_MAX_ADDS_PER_QUERY,
 ) -> None:
     group_size = len(row_u32)
-    head_cutoff = compute_head_cutoff(group_size)
-    if group_size < DOC2K_MIN_GROUP_SAMPLES or group_size <= head_cutoff:
+    if group_size < DOC2K_MIN_GROUP_SAMPLES or not head_indices or not tail_indices:
         return
     tiers = build_candidate_head_tiers(
         head_indices,
